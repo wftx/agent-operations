@@ -4,7 +4,7 @@
  */
 
 import { readFileSync, existsSync, watch, statSync, unlinkSync, mkdirSync, realpathSync, lstatSync } from 'fs';
-import { join, resolve, sep, dirname, basename } from 'path';
+import { join, resolve, relative, sep, dirname, basename } from 'path';
 import { homedir } from 'os';
 import * as crypto from 'crypto';
 
@@ -252,9 +252,10 @@ export function isClaudeDirOperation(
   // Canonicalize the agent dir first (resolves legitimate symlinks on the install
   // path, e.g. /tmp -> /private/tmp), so the .claude subtree below it is the only
   // thing left to vet.
-  const canonAgentDir = canonicalizePath(resolve(base));
+  const resolvedAgentDir = resolve(base);
+  const canonAgentDir = canonicalizePath(resolvedAgentDir);
   const claudeRoot = join(canonAgentDir, '.claude');
-  const target = resolve(canonAgentDir, filePath);
+  const target = resolve(canonAgentDir, relative(resolvedAgentDir, resolve(resolvedAgentDir, filePath)));
 
   // Lexical containment within the agent's own .claude/.
   if (target !== claudeRoot && !target.startsWith(claudeRoot + sep)) return false;
