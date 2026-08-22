@@ -14,6 +14,8 @@
     "scripts/execution-preflight-demo.ts",
     "scripts/manual-dispatch-demo.ts",
     "scripts/dispatch-cortextos.ts",
+    "scripts/execution-observation-demo.ts",
+    "scripts/observe-cortextos.ts",
     "tests/architecture/agent-operations-boundary.test.ts"
   ],
   "exclude": ["node_modules", "dist", "dashboard"]

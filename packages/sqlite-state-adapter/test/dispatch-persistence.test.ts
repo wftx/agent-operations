@@ -208,7 +208,7 @@ describe('SQLite Execution Dispatch persistence', () => {
       .toBeUndefined();
     database.close();
 
-    const upgraded = open(path);
+    const upgraded = open(path, 4);
     expect(await upgraded.getProject(PROJECT_ID)).not.toBeNull();
     expect(await upgraded.getRepository(REPOSITORY_ID)).not.toBeNull();
     expect(await upgraded.getJob('job:migration')).toMatchObject({ status: 'ready' });
@@ -224,7 +224,7 @@ describe('SQLite Execution Dispatch persistence', () => {
     database.close();
   });
 
-  it('rolls back a failed migration after v4 without damaging Dispatches', async () => {
+  it('rolls back a failed migration after current state without damaging Dispatches', async () => {
     const path = databasePath();
     const store = open(path);
     await seed(store, ['rollback']);
@@ -234,7 +234,7 @@ describe('SQLite Execution Dispatch persistence', () => {
     expect(() => SqliteAgentOperationsStateStore.open({
       databasePath: path,
       additionalMigrations: [{
-        version: 5,
+        version: 6,
         name: 'deliberate-dispatch-rollback',
         up: database => {
           database.exec('CREATE TABLE should_rollback_dispatch (id TEXT)');
@@ -249,7 +249,7 @@ describe('SQLite Execution Dispatch persistence', () => {
     expect(database.prepare('SELECT id FROM execution_dispatches').get())
       .toEqual({ id: 'dispatch:rollback' });
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
     database.close();
   });
 });

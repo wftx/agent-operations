@@ -32,3 +32,15 @@ export {
   type ManualDispatchOutcomeStatus,
   type ManualDispatchServiceOptions,
 } from './manual-dispatch-service.js';
+export {
+  ExecutionObservationService,
+  type AttemptExecutionDetail,
+  type AttemptExecutionState,
+  type ExecutionObservationResult,
+} from './execution-observation-service.js';
+export {
+  ExecutionOutcomeService,
+  type ConfirmAttemptFailedInput,
+  type ConfirmAttemptSucceededInput,
+  type ExecutionOutcomeServiceOptions,
+} from './execution-outcome-service.js';

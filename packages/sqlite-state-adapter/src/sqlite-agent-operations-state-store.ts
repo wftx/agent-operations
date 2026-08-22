@@ -12,6 +12,12 @@ import type {
   DurableExecutionPlan,
   DurableExecutionDispatch,
   DispatchStatus,
+  DurableExecutionObservation,
+  DurableAttemptOutcomeDecision,
+  ExecutionObservationKind,
+  ExecutionCorrelation,
+  AttemptOutcome,
+  AttemptOutcomeDecisionSource,
   DurableRepository,
   DurableRepositoryObservation,
   DurableRuntimeObservation,
@@ -155,6 +161,36 @@ interface ExecutionDispatchRow {
   resolved_at: string | null;
 }
 
+interface ExecutionObservationRow {
+  id: string;
+  dispatch_id: string;
+  attempt_id: string;
+  source: string;
+  source_event_id: string;
+  kind: ExecutionObservationKind;
+  correlation: ExecutionCorrelation;
+  correlated_dispatch_id: string | null;
+  runtime_session_id: string | null;
+  external_reference: string | null;
+  message: string | null;
+  output_summary: string | null;
+  observed_at: string;
+  recorded_at: string;
+}
+
+interface AttemptOutcomeDecisionRow {
+  id: string;
+  attempt_id: string;
+  dispatch_id: string;
+  outcome: AttemptOutcome;
+  source: AttemptOutcomeDecisionSource;
+  summary: string | null;
+  reason: string | null;
+  evidence_observation_id: string | null;
+  override_without_exact_evidence: number;
+  created_at: string;
+}
+
 function requireNonEmpty(value: string, field: string): void {
   if (!value.trim()) throw new Error(`${field} is required`);
 }
@@ -294,6 +330,40 @@ function toExecutionDispatch(row: ExecutionDispatchRow): DurableExecutionDispatc
     ...(row.submitted_at ? { submittedAt: row.submitted_at } : {}),
     ...(row.accepted_at ? { acceptedAt: row.accepted_at } : {}),
     ...(row.resolved_at ? { resolvedAt: row.resolved_at } : {}),
+  };
+}
+
+function toExecutionObservation(row: ExecutionObservationRow): DurableExecutionObservation {
+  return {
+    id: row.id,
+    dispatchId: row.dispatch_id,
+    attemptId: row.attempt_id,
+    source: row.source,
+    sourceEventId: row.source_event_id,
+    kind: row.kind,
+    correlation: row.correlation,
+    ...(row.correlated_dispatch_id ? { correlatedDispatchId: row.correlated_dispatch_id } : {}),
+    ...(row.runtime_session_id ? { runtimeSessionId: row.runtime_session_id } : {}),
+    ...(row.external_reference ? { externalReference: row.external_reference } : {}),
+    ...(row.message ? { message: row.message } : {}),
+    ...(row.output_summary ? { outputSummary: row.output_summary } : {}),
+    observedAt: row.observed_at,
+    recordedAt: row.recorded_at,
+  };
+}
+
+function toAttemptOutcomeDecision(row: AttemptOutcomeDecisionRow): DurableAttemptOutcomeDecision {
+  return {
+    id: row.id,
+    attemptId: row.attempt_id,
+    dispatchId: row.dispatch_id,
+    outcome: row.outcome,
+    source: row.source,
+    ...(row.summary ? { summary: row.summary } : {}),
+    ...(row.reason ? { reason: row.reason } : {}),
+    ...(row.evidence_observation_id ? { evidenceObservationId: row.evidence_observation_id } : {}),
+    overrideWithoutExactCompletionEvidence: row.override_without_exact_evidence === 1,
+    createdAt: row.created_at,
   };
 }
 
@@ -928,6 +998,103 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     } catch (error) {
       throw new Error(`Could not transition Execution Dispatch ${dispatch.id}: ${(error as Error).message}`);
     }
+  }
+
+  async appendExecutionObservation(observation: DurableExecutionObservation): Promise<boolean> {
+    this.assertOpen();
+    requireNonEmpty(observation.source, 'Execution Observation source');
+    requireNonEmpty(observation.sourceEventId, 'Execution Observation source event ID');
+    const existing = this.database.prepare(`
+      SELECT id FROM execution_observations
+      WHERE id = ? OR (dispatch_id = ? AND source = ? AND source_event_id = ?)
+      LIMIT 1
+    `).get(
+      observation.id,
+      observation.dispatchId,
+      observation.source,
+      observation.sourceEventId,
+    );
+    if (existing) return false;
+    try {
+      this.database.prepare(`
+        INSERT INTO execution_observations
+          (id, dispatch_id, attempt_id, source, source_event_id, kind, correlation,
+           correlated_dispatch_id, runtime_session_id, external_reference, message,
+           output_summary, observed_at, recorded_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        observation.id,
+        observation.dispatchId,
+        observation.attemptId,
+        observation.source,
+        observation.sourceEventId,
+        observation.kind,
+        observation.correlation,
+        observation.correlatedDispatchId ?? null,
+        observation.runtimeSessionId ?? null,
+        observation.externalReference ?? null,
+        observation.message ?? null,
+        observation.outputSummary ?? null,
+        observation.observedAt,
+        observation.recordedAt,
+      );
+      return true;
+    } catch (error) {
+      const raced = this.database.prepare(`
+        SELECT id FROM execution_observations
+        WHERE id = ? OR (dispatch_id = ? AND source = ? AND source_event_id = ?)
+        LIMIT 1
+      `).get(
+        observation.id,
+        observation.dispatchId,
+        observation.source,
+        observation.sourceEventId,
+      );
+      if (raced) return false;
+      throw new Error(`Could not append Execution Observation ${observation.id}: ${(error as Error).message}`);
+    }
+  }
+
+  async listExecutionObservationsForDispatch(
+    dispatchId: string,
+  ): Promise<readonly DurableExecutionObservation[]> {
+    this.assertOpen();
+    return (this.database.prepare(`
+      SELECT * FROM execution_observations
+      WHERE dispatch_id = ? ORDER BY observed_at, id
+    `).all(dispatchId) as ExecutionObservationRow[]).map(toExecutionObservation);
+  }
+
+  async createAttemptOutcomeDecision(decision: DurableAttemptOutcomeDecision): Promise<void> {
+    this.assertOpen();
+    try {
+      this.database.prepare(`
+        INSERT INTO attempt_outcome_decisions
+          (id, attempt_id, dispatch_id, outcome, source, summary, reason,
+           evidence_observation_id, override_without_exact_evidence, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        decision.id,
+        decision.attemptId,
+        decision.dispatchId,
+        decision.outcome,
+        decision.source,
+        decision.summary ?? null,
+        decision.reason ?? null,
+        decision.evidenceObservationId ?? null,
+        decision.overrideWithoutExactCompletionEvidence ? 1 : 0,
+        decision.createdAt,
+      );
+    } catch (error) {
+      throw new Error(`Could not create Attempt Outcome Decision ${decision.id}: ${(error as Error).message}`);
+    }
+  }
+
+  async getAttemptOutcomeDecision(attemptId: string): Promise<DurableAttemptOutcomeDecision | null> {
+    this.assertOpen();
+    const row = this.database.prepare('SELECT * FROM attempt_outcome_decisions WHERE attempt_id = ?')
+      .get(attemptId) as AttemptOutcomeDecisionRow | undefined;
+    return row ? toAttemptOutcomeDecision(row) : null;
   }
 
   async close(): Promise<void> {

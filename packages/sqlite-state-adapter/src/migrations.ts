@@ -10,7 +10,8 @@ export const INITIAL_SCHEMA_VERSION = 1;
 export const JOB_SCHEMA_VERSION = 2;
 export const EXECUTION_PLAN_SCHEMA_VERSION = 3;
 export const DISPATCH_SCHEMA_VERSION = 4;
-export const CURRENT_SCHEMA_VERSION = DISPATCH_SCHEMA_VERSION;
+export const OBSERVATION_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = OBSERVATION_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -203,6 +204,64 @@ const EXECUTION_DISPATCH_SCHEMA_SQL = `
   CREATE INDEX execution_dispatches_by_attempt ON execution_dispatches(attempt_id, created_at, id);
 `;
 
+const EXECUTION_OBSERVATION_SCHEMA_SQL = `
+  CREATE UNIQUE INDEX execution_dispatches_observation_scope
+    ON execution_dispatches(id, attempt_id);
+
+  CREATE TABLE execution_observations (
+    id TEXT PRIMARY KEY,
+    dispatch_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (length(trim(source)) > 0),
+    source_event_id TEXT NOT NULL CHECK (length(trim(source_event_id)) > 0),
+    kind TEXT NOT NULL CHECK (kind IN (
+      'runtime-running', 'runtime-idle', 'turn-completed', 'output-available',
+      'runtime-crashed', 'runtime-unavailable', 'unknown'
+    )),
+    correlation TEXT NOT NULL CHECK (correlation IN (
+      'exact', 'runtime-session', 'agent-level', 'uncorrelated'
+    )),
+    correlated_dispatch_id TEXT,
+    runtime_session_id TEXT,
+    external_reference TEXT,
+    message TEXT,
+    output_summary TEXT,
+    observed_at TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    UNIQUE (dispatch_id, source, source_event_id),
+    UNIQUE (id, dispatch_id, attempt_id),
+    FOREIGN KEY (dispatch_id, attempt_id) REFERENCES execution_dispatches(id, attempt_id),
+    CHECK (
+      (correlation = 'exact' AND correlated_dispatch_id = dispatch_id)
+      OR (correlation <> 'exact' AND correlated_dispatch_id IS NULL)
+    )
+  );
+
+  CREATE INDEX execution_observations_by_dispatch
+    ON execution_observations(dispatch_id, observed_at, id);
+
+  CREATE TABLE attempt_outcome_decisions (
+    id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL UNIQUE REFERENCES job_attempts(id),
+    dispatch_id TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('completed', 'failed')),
+    source TEXT NOT NULL CHECK (source IN ('human', 'runtime-evidence')),
+    summary TEXT,
+    reason TEXT,
+    evidence_observation_id TEXT,
+    override_without_exact_evidence INTEGER NOT NULL
+      CHECK (override_without_exact_evidence IN (0, 1)),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (dispatch_id, attempt_id) REFERENCES execution_dispatches(id, attempt_id),
+    FOREIGN KEY (evidence_observation_id, dispatch_id, attempt_id)
+      REFERENCES execution_observations(id, dispatch_id, attempt_id),
+    CHECK (
+      (outcome = 'completed' AND length(trim(summary)) > 0 AND reason IS NULL)
+      OR (outcome = 'failed' AND length(trim(reason)) > 0 AND summary IS NULL)
+    )
+  );
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -223,6 +282,11 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: DISPATCH_SCHEMA_VERSION,
     name: 'manual-execution-dispatches',
     up: database => database.exec(EXECUTION_DISPATCH_SCHEMA_SQL),
+  },
+  {
+    version: OBSERVATION_SCHEMA_VERSION,
+    name: 'execution-observations-and-outcomes',
+    up: database => database.exec(EXECUTION_OBSERVATION_SCHEMA_SQL),
   },
 ];
 

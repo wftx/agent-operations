@@ -1,0 +1,119 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { FakeAgentRuntimeAdapter } from '../../agent-operations-contracts/src/index.js';
+import { CortextOSExecutionObserver } from '../src/index.js';
+
+const TIME = '2026-08-21T20:00:00.000Z';
+const REQUEST = {
+  dispatchId: 'dispatch:one',
+  attemptId: 'attempt:one',
+  runtimeAgentId: 'engineering/coder',
+  acceptedAt: '2026-08-21T19:59:00.000Z',
+};
+const directories: string[] = [];
+
+afterEach(() => {
+  for (const directory of directories.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
+
+function root(): string {
+  const directory = mkdtempSync(join(tmpdir(), 'ao-cortextos-observer-'));
+  directories.push(directory);
+  return directory;
+}
+
+function runtime(
+  state: 'running' | 'degraded' | 'stopped' = 'running',
+  provider: 'claude' | 'codex' | 'opencode' | 'hermes' = 'codex',
+  reason?: string,
+) {
+  return new FakeAgentRuntimeAdapter([{
+    id: REQUEST.runtimeAgentId,
+    name: 'coder',
+    organization: 'engineering',
+    provider,
+    enabled: true,
+    configured: true,
+    capabilities: [],
+    health: { state, ...(reason ? { reason } : {}) },
+    observedAt: TIME,
+  }]);
+}
+
+describe('CortextOSExecutionObserver', () => {
+  it('reports daemon running state only as agent-level evidence', async () => {
+    const observer = new CortextOSExecutionObserver({ runtimeAdapter: runtime(), ctxRoot: root() });
+    expect(await observer.observe(REQUEST)).toEqual([{
+      source: 'cortextos-daemon-status',
+      sourceEventId: 'status:engineering/coder:running:',
+      kind: 'runtime-running',
+      correlation: 'agent-level',
+      observedAt: TIME,
+      message: 'CortextOS runtime is running; this is not Dispatch completion evidence.',
+    }]);
+  });
+
+  it('reports post-acceptance Claude/Codex idle flags as agent-level, never exact', async () => {
+    const ctxRoot = root();
+    const stateDir = join(ctxRoot, 'state', 'coder');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, 'last_idle.flag'), String(Date.parse(TIME) / 1000));
+    const observer = new CortextOSExecutionObserver({ runtimeAdapter: runtime(), ctxRoot });
+    const observations = await observer.observe(REQUEST);
+    expect(observations).toHaveLength(2);
+    expect(observations[1]).toMatchObject({
+      kind: 'runtime-idle',
+      correlation: 'agent-level',
+      observedAt: TIME,
+    });
+    expect(observations.some(item => item.correlation === 'exact')).toBe(false);
+  });
+
+  it('maps explicit crashed/halted daemon evidence without resolving an outcome', async () => {
+    const observer = new CortextOSExecutionObserver({
+      runtimeAdapter: runtime('degraded', 'claude', 'CortextOS reported a crashed runtime'),
+      ctxRoot: root(),
+    });
+    expect(await observer.observe(REQUEST)).toEqual([expect.objectContaining({
+      kind: 'runtime-crashed',
+      correlation: 'agent-level',
+    })]);
+  });
+
+  it('reports unavailable observation transport as uncorrelated ambiguity', async () => {
+    const observer = new CortextOSExecutionObserver({
+      runtimeAdapter: {
+        listAgents: async () => [],
+        getAgent: async () => { throw new Error('daemon unavailable'); },
+        getHealth: async () => ({
+          state: 'unavailable' as const,
+          observedAt: TIME,
+          agentCount: 0,
+        }),
+      },
+      ctxRoot: root(),
+      now: () => new Date(TIME),
+    });
+    expect(await observer.observe(REQUEST)).toEqual([expect.objectContaining({
+      kind: 'runtime-unavailable',
+      correlation: 'uncorrelated',
+      observedAt: TIME,
+    })]);
+  });
+
+  it('does not invent idle completion for OpenCode or Hermes', async () => {
+    const ctxRoot = root();
+    const stateDir = join(ctxRoot, 'state', 'coder');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, 'last_idle.flag'), String(Date.parse(TIME) / 1000));
+    for (const provider of ['opencode', 'hermes'] as const) {
+      const observer = new CortextOSExecutionObserver({
+        runtimeAdapter: runtime('running', provider),
+        ctxRoot,
+      });
+      expect(await observer.observe(REQUEST)).toHaveLength(1);
+    }
+  });
+});

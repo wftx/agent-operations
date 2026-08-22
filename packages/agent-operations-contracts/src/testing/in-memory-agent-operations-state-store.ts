@@ -13,6 +13,10 @@ import type { DurableJob, DurableJobAttempt, NewDurableJobAttempt } from '../wor
 import { isActiveAttemptStatus } from '../work.js';
 import type { DurableExecutionPlan } from '../execution.js';
 import type { DurableExecutionDispatch } from '../dispatch.js';
+import type {
+  DurableAttemptOutcomeDecision,
+  DurableExecutionObservation,
+} from '../observation.js';
 
 export type InMemoryStateStoreOperation =
   | 'get-installation'
@@ -24,6 +28,8 @@ export type InMemoryStateStoreOperation =
   | 'write-attempt'
   | 'write-execution-plan'
   | 'write-execution-dispatch'
+  | 'write-execution-observation'
+  | 'write-attempt-outcome'
   | 'close';
 
 export interface InMemoryAgentOperationsStateStoreOptions {
@@ -70,6 +76,14 @@ function copyExecutionPlan(value: DurableExecutionPlan): DurableExecutionPlan {
 }
 
 function copyExecutionDispatch(value: DurableExecutionDispatch): DurableExecutionDispatch {
+  return { ...value };
+}
+
+function copyExecutionObservation(value: DurableExecutionObservation): DurableExecutionObservation {
+  return { ...value };
+}
+
+function copyAttemptOutcomeDecision(value: DurableAttemptOutcomeDecision): DurableAttemptOutcomeDecision {
   return { ...value };
 }
 
@@ -126,6 +140,8 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   private readonly attempts = new Map<string, DurableJobAttempt>();
   private readonly executionPlans = new Map<string, DurableExecutionPlan>();
   private readonly executionDispatches = new Map<string, DurableExecutionDispatch>();
+  private readonly executionObservations = new Map<string, DurableExecutionObservation>();
+  private readonly attemptOutcomeDecisions = new Map<string, DurableAttemptOutcomeDecision>();
   private closed = false;
 
   constructor(options: InMemoryAgentOperationsStateStoreOptions = {}) {
@@ -524,6 +540,77 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     }
     validateDispatchShape(dispatch);
     this.executionDispatches.set(dispatch.id, copyExecutionDispatch(dispatch));
+  }
+
+  async appendExecutionObservation(observation: DurableExecutionObservation): Promise<boolean> {
+    this.assertAvailable('write-execution-observation');
+    requireNonEmpty(observation.id, 'Execution Observation ID');
+    requireNonEmpty(observation.source, 'Execution Observation source');
+    requireNonEmpty(observation.sourceEventId, 'Execution Observation source event ID');
+    const dispatch = this.executionDispatches.get(observation.dispatchId);
+    if (!dispatch || dispatch.status !== 'accepted' || dispatch.attemptId !== observation.attemptId) {
+      throw new Error(`Invalid Execution Observation Dispatch association: ${observation.id}`);
+    }
+    if (observation.correlation === 'exact'
+      && observation.correlatedDispatchId !== observation.dispatchId) {
+      throw new Error(`Exact Execution Observation must identify its Dispatch: ${observation.id}`);
+    }
+    if (observation.correlation !== 'exact' && observation.correlatedDispatchId !== undefined) {
+      throw new Error(`Non-exact Execution Observation cannot identify a Dispatch: ${observation.id}`);
+    }
+    const duplicate = this.executionObservations.get(observation.id)
+      ?? [...this.executionObservations.values()].find(candidate =>
+        candidate.dispatchId === observation.dispatchId
+        && candidate.source === observation.source
+        && candidate.sourceEventId === observation.sourceEventId);
+    if (duplicate) return false;
+    this.executionObservations.set(observation.id, copyExecutionObservation(observation));
+    return true;
+  }
+
+  async listExecutionObservationsForDispatch(
+    dispatchId: string,
+  ): Promise<readonly DurableExecutionObservation[]> {
+    this.assertAvailable('read');
+    return [...this.executionObservations.values()]
+      .filter(observation => observation.dispatchId === dispatchId)
+      .sort((a, b) => a.observedAt.localeCompare(b.observedAt) || a.id.localeCompare(b.id))
+      .map(copyExecutionObservation);
+  }
+
+  async createAttemptOutcomeDecision(decision: DurableAttemptOutcomeDecision): Promise<void> {
+    this.assertAvailable('write-attempt-outcome');
+    requireNonEmpty(decision.id, 'Attempt Outcome Decision ID');
+    const dispatch = this.executionDispatches.get(decision.dispatchId);
+    const attempt = this.attempts.get(decision.attemptId);
+    if (!dispatch || dispatch.status !== 'accepted' || dispatch.attemptId !== decision.attemptId || !attempt) {
+      throw new Error(`Invalid Attempt Outcome Decision associations: ${decision.id}`);
+    }
+    if (decision.outcome === 'completed' && !decision.summary?.trim()) {
+      throw new Error('Completed Attempt Outcome Decision requires a summary');
+    }
+    if (decision.outcome === 'failed' && !decision.reason?.trim()) {
+      throw new Error('Failed Attempt Outcome Decision requires a reason');
+    }
+    if (decision.evidenceObservationId) {
+      const evidence = this.executionObservations.get(decision.evidenceObservationId);
+      if (!evidence || evidence.dispatchId !== decision.dispatchId || evidence.attemptId !== decision.attemptId) {
+        throw new Error(`Invalid outcome evidence Observation: ${decision.evidenceObservationId}`);
+      }
+    }
+    if (this.attemptOutcomeDecisions.has(decision.attemptId)) {
+      throw new Error(`Attempt already has an Outcome Decision: ${decision.attemptId}`);
+    }
+    if ([...this.attemptOutcomeDecisions.values()].some(candidate => candidate.id === decision.id)) {
+      throw new Error(`Duplicate Attempt Outcome Decision ID: ${decision.id}`);
+    }
+    this.attemptOutcomeDecisions.set(decision.attemptId, copyAttemptOutcomeDecision(decision));
+  }
+
+  async getAttemptOutcomeDecision(attemptId: string): Promise<DurableAttemptOutcomeDecision | null> {
+    this.assertAvailable('read');
+    const decision = this.attemptOutcomeDecisions.get(attemptId);
+    return decision ? copyAttemptOutcomeDecision(decision) : null;
   }
 
   async close(): Promise<void> {

@@ -8,6 +8,10 @@ import type { RuntimeProvider, RuntimeState } from './runtime.js';
 import type { DurableJob, DurableJobAttempt, NewDurableJobAttempt } from './work.js';
 import type { DurableExecutionPlan } from './execution.js';
 import type { DurableExecutionDispatch } from './dispatch.js';
+import type {
+  DurableAttemptOutcomeDecision,
+  DurableExecutionObservation,
+} from './observation.js';
 
 export interface AgentOperationsInstallation {
   readonly id: string;
@@ -111,6 +115,12 @@ export interface AgentOperationsStateStore {
     dispatch: DurableExecutionDispatch,
     expectedRevision: number,
   ): Promise<void>;
+  appendExecutionObservation(observation: DurableExecutionObservation): Promise<boolean>;
+  listExecutionObservationsForDispatch(
+    dispatchId: string,
+  ): Promise<readonly DurableExecutionObservation[]>;
+  createAttemptOutcomeDecision(decision: DurableAttemptOutcomeDecision): Promise<void>;
+  getAttemptOutcomeDecision(attemptId: string): Promise<DurableAttemptOutcomeDecision | null>;
   close(): Promise<void>;
 }
 
