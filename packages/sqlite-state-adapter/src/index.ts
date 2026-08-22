@@ -10,7 +10,9 @@ export {
 } from './state-location.js';
 export {
   DEFAULT_STATE_MIGRATIONS,
+  CURRENT_SCHEMA_VERSION,
   INITIAL_SCHEMA_VERSION,
+  JOB_SCHEMA_VERSION,
   applyStateMigrations,
   type SqliteStateMigration,
 } from './migrations.js';

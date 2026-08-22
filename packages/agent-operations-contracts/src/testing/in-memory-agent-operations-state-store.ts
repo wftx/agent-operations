@@ -9,6 +9,8 @@ import type {
   RepositoryCheckoutBinding,
 } from '../persistence.js';
 import { createRepositoryCheckoutBindingId } from '../persistence.js';
+import type { DurableJob, DurableJobAttempt, NewDurableJobAttempt } from '../work.js';
+import { isActiveAttemptStatus } from '../work.js';
 
 export type InMemoryStateStoreOperation =
   | 'get-installation'
@@ -16,6 +18,8 @@ export type InMemoryStateStoreOperation =
   | 'read'
   | 'record-repository-observation'
   | 'record-runtime-observation'
+  | 'write-job'
+  | 'write-attempt'
   | 'close';
 
 export interface InMemoryAgentOperationsStateStoreOptions {
@@ -49,6 +53,14 @@ function copyRuntimeObservation(value: DurableRuntimeObservation): DurableRuntim
   return { ...value };
 }
 
+function copyJob(value: DurableJob): DurableJob {
+  return { ...value };
+}
+
+function copyAttempt(value: DurableJobAttempt): DurableJobAttempt {
+  return { ...value };
+}
+
 function requireNonEmpty(value: string, field: string): void {
   if (!value.trim()) throw new Error(`${field} is required`);
 }
@@ -73,6 +85,8 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   private readonly projectRuntimeAgents = new Map<string, Set<string>>();
   private readonly repositoryObservations = new Map<string, DurableRepositoryObservation[]>();
   private readonly runtimeObservations = new Map<string, DurableRuntimeObservation[]>();
+  private readonly jobs = new Map<string, DurableJob>();
+  private readonly attempts = new Map<string, DurableJobAttempt>();
   private closed = false;
 
   constructor(options: InMemoryAgentOperationsStateStoreOptions = {}) {
@@ -239,6 +253,109 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
       undefined,
     );
     return latest ? copyRuntimeObservation(latest) : null;
+  }
+
+  async createJob(job: DurableJob): Promise<void> {
+    this.assertAvailable('write-job');
+    requireNonEmpty(job.id, 'Job ID');
+    requireNonEmpty(job.title, 'Job title');
+    if (!job.id.startsWith('job:')) throw new Error(`Invalid Agent Operations job ID: ${job.id}`);
+    if (job.status !== 'draft' || job.revision !== 0) throw new Error('New jobs must be draft at revision 0');
+    if (!this.projects.has(job.projectId)) throw new Error(`Unknown project for job: ${job.projectId}`);
+    if (job.repositoryId && !this.projectRepositories.get(job.projectId)?.has(job.repositoryId)) {
+      throw new Error(`Repository ${job.repositoryId} is not associated with project ${job.projectId}`);
+    }
+    if (job.preferredRuntimeAgentId
+      && !this.projectRuntimeAgents.get(job.projectId)?.has(job.preferredRuntimeAgentId)) {
+      throw new Error(`Runtime ${job.preferredRuntimeAgentId} is not associated with project ${job.projectId}`);
+    }
+    if (this.jobs.has(job.id)) throw new Error(`Duplicate job ID: ${job.id}`);
+    this.jobs.set(job.id, copyJob(job));
+  }
+
+  async getJob(id: string): Promise<DurableJob | null> {
+    this.assertAvailable('read');
+    const job = this.jobs.get(id);
+    return job ? copyJob(job) : null;
+  }
+
+  async listJobs(projectId?: string): Promise<readonly DurableJob[]> {
+    this.assertAvailable('read');
+    return [...this.jobs.values()]
+      .filter(job => !projectId || job.projectId === projectId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map(copyJob);
+  }
+
+  async saveJobTransition(job: DurableJob, expectedRevision: number): Promise<void> {
+    this.assertAvailable('write-job');
+    const existing = this.jobs.get(job.id);
+    if (!existing) throw new Error(`Job not found: ${job.id}`);
+    if (existing.revision !== expectedRevision || job.revision !== expectedRevision + 1) {
+      throw new Error(`Stale job revision for ${job.id}; expected ${existing.revision}`);
+    }
+    if (existing.projectId !== job.projectId
+      || existing.repositoryId !== job.repositoryId
+      || existing.preferredRuntimeAgentId !== job.preferredRuntimeAgentId
+      || existing.createdAt !== job.createdAt) {
+      throw new Error(`Job transition cannot rewrite durable identity or assignment: ${job.id}`);
+    }
+    this.jobs.set(job.id, copyJob(job));
+  }
+
+  async createAttempt(attempt: NewDurableJobAttempt): Promise<DurableJobAttempt> {
+    this.assertAvailable('write-attempt');
+    if (!attempt.id.startsWith('attempt:')) throw new Error(`Invalid Agent Operations attempt ID: ${attempt.id}`);
+    if (attempt.status !== 'created' || attempt.revision !== 0) {
+      throw new Error('New attempts must be created at revision 0');
+    }
+    const job = this.jobs.get(attempt.jobId);
+    if (!job) throw new Error(`Unknown job for attempt: ${attempt.jobId}`);
+    if (attempt.runtimeAgentId
+      && !this.projectRuntimeAgents.get(job.projectId)?.has(attempt.runtimeAgentId)) {
+      throw new Error(`Runtime ${attempt.runtimeAgentId} is not associated with project ${job.projectId}`);
+    }
+    if (this.attempts.has(attempt.id)) throw new Error(`Duplicate attempt ID: ${attempt.id}`);
+    const jobAttempts = [...this.attempts.values()].filter(candidate => candidate.jobId === attempt.jobId);
+    if (jobAttempts.some(candidate => isActiveAttemptStatus(candidate.status))) {
+      throw new Error(`Job ${attempt.jobId} already has an active attempt`);
+    }
+    const created: DurableJobAttempt = {
+      ...attempt,
+      sequence: Math.max(0, ...jobAttempts.map(candidate => candidate.sequence)) + 1,
+    };
+    this.attempts.set(created.id, copyAttempt(created));
+    return copyAttempt(created);
+  }
+
+  async getAttempt(id: string): Promise<DurableJobAttempt | null> {
+    this.assertAvailable('read');
+    const attempt = this.attempts.get(id);
+    return attempt ? copyAttempt(attempt) : null;
+  }
+
+  async listAttemptsForJob(jobId: string): Promise<readonly DurableJobAttempt[]> {
+    this.assertAvailable('read');
+    return [...this.attempts.values()]
+      .filter(attempt => attempt.jobId === jobId)
+      .sort((a, b) => a.sequence - b.sequence)
+      .map(copyAttempt);
+  }
+
+  async saveAttemptTransition(attempt: DurableJobAttempt, expectedRevision: number): Promise<void> {
+    this.assertAvailable('write-attempt');
+    const existing = this.attempts.get(attempt.id);
+    if (!existing) throw new Error(`Attempt not found: ${attempt.id}`);
+    if (existing.revision !== expectedRevision || attempt.revision !== expectedRevision + 1) {
+      throw new Error(`Stale attempt revision for ${attempt.id}; expected ${existing.revision}`);
+    }
+    if (existing.jobId !== attempt.jobId
+      || existing.sequence !== attempt.sequence
+      || existing.runtimeAgentId !== attempt.runtimeAgentId
+      || existing.createdAt !== attempt.createdAt) {
+      throw new Error(`Attempt transition cannot rewrite durable identity or assignment: ${attempt.id}`);
+    }
+    this.attempts.set(attempt.id, copyAttempt(attempt));
   }
 
   async close(): Promise<void> {

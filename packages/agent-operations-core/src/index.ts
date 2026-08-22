@@ -12,3 +12,10 @@ export {
   type AgentOperationsStateSyncServiceOptions,
   type StateSyncResult,
 } from './state-sync-service.js';
+export {
+  JobLifecycleService,
+  type CreateAttemptInput,
+  type CreateJobInput,
+  type JobDetail,
+  type JobLifecycleServiceOptions,
+} from './job-lifecycle-service.js';

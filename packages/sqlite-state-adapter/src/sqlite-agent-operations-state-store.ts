@@ -7,9 +7,14 @@ import type {
   AgentOperationsStateStore,
   DurableProject,
   DurableProjectConfiguration,
+  DurableJob,
+  DurableJobAttempt,
   DurableRepository,
   DurableRepositoryObservation,
   DurableRuntimeObservation,
+  NewDurableJobAttempt,
+  AttemptStatus,
+  JobStatus,
   RepositoryCheckoutBinding,
   RepositoryIdentityKind,
   RepositoryAvailability,
@@ -28,6 +33,8 @@ export interface SqliteAgentOperationsStateStoreOptions {
   readonly now?: () => Date;
   /** Test/migration-development seam. Production schema lives in the default migration list. */
   readonly additionalMigrations?: readonly SqliteStateMigration[];
+  /** Test seam for proving an actual v1 -> v2 upgrade. Never set by production composition. */
+  readonly targetSchemaVersion?: number;
 }
 
 interface ProjectRow {
@@ -81,6 +88,34 @@ interface RuntimeObservationRow {
   last_heartbeat: string | null;
   reason: string | null;
   observed_at: string;
+}
+
+interface JobRow {
+  id: string;
+  project_id: string;
+  title: string;
+  description: string | null;
+  status: JobStatus;
+  repository_id: string | null;
+  preferred_runtime_agent_id: string | null;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface AttemptRow {
+  id: string;
+  job_id: string;
+  sequence: number;
+  runtime_agent_id: string | null;
+  status: AttemptStatus;
+  started_at: string | null;
+  finished_at: string | null;
+  summary: string | null;
+  failure_reason: string | null;
+  revision: number;
+  created_at: string;
+  updated_at: string;
 }
 
 function requireNonEmpty(value: string, field: string): void {
@@ -154,6 +189,40 @@ function toRuntimeObservation(row: RuntimeObservationRow): DurableRuntimeObserva
   };
 }
 
+function toJob(row: JobRow): DurableJob {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    title: row.title,
+    ...(row.description ? { description: row.description } : {}),
+    status: row.status,
+    ...(row.repository_id ? { repositoryId: row.repository_id } : {}),
+    ...(row.preferred_runtime_agent_id
+      ? { preferredRuntimeAgentId: row.preferred_runtime_agent_id }
+      : {}),
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toAttempt(row: AttemptRow): DurableJobAttempt {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    sequence: row.sequence,
+    ...(row.runtime_agent_id ? { runtimeAgentId: row.runtime_agent_id } : {}),
+    status: row.status,
+    ...(row.started_at ? { startedAt: row.started_at } : {}),
+    ...(row.finished_at ? { finishedAt: row.finished_at } : {}),
+    ...(row.summary ? { summary: row.summary } : {}),
+    ...(row.failure_reason ? { failureReason: row.failure_reason } : {}),
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 export class SqliteAgentOperationsStateStore implements AgentOperationsStateStore {
   readonly databasePath: string;
   private readonly database: Database.Database;
@@ -173,7 +242,12 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
       database = new Database(databasePath, { timeout: 5_000 });
       database.pragma('busy_timeout = 5000');
       database.pragma('foreign_keys = ON');
-      applyStateMigrations(database, options.additionalMigrations, now);
+      applyStateMigrations(
+        database,
+        options.additionalMigrations,
+        now,
+        options.targetSchemaVersion,
+      );
       const installation = database.prepare('SELECT id FROM installations LIMIT 1').get() as { id: string } | undefined;
       if (!installation) {
         const id = options.installationIdFactory?.() ?? `installation:${randomUUID()}`;
@@ -413,6 +487,194 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
       ORDER BY observed_at DESC, sequence DESC LIMIT 1
     `).get(projectId, agentId) as RuntimeObservationRow | undefined;
     return row ? toRuntimeObservation(row) : null;
+  }
+
+  async createJob(job: DurableJob): Promise<void> {
+    this.assertOpen();
+    requireNonEmpty(job.title, 'Job title');
+    if (!job.id.startsWith('job:')) throw new Error(`Invalid Agent Operations job ID: ${job.id}`);
+    if (job.status !== 'draft' || job.revision !== 0) throw new Error('New jobs must be draft at revision 0');
+    try {
+      const project = this.database.prepare('SELECT 1 FROM projects WHERE id = ?').get(job.projectId);
+      if (!project) throw new Error(`Unknown project for job: ${job.projectId}`);
+      if (job.repositoryId) {
+        const association = this.database.prepare(`
+          SELECT 1 FROM project_repositories WHERE project_id = ? AND repository_id = ?
+        `).get(job.projectId, job.repositoryId);
+        if (!association) {
+          throw new Error(`Repository ${job.repositoryId} is not associated with project ${job.projectId}`);
+        }
+      }
+      if (job.preferredRuntimeAgentId) {
+        const association = this.database.prepare(`
+          SELECT 1 FROM project_runtime_agents WHERE project_id = ? AND agent_id = ?
+        `).get(job.projectId, job.preferredRuntimeAgentId);
+        if (!association) {
+          throw new Error(
+            `Runtime ${job.preferredRuntimeAgentId} is not associated with project ${job.projectId}`,
+          );
+        }
+      }
+      this.database.prepare(`
+        INSERT INTO jobs
+          (id, project_id, title, description, status, repository_id,
+           preferred_runtime_agent_id, revision, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        job.id,
+        job.projectId,
+        job.title,
+        job.description ?? null,
+        job.status,
+        job.repositoryId ?? null,
+        job.preferredRuntimeAgentId ?? null,
+        job.revision,
+        job.createdAt,
+        job.updatedAt,
+      );
+    } catch (error) {
+      throw new Error(`Could not create job ${job.id}: ${(error as Error).message}`);
+    }
+  }
+
+  async getJob(id: string): Promise<DurableJob | null> {
+    this.assertOpen();
+    const row = this.database.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as JobRow | undefined;
+    return row ? toJob(row) : null;
+  }
+
+  async listJobs(projectId?: string): Promise<readonly DurableJob[]> {
+    this.assertOpen();
+    const rows = projectId
+      ? this.database.prepare('SELECT * FROM jobs WHERE project_id = ? ORDER BY created_at, id').all(projectId)
+      : this.database.prepare('SELECT * FROM jobs ORDER BY created_at, id').all();
+    return (rows as JobRow[]).map(toJob);
+  }
+
+  async saveJobTransition(job: DurableJob, expectedRevision: number): Promise<void> {
+    this.assertOpen();
+    const existingRow = this.database.prepare('SELECT * FROM jobs WHERE id = ?').get(job.id) as JobRow | undefined;
+    if (!existingRow) throw new Error(`Job not found: ${job.id}`);
+    const existing = toJob(existingRow);
+    if (existing.projectId !== job.projectId
+      || existing.repositoryId !== job.repositoryId
+      || existing.preferredRuntimeAgentId !== job.preferredRuntimeAgentId
+      || existing.createdAt !== job.createdAt) {
+      throw new Error(`Job transition cannot rewrite durable identity or assignment: ${job.id}`);
+    }
+    if (job.revision !== expectedRevision + 1) {
+      throw new Error(`Job transition revision must advance exactly once: ${job.id}`);
+    }
+    const result = this.database.prepare(`
+      UPDATE jobs SET title = ?, description = ?, status = ?, revision = ?, updated_at = ?
+      WHERE id = ? AND revision = ?
+    `).run(
+      job.title,
+      job.description ?? null,
+      job.status,
+      job.revision,
+      job.updatedAt,
+      job.id,
+      expectedRevision,
+    );
+    if (result.changes !== 1) throw new Error(`Stale job revision for ${job.id}`);
+  }
+
+  async createAttempt(attempt: NewDurableJobAttempt): Promise<DurableJobAttempt> {
+    this.assertOpen();
+    if (!attempt.id.startsWith('attempt:')) throw new Error(`Invalid Agent Operations attempt ID: ${attempt.id}`);
+    if (attempt.status !== 'created' || attempt.revision !== 0) {
+      throw new Error('New attempts must be created at revision 0');
+    }
+    try {
+      const create = this.database.transaction(() => {
+        const job = this.database.prepare('SELECT project_id FROM jobs WHERE id = ?')
+          .get(attempt.jobId) as { project_id: string } | undefined;
+        if (!job) throw new Error(`Unknown job for attempt: ${attempt.jobId}`);
+        if (attempt.runtimeAgentId) {
+          const association = this.database.prepare(`
+            SELECT 1 FROM project_runtime_agents WHERE project_id = ? AND agent_id = ?
+          `).get(job.project_id, attempt.runtimeAgentId);
+          if (!association) {
+            throw new Error(
+              `Runtime ${attempt.runtimeAgentId} is not associated with project ${job.project_id}`,
+            );
+          }
+        }
+        const active = this.database.prepare(`
+          SELECT id FROM job_attempts WHERE job_id = ? AND status IN ('created', 'running') LIMIT 1
+        `).get(attempt.jobId) as { id: string } | undefined;
+        if (active) throw new Error(`Job ${attempt.jobId} already has an active attempt`);
+        const row = this.database.prepare(`
+          SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM job_attempts WHERE job_id = ?
+        `).get(attempt.jobId) as { next_sequence: number };
+        this.database.prepare(`
+          INSERT INTO job_attempts
+            (id, job_id, sequence, runtime_agent_id, status, revision, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          attempt.id,
+          attempt.jobId,
+          row.next_sequence,
+          attempt.runtimeAgentId ?? null,
+          attempt.status,
+          attempt.revision,
+          attempt.createdAt,
+          attempt.updatedAt,
+        );
+        return { ...attempt, sequence: row.next_sequence };
+      });
+      return create.immediate();
+    } catch (error) {
+      throw new Error(`Could not create attempt ${attempt.id}: ${(error as Error).message}`);
+    }
+  }
+
+  async getAttempt(id: string): Promise<DurableJobAttempt | null> {
+    this.assertOpen();
+    const row = this.database.prepare('SELECT * FROM job_attempts WHERE id = ?')
+      .get(id) as AttemptRow | undefined;
+    return row ? toAttempt(row) : null;
+  }
+
+  async listAttemptsForJob(jobId: string): Promise<readonly DurableJobAttempt[]> {
+    this.assertOpen();
+    return (this.database.prepare('SELECT * FROM job_attempts WHERE job_id = ? ORDER BY sequence')
+      .all(jobId) as AttemptRow[]).map(toAttempt);
+  }
+
+  async saveAttemptTransition(attempt: DurableJobAttempt, expectedRevision: number): Promise<void> {
+    this.assertOpen();
+    const existingRow = this.database.prepare('SELECT * FROM job_attempts WHERE id = ?')
+      .get(attempt.id) as AttemptRow | undefined;
+    if (!existingRow) throw new Error(`Attempt not found: ${attempt.id}`);
+    const existing = toAttempt(existingRow);
+    if (existing.jobId !== attempt.jobId
+      || existing.sequence !== attempt.sequence
+      || existing.runtimeAgentId !== attempt.runtimeAgentId
+      || existing.createdAt !== attempt.createdAt) {
+      throw new Error(`Attempt transition cannot rewrite durable identity or assignment: ${attempt.id}`);
+    }
+    if (attempt.revision !== expectedRevision + 1) {
+      throw new Error(`Attempt transition revision must advance exactly once: ${attempt.id}`);
+    }
+    const result = this.database.prepare(`
+      UPDATE job_attempts SET
+        status = ?, started_at = ?, finished_at = ?, summary = ?, failure_reason = ?,
+        revision = ?, updated_at = ?
+      WHERE id = ? AND revision = ?
+    `).run(
+      attempt.status,
+      attempt.startedAt ?? null,
+      attempt.finishedAt ?? null,
+      attempt.summary ?? null,
+      attempt.failureReason ?? null,
+      attempt.revision,
+      attempt.updatedAt,
+      attempt.id,
+      expectedRevision,
+    );
+    if (result.changes !== 1) throw new Error(`Stale attempt revision for ${attempt.id}`);
   }
 
   async close(): Promise<void> {

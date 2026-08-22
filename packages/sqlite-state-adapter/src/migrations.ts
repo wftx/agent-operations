@@ -7,6 +7,8 @@ export interface SqliteStateMigration {
 }
 
 export const INITIAL_SCHEMA_VERSION = 1;
+export const JOB_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = JOB_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -94,11 +96,53 @@ const INITIAL_SCHEMA_SQL = `
     ON runtime_observations(project_id, agent_id, observed_at DESC, sequence DESC);
 `;
 
+const JOB_AND_ATTEMPT_SCHEMA_SQL = `
+  CREATE TABLE jobs (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL CHECK (status IN ('draft', 'ready', 'completed', 'cancelled')),
+    repository_id TEXT REFERENCES repositories(id),
+    preferred_runtime_agent_id TEXT,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+
+  CREATE TABLE job_attempts (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES jobs(id),
+    sequence INTEGER NOT NULL CHECK (sequence > 0),
+    runtime_agent_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('created', 'running', 'completed', 'failed', 'cancelled')),
+    started_at TEXT,
+    finished_at TEXT,
+    summary TEXT,
+    failure_reason TEXT,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (job_id, sequence)
+  );
+
+  CREATE UNIQUE INDEX one_active_attempt_per_job
+    ON job_attempts(job_id)
+    WHERE status IN ('created', 'running');
+  CREATE INDEX jobs_by_project ON jobs(project_id, created_at, id);
+  CREATE INDEX attempts_by_job ON job_attempts(job_id, sequence);
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
     name: 'initial-agent-operations-state',
     up: database => database.exec(INITIAL_SCHEMA_SQL),
+  },
+  {
+    version: JOB_SCHEMA_VERSION,
+    name: 'durable-jobs-and-attempts',
+    up: database => database.exec(JOB_AND_ATTEMPT_SCHEMA_SQL),
   },
 ];
 
@@ -106,6 +150,7 @@ export function applyStateMigrations(
   database: Database.Database,
   additionalMigrations: readonly SqliteStateMigration[] = [],
   now: () => Date = () => new Date(),
+  targetVersion?: number,
 ): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -141,8 +186,18 @@ export function applyStateMigrations(
     }
   }
 
+  const resolvedTarget = targetVersion ?? migrations.at(-1)?.version ?? 0;
+  if (!knownByVersion.has(resolvedTarget)) {
+    throw new Error(`Unknown Agent Operations target schema version: ${resolvedTarget}`);
+  }
+  const newerApplied = appliedRows.find(row => row.version > resolvedTarget);
+  if (newerApplied) {
+    throw new Error(`Agent Operations schema ${newerApplied.version} cannot be downgraded to ${resolvedTarget}`);
+  }
+
   const applied = new Set(appliedRows.map(row => row.version));
   for (const migration of migrations) {
+    if (migration.version > resolvedTarget) continue;
     if (applied.has(migration.version)) continue;
     const applyOne = database.transaction(() => {
       migration.up(database);

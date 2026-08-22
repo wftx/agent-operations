@@ -5,6 +5,7 @@ import type {
   WorkingTreeState,
 } from './repository.js';
 import type { RuntimeProvider, RuntimeState } from './runtime.js';
+import type { DurableJob, DurableJobAttempt, NewDurableJobAttempt } from './work.js';
 
 export interface AgentOperationsInstallation {
   readonly id: string;
@@ -90,6 +91,14 @@ export interface AgentOperationsStateStore {
   getLatestRepositoryObservation(checkoutBindingId: string): Promise<DurableRepositoryObservation | null>;
   recordRuntimeObservation(observation: DurableRuntimeObservation): Promise<void>;
   getLatestRuntimeObservation(projectId: string, agentId: string): Promise<DurableRuntimeObservation | null>;
+  createJob(job: DurableJob): Promise<void>;
+  getJob(id: string): Promise<DurableJob | null>;
+  listJobs(projectId?: string): Promise<readonly DurableJob[]>;
+  saveJobTransition(job: DurableJob, expectedRevision: number): Promise<void>;
+  createAttempt(attempt: NewDurableJobAttempt): Promise<DurableJobAttempt>;
+  getAttempt(id: string): Promise<DurableJobAttempt | null>;
+  listAttemptsForJob(jobId: string): Promise<readonly DurableJobAttempt[]>;
+  saveAttemptTransition(attempt: DurableJobAttempt, expectedRevision: number): Promise<void>;
   close(): Promise<void>;
 }
 
