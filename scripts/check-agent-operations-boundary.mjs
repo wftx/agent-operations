@@ -7,6 +7,7 @@ const packagesRoot = join(repositoryRoot, 'packages');
 const failures = [];
 const importPattern = /(?:from\s+|import\s*\(|require\s*\()\s*['"]([^'"]+)['"]/g;
 const coreInternalPattern = /(?:^|\/)src\/(?:daemon|pty|hooks)(?:\/|$)/;
+const implementationPackagePattern = /(?:^|\/)(?:cortextos-adapter|git-adapter)(?:\/|$)/;
 
 function walk(directory) {
   if (!existsSync(directory)) return [];
@@ -32,8 +33,8 @@ for (const packageEntry of readdirSync(packagesRoot, { withFileTypes: true })) {
       }
       const isContractOrDomain = packageName === 'agent-operations-contracts'
         || /^agent-operations-(?:core|domain)$/.test(packageName);
-      if (isContractOrDomain && specifier.includes('cortextos-adapter')) {
-        failures.push(`${relative(repositoryRoot, file)} makes AO contracts/domain depend on the CortextOS adapter`);
+      if (isContractOrDomain && implementationPackagePattern.test(specifier)) {
+        failures.push(`${relative(repositoryRoot, file)} makes AO contracts/domain depend on an implementation adapter: ${specifier}`);
       }
     }
   }

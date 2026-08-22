@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "projects": [
+    {
+      "id": "agent-operations",
+      "name": "Agent Operations",
+      "repositories": [
+        {
+          "path": "."
+        }
+      ],
+      "runtimeAgentIds": []
+    }
+  ]
+}
