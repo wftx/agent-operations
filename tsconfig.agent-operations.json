@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": [
+    "packages/**/*.ts",
+    "tests/architecture/agent-operations-boundary.test.ts"
+  ],
+  "exclude": ["node_modules", "dist", "dashboard"]
+}

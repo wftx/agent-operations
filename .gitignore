@@ -49,6 +49,14 @@ tests/playwright/dashboard-ui.spec.ts
 # Local ops docs (personal, not for public repo)
 docs/
 
+# Public architecture decisions are repository documentation.
+!docs/
+docs/*
+!docs/architecture/
+docs/architecture/*
+!docs/architecture/decisions/
+!docs/architecture/decisions/**
+
 # Internal developer/planning notes (not for public repo)
 KNOWN-ISSUES.md
 WINDOWS-IMPLEMENTATION-PLAN.md
