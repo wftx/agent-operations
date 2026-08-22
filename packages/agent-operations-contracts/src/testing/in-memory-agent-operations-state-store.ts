@@ -12,6 +12,7 @@ import { createRepositoryCheckoutBindingId } from '../persistence.js';
 import type { DurableJob, DurableJobAttempt, NewDurableJobAttempt } from '../work.js';
 import { isActiveAttemptStatus } from '../work.js';
 import type { DurableExecutionPlan } from '../execution.js';
+import type { DurableExecutionDispatch } from '../dispatch.js';
 
 export type InMemoryStateStoreOperation =
   | 'get-installation'
@@ -22,6 +23,7 @@ export type InMemoryStateStoreOperation =
   | 'write-job'
   | 'write-attempt'
   | 'write-execution-plan'
+  | 'write-execution-dispatch'
   | 'close';
 
 export interface InMemoryAgentOperationsStateStoreOptions {
@@ -67,6 +69,35 @@ function copyExecutionPlan(value: DurableExecutionPlan): DurableExecutionPlan {
   return { ...value, input: { ...value.input } };
 }
 
+function copyExecutionDispatch(value: DurableExecutionDispatch): DurableExecutionDispatch {
+  return { ...value };
+}
+
+function isValidDispatchTransition(from: string, to: string): boolean {
+  return from === 'prepared' && to === 'submitting'
+    || from === 'submitting' && (to === 'accepted' || to === 'rejected' || to === 'uncertain');
+}
+
+function validateDispatchShape(dispatch: DurableExecutionDispatch): void {
+  const terminal = dispatch.status === 'accepted'
+    || dispatch.status === 'rejected'
+    || dispatch.status === 'uncertain';
+  if (dispatch.status === 'prepared'
+    && (dispatch.submittedAt || dispatch.acceptedAt || dispatch.resolvedAt)) {
+    throw new Error('Prepared Dispatch cannot have submission or resolution timestamps');
+  }
+  if (dispatch.status === 'submitting'
+    && (!dispatch.submittedAt || dispatch.acceptedAt || dispatch.resolvedAt)) {
+    throw new Error('Submitting Dispatch requires only a submission timestamp');
+  }
+  if (terminal && (!dispatch.submittedAt || !dispatch.resolvedAt)) {
+    throw new Error('Terminal Dispatch requires submission and resolution timestamps');
+  }
+  if ((dispatch.status === 'accepted') !== Boolean(dispatch.acceptedAt)) {
+    throw new Error('Only an accepted Dispatch has an acceptance timestamp');
+  }
+}
+
 function requireNonEmpty(value: string, field: string): void {
   if (!value.trim()) throw new Error(`${field} is required`);
 }
@@ -94,6 +125,7 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   private readonly jobs = new Map<string, DurableJob>();
   private readonly attempts = new Map<string, DurableJobAttempt>();
   private readonly executionPlans = new Map<string, DurableExecutionPlan>();
+  private readonly executionDispatches = new Map<string, DurableExecutionDispatch>();
   private closed = false;
 
   constructor(options: InMemoryAgentOperationsStateStoreOptions = {}) {
@@ -424,6 +456,74 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     this.assertAvailable('read');
     const plan = [...this.executionPlans.values()].find(candidate => candidate.attemptId === attemptId);
     return plan ? copyExecutionPlan(plan) : null;
+  }
+
+  async createExecutionDispatch(dispatch: DurableExecutionDispatch): Promise<void> {
+    this.assertAvailable('write-execution-dispatch');
+    requireNonEmpty(dispatch.id, 'Execution Dispatch ID');
+    requireNonEmpty(dispatch.idempotencyKey, 'Execution Dispatch idempotency key');
+    if (!dispatch.id.startsWith('dispatch:')) throw new Error(`Invalid Execution Dispatch ID: ${dispatch.id}`);
+    if (dispatch.status !== 'prepared' || dispatch.revision !== 0) {
+      throw new Error('New Execution Dispatches must be prepared at revision 0');
+    }
+    validateDispatchShape(dispatch);
+    const plan = this.executionPlans.get(dispatch.executionPlanId);
+    if (!plan
+      || plan.attemptId !== dispatch.attemptId
+      || plan.jobId !== dispatch.jobId
+      || plan.runtimeAgentId !== dispatch.runtimeAgentId) {
+      throw new Error(`Invalid Execution Dispatch Plan associations: ${dispatch.id}`);
+    }
+    if (this.executionDispatches.has(dispatch.id)) {
+      throw new Error(`Duplicate Execution Dispatch ID: ${dispatch.id}`);
+    }
+    if ([...this.executionDispatches.values()].some(candidate =>
+      candidate.executionPlanId === dispatch.executionPlanId)) {
+      throw new Error(`Execution Plan already has a Dispatch: ${dispatch.executionPlanId}`);
+    }
+    if ([...this.executionDispatches.values()].some(candidate =>
+      candidate.idempotencyKey === dispatch.idempotencyKey)) {
+      throw new Error(`Duplicate Execution Dispatch idempotency key: ${dispatch.idempotencyKey}`);
+    }
+    this.executionDispatches.set(dispatch.id, copyExecutionDispatch(dispatch));
+  }
+
+  async getExecutionDispatch(id: string): Promise<DurableExecutionDispatch | null> {
+    this.assertAvailable('read');
+    const dispatch = this.executionDispatches.get(id);
+    return dispatch ? copyExecutionDispatch(dispatch) : null;
+  }
+
+  async getExecutionDispatchForPlan(executionPlanId: string): Promise<DurableExecutionDispatch | null> {
+    this.assertAvailable('read');
+    const dispatch = [...this.executionDispatches.values()]
+      .find(candidate => candidate.executionPlanId === executionPlanId);
+    return dispatch ? copyExecutionDispatch(dispatch) : null;
+  }
+
+  async saveExecutionDispatchTransition(
+    dispatch: DurableExecutionDispatch,
+    expectedRevision: number,
+  ): Promise<void> {
+    this.assertAvailable('write-execution-dispatch');
+    const existing = this.executionDispatches.get(dispatch.id);
+    if (!existing) throw new Error(`Execution Dispatch not found: ${dispatch.id}`);
+    if (existing.revision !== expectedRevision || dispatch.revision !== expectedRevision + 1) {
+      throw new Error(`Stale Execution Dispatch revision for ${dispatch.id}`);
+    }
+    if (existing.executionPlanId !== dispatch.executionPlanId
+      || existing.attemptId !== dispatch.attemptId
+      || existing.jobId !== dispatch.jobId
+      || existing.runtimeAgentId !== dispatch.runtimeAgentId
+      || existing.idempotencyKey !== dispatch.idempotencyKey
+      || existing.createdAt !== dispatch.createdAt) {
+      throw new Error(`Execution Dispatch transition cannot rewrite durable identity: ${dispatch.id}`);
+    }
+    if (!isValidDispatchTransition(existing.status, dispatch.status)) {
+      throw new Error(`Execution Dispatch cannot transition from ${existing.status} to ${dispatch.status}`);
+    }
+    validateDispatchShape(dispatch);
+    this.executionDispatches.set(dispatch.id, copyExecutionDispatch(dispatch));
   }
 
   async close(): Promise<void> {

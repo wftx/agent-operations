@@ -9,7 +9,8 @@ export interface SqliteStateMigration {
 export const INITIAL_SCHEMA_VERSION = 1;
 export const JOB_SCHEMA_VERSION = 2;
 export const EXECUTION_PLAN_SCHEMA_VERSION = 3;
-export const CURRENT_SCHEMA_VERSION = EXECUTION_PLAN_SCHEMA_VERSION;
+export const DISPATCH_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = DISPATCH_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -167,6 +168,41 @@ const EXECUTION_PLAN_SCHEMA_SQL = `
   CREATE INDEX execution_plans_by_job ON execution_plans(job_id, created_at, id);
 `;
 
+const EXECUTION_DISPATCH_SCHEMA_SQL = `
+  CREATE UNIQUE INDEX execution_plans_dispatch_scope
+    ON execution_plans(id, attempt_id, job_id, runtime_agent_id);
+
+  CREATE TABLE execution_dispatches (
+    id TEXT PRIMARY KEY,
+    execution_plan_id TEXT NOT NULL UNIQUE,
+    attempt_id TEXT NOT NULL,
+    job_id TEXT NOT NULL,
+    runtime_agent_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE CHECK (length(trim(idempotency_key)) > 0),
+    status TEXT NOT NULL CHECK (status IN ('prepared', 'submitting', 'accepted', 'rejected', 'uncertain')),
+    external_reference TEXT,
+    message TEXT,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    submitted_at TEXT,
+    accepted_at TEXT,
+    resolved_at TEXT,
+    FOREIGN KEY (attempt_id) REFERENCES job_attempts(id),
+    FOREIGN KEY (job_id) REFERENCES jobs(id),
+    FOREIGN KEY (execution_plan_id, attempt_id, job_id, runtime_agent_id)
+      REFERENCES execution_plans(id, attempt_id, job_id, runtime_agent_id),
+    CHECK (
+      (status = 'prepared' AND submitted_at IS NULL AND accepted_at IS NULL AND resolved_at IS NULL)
+      OR (status = 'submitting' AND submitted_at IS NOT NULL AND accepted_at IS NULL AND resolved_at IS NULL)
+      OR (status = 'accepted' AND submitted_at IS NOT NULL AND accepted_at IS NOT NULL AND resolved_at IS NOT NULL)
+      OR (status IN ('rejected', 'uncertain') AND submitted_at IS NOT NULL AND accepted_at IS NULL AND resolved_at IS NOT NULL)
+    )
+  );
+
+  CREATE INDEX execution_dispatches_by_attempt ON execution_dispatches(attempt_id, created_at, id);
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -182,6 +218,11 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: EXECUTION_PLAN_SCHEMA_VERSION,
     name: 'immutable-execution-plans',
     up: database => database.exec(EXECUTION_PLAN_SCHEMA_SQL),
+  },
+  {
+    version: DISPATCH_SCHEMA_VERSION,
+    name: 'manual-execution-dispatches',
+    up: database => database.exec(EXECUTION_DISPATCH_SCHEMA_SQL),
   },
 ];
 

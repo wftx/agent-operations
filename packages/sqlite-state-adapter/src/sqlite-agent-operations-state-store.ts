@@ -10,6 +10,8 @@ import type {
   DurableJob,
   DurableJobAttempt,
   DurableExecutionPlan,
+  DurableExecutionDispatch,
+  DispatchStatus,
   DurableRepository,
   DurableRepositoryObservation,
   DurableRuntimeObservation,
@@ -135,6 +137,24 @@ interface ExecutionPlanRow {
   created_at: string;
 }
 
+interface ExecutionDispatchRow {
+  id: string;
+  execution_plan_id: string;
+  attempt_id: string;
+  job_id: string;
+  runtime_agent_id: string;
+  idempotency_key: string;
+  status: DispatchStatus;
+  external_reference: string | null;
+  message: string | null;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+  submitted_at: string | null;
+  accepted_at: string | null;
+  resolved_at: string | null;
+}
+
 function requireNonEmpty(value: string, field: string): void {
   if (!value.trim()) throw new Error(`${field} is required`);
 }
@@ -255,6 +275,31 @@ function toExecutionPlan(row: ExecutionPlanRow): DurableExecutionPlan {
     attemptRevisionAtPreparation: row.attempt_revision,
     createdAt: row.created_at,
   };
+}
+
+function toExecutionDispatch(row: ExecutionDispatchRow): DurableExecutionDispatch {
+  return {
+    id: row.id,
+    executionPlanId: row.execution_plan_id,
+    attemptId: row.attempt_id,
+    jobId: row.job_id,
+    runtimeAgentId: row.runtime_agent_id,
+    idempotencyKey: row.idempotency_key,
+    status: row.status,
+    ...(row.external_reference ? { externalReference: row.external_reference } : {}),
+    ...(row.message ? { message: row.message } : {}),
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(row.submitted_at ? { submittedAt: row.submitted_at } : {}),
+    ...(row.accepted_at ? { acceptedAt: row.accepted_at } : {}),
+    ...(row.resolved_at ? { resolvedAt: row.resolved_at } : {}),
+  };
+}
+
+function isValidDispatchTransition(from: DispatchStatus, to: DispatchStatus): boolean {
+  return from === 'prepared' && to === 'submitting'
+    || from === 'submitting' && (to === 'accepted' || to === 'rejected' || to === 'uncertain');
 }
 
 export class SqliteAgentOperationsStateStore implements AgentOperationsStateStore {
@@ -779,6 +824,110 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     const row = this.database.prepare('SELECT * FROM execution_plans WHERE attempt_id = ?')
       .get(attemptId) as ExecutionPlanRow | undefined;
     return row ? toExecutionPlan(row) : null;
+  }
+
+  async createExecutionDispatch(dispatch: DurableExecutionDispatch): Promise<void> {
+    this.assertOpen();
+    requireNonEmpty(dispatch.idempotencyKey, 'Execution Dispatch idempotency key');
+    if (!dispatch.id.startsWith('dispatch:')) throw new Error(`Invalid Execution Dispatch ID: ${dispatch.id}`);
+    if (dispatch.status !== 'prepared' || dispatch.revision !== 0) {
+      throw new Error('New Execution Dispatches must be prepared at revision 0');
+    }
+    const plan = this.database.prepare(`
+      SELECT attempt_id, job_id, runtime_agent_id FROM execution_plans WHERE id = ?
+    `).get(dispatch.executionPlanId) as {
+      attempt_id: string;
+      job_id: string;
+      runtime_agent_id: string;
+    } | undefined;
+    if (!plan
+      || plan.attempt_id !== dispatch.attemptId
+      || plan.job_id !== dispatch.jobId
+      || plan.runtime_agent_id !== dispatch.runtimeAgentId) {
+      throw new Error(`Invalid Execution Dispatch Plan associations: ${dispatch.id}`);
+    }
+    try {
+      this.database.prepare(`
+        INSERT INTO execution_dispatches
+          (id, execution_plan_id, attempt_id, job_id, runtime_agent_id, idempotency_key,
+           status, revision, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        dispatch.id,
+        dispatch.executionPlanId,
+        dispatch.attemptId,
+        dispatch.jobId,
+        dispatch.runtimeAgentId,
+        dispatch.idempotencyKey,
+        dispatch.status,
+        dispatch.revision,
+        dispatch.createdAt,
+        dispatch.updatedAt,
+      );
+    } catch (error) {
+      throw new Error(`Could not create Execution Dispatch ${dispatch.id}: ${(error as Error).message}`);
+    }
+  }
+
+  async getExecutionDispatch(id: string): Promise<DurableExecutionDispatch | null> {
+    this.assertOpen();
+    const row = this.database.prepare('SELECT * FROM execution_dispatches WHERE id = ?')
+      .get(id) as ExecutionDispatchRow | undefined;
+    return row ? toExecutionDispatch(row) : null;
+  }
+
+  async getExecutionDispatchForPlan(executionPlanId: string): Promise<DurableExecutionDispatch | null> {
+    this.assertOpen();
+    const row = this.database.prepare('SELECT * FROM execution_dispatches WHERE execution_plan_id = ?')
+      .get(executionPlanId) as ExecutionDispatchRow | undefined;
+    return row ? toExecutionDispatch(row) : null;
+  }
+
+  async saveExecutionDispatchTransition(
+    dispatch: DurableExecutionDispatch,
+    expectedRevision: number,
+  ): Promise<void> {
+    this.assertOpen();
+    const existingRow = this.database.prepare('SELECT * FROM execution_dispatches WHERE id = ?')
+      .get(dispatch.id) as ExecutionDispatchRow | undefined;
+    if (!existingRow) throw new Error(`Execution Dispatch not found: ${dispatch.id}`);
+    const existing = toExecutionDispatch(existingRow);
+    if (existing.executionPlanId !== dispatch.executionPlanId
+      || existing.attemptId !== dispatch.attemptId
+      || existing.jobId !== dispatch.jobId
+      || existing.runtimeAgentId !== dispatch.runtimeAgentId
+      || existing.idempotencyKey !== dispatch.idempotencyKey
+      || existing.createdAt !== dispatch.createdAt) {
+      throw new Error(`Execution Dispatch transition cannot rewrite durable identity: ${dispatch.id}`);
+    }
+    if (dispatch.revision !== expectedRevision + 1) {
+      throw new Error(`Execution Dispatch transition revision must advance exactly once: ${dispatch.id}`);
+    }
+    if (!isValidDispatchTransition(existing.status, dispatch.status)) {
+      throw new Error(`Execution Dispatch cannot transition from ${existing.status} to ${dispatch.status}`);
+    }
+    try {
+      const result = this.database.prepare(`
+        UPDATE execution_dispatches SET
+          status = ?, external_reference = ?, message = ?, revision = ?, updated_at = ?,
+          submitted_at = ?, accepted_at = ?, resolved_at = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        dispatch.status,
+        dispatch.externalReference ?? null,
+        dispatch.message ?? null,
+        dispatch.revision,
+        dispatch.updatedAt,
+        dispatch.submittedAt ?? null,
+        dispatch.acceptedAt ?? null,
+        dispatch.resolvedAt ?? null,
+        dispatch.id,
+        expectedRevision,
+      );
+      if (result.changes !== 1) throw new Error(`Stale Execution Dispatch revision for ${dispatch.id}`);
+    } catch (error) {
+      throw new Error(`Could not transition Execution Dispatch ${dispatch.id}: ${(error as Error).message}`);
+    }
   }
 
   async close(): Promise<void> {

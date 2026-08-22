@@ -1,6 +1,8 @@
+import { resolve } from 'node:path';
 import type {
   AgentOperationsStateStore,
   AgentRuntimeAdapter,
+  AgentRuntimeDetail,
   DurableExecutionPlan,
   ExecutionPreflightFinding,
   ExecutionPreflightFindingCode,
@@ -23,8 +25,8 @@ export class ExecutionPreflightService {
     if (!plan) throw new Error(`Execution Plan not found: ${planId}`);
     const checks: ExecutionPreflightFinding[] = [];
     await this.checkDurableState(plan, checks);
-    await this.checkRuntime(plan, checks);
-    await this.checkRepository(plan, checks);
+    const runtime = await this.checkRuntime(plan, checks);
+    await this.checkRepository(plan, checks, runtime);
     const dispatchable = !checks.some(check => check.severity === 'blocking');
     return {
       planId: plan.id,
@@ -108,7 +110,7 @@ export class ExecutionPreflightService {
   private async checkRuntime(
     plan: DurableExecutionPlan,
     checks: ExecutionPreflightFinding[],
-  ): Promise<void> {
+  ): Promise<AgentRuntimeDetail | null> {
     const runtimeIds = await this.store.listProjectRuntimeAgentIds(plan.projectId)
       .catch(() => [] as readonly string[]);
     const associated = runtimeIds.includes(plan.runtimeAgentId);
@@ -130,13 +132,13 @@ export class ExecutionPreflightService {
           'blocking',
           `Runtime inventory is ${health.state}${health.reason ? `: ${health.reason}` : '.'}`,
         );
-        return;
+        return null;
       }
       add(checks, 'runtime-adapter-available', 'pass', 'Runtime inventory is currently available.');
       const runtime = await this.runtimes.getAgent(plan.runtimeAgentId);
       if (!runtime) {
         add(checks, 'runtime-missing', 'blocking', `Runtime ${plan.runtimeAgentId} was not observed.`);
-        return;
+        return null;
       }
       if (runtime.provider === 'unknown') {
         add(checks, 'runtime-provider-unknown', 'blocking', `Runtime ${runtime.id} has an unknown provider.`);
@@ -154,6 +156,7 @@ export class ExecutionPreflightService {
         runtime.health.state === 'running' ? 'pass' : 'blocking',
         `Runtime ${runtime.id} is ${runtime.health.state}${runtime.health.reason ? `: ${runtime.health.reason}` : '.'}`,
       );
+      return runtime;
     } catch (error) {
       add(
         checks,
@@ -161,12 +164,14 @@ export class ExecutionPreflightService {
         'blocking',
         `Runtime observation failed: ${message(error)}`,
       );
+      return null;
     }
   }
 
   private async checkRepository(
     plan: DurableExecutionPlan,
     checks: ExecutionPreflightFinding[],
+    runtime: AgentRuntimeDetail | null,
   ): Promise<void> {
     if (!plan.repositoryId && !plan.checkoutBindingId) {
       add(checks, 'no-repository-target', 'pass', 'Plan has no repository target.');
@@ -200,6 +205,25 @@ export class ExecutionPreflightService {
     }
     if (binding.installationId === plan.installationId && binding.repositoryId === plan.repositoryId) {
       add(checks, 'checkout-binding-valid', 'pass', 'Checkout binding matches Plan installation and repository.');
+    }
+    if (!runtime?.workingDirectory) {
+      add(
+        checks,
+        'runtime-working-directory-unavailable',
+        'blocking',
+        `Runtime ${plan.runtimeAgentId} does not expose its current working directory.`,
+      );
+    } else {
+      const runtimeDirectory = resolve(runtime.workingDirectory);
+      const checkoutDirectory = resolve(binding.canonicalPath);
+      add(
+        checks,
+        runtimeDirectory === checkoutDirectory ? 'runtime-checkout-match' : 'runtime-checkout-mismatch',
+        runtimeDirectory === checkoutDirectory ? 'pass' : 'blocking',
+        runtimeDirectory === checkoutDirectory
+          ? 'Runtime working directory matches the selected checkout.'
+          : `Runtime working directory ${runtimeDirectory} does not match checkout ${checkoutDirectory}.`,
+      );
     }
     try {
       const observation = await this.repositories.inspectRepository(binding.canonicalPath);

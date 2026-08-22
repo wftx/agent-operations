@@ -89,7 +89,7 @@ async function main(): Promise<void> {
       observedAt: now,
     };
     const repositoryAdapter = new FakeRepositoryInventoryAdapter([observedRepository]);
-    const runningRuntime = runtimeFixture(now, 'running');
+    const runningRuntime = runtimeFixture(now, 'running', checkoutPath);
     const ready = await new ExecutionPreflightService(
       store,
       new FakeAgentRuntimeAdapter([runningRuntime]),
@@ -97,7 +97,7 @@ async function main(): Promise<void> {
     ).preflight(plan.id);
     const blocked = await new ExecutionPreflightService(
       store,
-      new FakeAgentRuntimeAdapter([runtimeFixture(now, 'stopped')]),
+      new FakeAgentRuntimeAdapter([runtimeFixture(now, 'stopped', checkoutPath)]),
       repositoryAdapter,
     ).preflight(plan.id);
 
@@ -115,7 +115,11 @@ async function main(): Promise<void> {
   }
 }
 
-function runtimeFixture(observedAt: string, state: 'running' | 'stopped'): AgentRuntimeDetail {
+function runtimeFixture(
+  observedAt: string,
+  state: 'running' | 'stopped',
+  workingDirectory: string,
+): AgentRuntimeDetail {
   return {
     id: RUNTIME_ID,
     name: 'coder',
@@ -125,6 +129,7 @@ function runtimeFixture(observedAt: string, state: 'running' | 'stopped'): Agent
     configured: true,
     capabilities: ['session-resume'],
     health: { state },
+    workingDirectory,
     observedAt,
   };
 }

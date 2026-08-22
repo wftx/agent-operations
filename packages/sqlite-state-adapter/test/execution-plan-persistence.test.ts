@@ -113,14 +113,14 @@ async function seedPhaseSeven(store: SqliteAgentOperationsStateStore): Promise<v
 describe('SQLite Execution Plan persistence', () => {
   it('creates and reopens an immutable Plan in a fresh schema-v3 database', async () => {
     const databasePath = path();
-    const store = open(databasePath);
+    const store = open(databasePath, 3);
     await seedPhaseSeven(store);
     await store.createExecutionPlan(plan());
     await expect(store.createExecutionPlan({ ...plan(), id: 'plan:duplicate-attempt' }))
       .rejects.toThrow('Could not create Execution Plan');
     await store.close();
 
-    const reopened = open(databasePath);
+    const reopened = open(databasePath, 3);
     expect(await reopened.getExecutionPlan(plan().id)).toEqual(plan());
     expect(await reopened.getExecutionPlanForAttempt(plan().attemptId)).toEqual(plan());
     expect('updateExecutionPlan' in reopened).toBe(false);
@@ -140,7 +140,7 @@ describe('SQLite Execution Plan persistence', () => {
       .toBeUndefined();
     database.close();
 
-    const upgraded = open(databasePath);
+    const upgraded = open(databasePath, 3);
     expect(await upgraded.getProject(PROJECT_ID)).toMatchObject({ name: 'Agent Operations' });
     expect(await upgraded.getRepository(REPOSITORY_ID)).toMatchObject({ name: 'agent-operations' });
     expect(await upgraded.getJob(job().id)).toMatchObject({ status: 'ready', revision: 1 });
@@ -155,7 +155,7 @@ describe('SQLite Execution Plan persistence', () => {
     database.close();
   });
 
-  it('rolls back a failed migration after v3 without damaging Plans or migration history', async () => {
+  it('rolls back a failed migration after current state without damaging Plans or migration history', async () => {
     const databasePath = path();
     const store = open(databasePath);
     await seedPhaseSeven(store);
@@ -165,20 +165,20 @@ describe('SQLite Execution Plan persistence', () => {
     expect(() => SqliteAgentOperationsStateStore.open({
       databasePath,
       additionalMigrations: [{
-        version: 4,
-        name: 'deliberate-v4-failure',
+        version: 5,
+        name: 'deliberate-v5-failure',
         up: database => {
-          database.exec('CREATE TABLE should_rollback_v4 (id TEXT)');
+          database.exec('CREATE TABLE should_rollback_v5 (id TEXT)');
           throw new Error('deliberate migration failure');
         },
       }],
     })).toThrow('deliberate migration failure');
 
     const database = new Database(databasePath, { readonly: true });
-    expect(database.prepare("SELECT name FROM sqlite_master WHERE name='should_rollback_v4'").get())
+    expect(database.prepare("SELECT name FROM sqlite_master WHERE name='should_rollback_v5'").get())
       .toBeUndefined();
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }]);
     expect(database.prepare('SELECT id FROM execution_plans').get()).toEqual({ id: plan().id });
     database.close();
   });

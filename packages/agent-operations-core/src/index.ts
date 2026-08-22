@@ -26,3 +26,9 @@ export {
   type PrepareExecutionPlanInput,
 } from './execution-planning-service.js';
 export { ExecutionPreflightService } from './execution-preflight-service.js';
+export {
+  ManualDispatchService,
+  type ManualDispatchOutcome,
+  type ManualDispatchOutcomeStatus,
+  type ManualDispatchServiceOptions,
+} from './manual-dispatch-service.js';

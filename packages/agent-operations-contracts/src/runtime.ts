@@ -48,6 +48,8 @@ export interface AgentRuntimeSummary extends AgentRuntimeIdentity {
 
 export interface AgentRuntimeDetail extends AgentRuntimeSummary {
   readonly observedAt: string;
+  /** Current effective launch directory when the runtime can prove it. */
+  readonly workingDirectory?: string;
 }
 
 export type RuntimeInventoryState = 'available' | 'degraded' | 'unavailable';

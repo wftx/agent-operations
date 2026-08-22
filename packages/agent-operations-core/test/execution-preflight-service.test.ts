@@ -51,7 +51,11 @@ function configuration(runtimeIds: readonly string[] = [RUNTIME_ID]): DurablePro
   };
 }
 
-function runtime(state: RuntimeState = 'running', provider: 'codex' | 'unknown' = 'codex') {
+function runtime(
+  state: RuntimeState = 'running',
+  provider: 'codex' | 'unknown' = 'codex',
+  workingDirectory: string | null = PATH,
+) {
   return new FakeAgentRuntimeAdapter([{
     id: RUNTIME_ID,
     name: 'coder',
@@ -62,6 +66,7 @@ function runtime(state: RuntimeState = 'running', provider: 'codex' | 'unknown' 
     capabilities: ['session-resume'],
     health: { state },
     observedAt: TIME,
+    ...(workingDirectory ? { workingDirectory } : {}),
   }]);
 }
 
@@ -155,6 +160,26 @@ describe('ExecutionPreflightService', () => {
     ).preflight(plan.id);
     expect(result).toMatchObject({ status: 'warning', dispatchable: true });
     expect(codes(result)).toEqual(expect.arrayContaining(['working-tree-dirty', 'detached-head']));
+  });
+
+  it('blocks repository work when runtime checkout compatibility cannot be proven', async () => {
+    const unavailable = await prepared();
+    let result = await new ExecutionPreflightService(
+      unavailable.store,
+      runtime('running', 'codex', null),
+      repository(),
+    ).preflight(unavailable.plan.id);
+    expect(codes(result)).toContain('runtime-working-directory-unavailable');
+    expect(result.dispatchable).toBe(false);
+
+    const mismatch = await prepared();
+    result = await new ExecutionPreflightService(
+      mismatch.store,
+      runtime('running', 'codex', '/fixtures/wrong-checkout'),
+      repository(),
+    ).preflight(mismatch.plan.id);
+    expect(codes(result)).toContain('runtime-checkout-mismatch');
+    expect(result.dispatchable).toBe(false);
   });
 
   it.each(['starting', 'stopped', 'degraded', 'unknown'] as const)(

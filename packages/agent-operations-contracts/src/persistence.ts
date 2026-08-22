@@ -7,6 +7,7 @@ import type {
 import type { RuntimeProvider, RuntimeState } from './runtime.js';
 import type { DurableJob, DurableJobAttempt, NewDurableJobAttempt } from './work.js';
 import type { DurableExecutionPlan } from './execution.js';
+import type { DurableExecutionDispatch } from './dispatch.js';
 
 export interface AgentOperationsInstallation {
   readonly id: string;
@@ -103,6 +104,13 @@ export interface AgentOperationsStateStore {
   createExecutionPlan(plan: DurableExecutionPlan): Promise<void>;
   getExecutionPlan(id: string): Promise<DurableExecutionPlan | null>;
   getExecutionPlanForAttempt(attemptId: string): Promise<DurableExecutionPlan | null>;
+  createExecutionDispatch(dispatch: DurableExecutionDispatch): Promise<void>;
+  getExecutionDispatch(id: string): Promise<DurableExecutionDispatch | null>;
+  getExecutionDispatchForPlan(executionPlanId: string): Promise<DurableExecutionDispatch | null>;
+  saveExecutionDispatchTransition(
+    dispatch: DurableExecutionDispatch,
+    expectedRevision: number,
+  ): Promise<void>;
   close(): Promise<void>;
 }
 
