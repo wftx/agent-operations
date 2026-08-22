@@ -9,6 +9,7 @@
   "include": [
     "packages/**/*.ts",
     "scripts/project-inventory-demo.ts",
+    "scripts/state-sync-demo.ts",
     "tests/architecture/agent-operations-boundary.test.ts"
   ],
   "exclude": ["node_modules", "dist", "dashboard"]

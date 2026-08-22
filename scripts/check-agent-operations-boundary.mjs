@@ -7,7 +7,8 @@ const packagesRoot = join(repositoryRoot, 'packages');
 const failures = [];
 const importPattern = /(?:from\s+|import\s*\(|require\s*\()\s*['"]([^'"]+)['"]/g;
 const coreInternalPattern = /(?:^|\/)src\/(?:daemon|pty|hooks)(?:\/|$)/;
-const implementationPackagePattern = /(?:^|\/)(?:cortextos-adapter|git-adapter)(?:\/|$)/;
+const implementationPackagePattern = /(?:^|\/)(?:cortextos-adapter|git-adapter|sqlite-state-adapter)(?:\/|$)/;
+const foreignPersistencePattern = /(?:^|\/)(?:dashboard\/src\/lib\/db|src\/(?:bus|utils\/(?:atomic|lock)))(?:\.[cm]?[jt]s|\/|$)/;
 
 function walk(directory) {
   if (!existsSync(directory)) return [];
@@ -35,6 +36,9 @@ for (const packageEntry of readdirSync(packagesRoot, { withFileTypes: true })) {
         || /^agent-operations-(?:core|domain)$/.test(packageName);
       if (isContractOrDomain && implementationPackagePattern.test(specifier)) {
         failures.push(`${relative(repositoryRoot, file)} makes AO contracts/domain depend on an implementation adapter: ${specifier}`);
+      }
+      if (isContractOrDomain && foreignPersistencePattern.test(specifier)) {
+        failures.push(`${relative(repositoryRoot, file)} makes AO contracts/domain depend on foreign persistence: ${specifier}`);
       }
     }
   }
