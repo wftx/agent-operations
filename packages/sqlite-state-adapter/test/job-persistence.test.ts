@@ -93,7 +93,7 @@ describe('SQLite job and attempt persistence', () => {
       .toBeUndefined();
     database.close();
 
-    const upgraded = open(path);
+    const upgraded = open(path, 2);
     expect(await upgraded.getProject(PROJECT_ID)).toMatchObject({ name: 'Agent Operations' });
     expect(await upgraded.listJobs()).toEqual([]);
     await upgraded.createJob(job());

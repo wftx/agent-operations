@@ -9,6 +9,7 @@ import type {
   DurableProjectConfiguration,
   DurableJob,
   DurableJobAttempt,
+  DurableExecutionPlan,
   DurableRepository,
   DurableRepositoryObservation,
   DurableRuntimeObservation,
@@ -118,6 +119,22 @@ interface AttemptRow {
   updated_at: string;
 }
 
+interface ExecutionPlanRow {
+  id: string;
+  attempt_id: string;
+  job_id: string;
+  project_id: string;
+  installation_id: string;
+  runtime_agent_id: string;
+  repository_id: string | null;
+  checkout_binding_id: string | null;
+  input_version: 1;
+  instruction: string;
+  job_revision: number;
+  attempt_revision: number;
+  created_at: string;
+}
+
 function requireNonEmpty(value: string, field: string): void {
   if (!value.trim()) throw new Error(`${field} is required`);
 }
@@ -220,6 +237,23 @@ function toAttempt(row: AttemptRow): DurableJobAttempt {
     revision: row.revision,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function toExecutionPlan(row: ExecutionPlanRow): DurableExecutionPlan {
+  return {
+    id: row.id,
+    attemptId: row.attempt_id,
+    jobId: row.job_id,
+    projectId: row.project_id,
+    installationId: row.installation_id,
+    runtimeAgentId: row.runtime_agent_id,
+    ...(row.repository_id ? { repositoryId: row.repository_id } : {}),
+    ...(row.checkout_binding_id ? { checkoutBindingId: row.checkout_binding_id } : {}),
+    input: { version: row.input_version, instruction: row.instruction },
+    jobRevisionAtPreparation: row.job_revision,
+    attemptRevisionAtPreparation: row.attempt_revision,
+    createdAt: row.created_at,
   };
 }
 
@@ -675,6 +709,76 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
       expectedRevision,
     );
     if (result.changes !== 1) throw new Error(`Stale attempt revision for ${attempt.id}`);
+  }
+
+  async createExecutionPlan(plan: DurableExecutionPlan): Promise<void> {
+    this.assertOpen();
+    requireNonEmpty(plan.input.instruction, 'Execution instruction');
+    if (!plan.id.startsWith('plan:')) throw new Error(`Invalid Execution Plan ID: ${plan.id}`);
+    if (plan.input.version !== 1) throw new Error(`Unsupported execution input version: ${plan.input.version}`);
+    if (plan.jobRevisionAtPreparation < 0 || plan.attemptRevisionAtPreparation < 0) {
+      throw new Error('Execution Plan revisions must be non-negative');
+    }
+    const attempt = this.database.prepare(`
+      SELECT a.job_id, a.runtime_agent_id, a.revision AS attempt_revision,
+             j.project_id, j.repository_id, j.revision AS job_revision
+      FROM job_attempts a JOIN jobs j ON j.id = a.job_id WHERE a.id = ?
+    `).get(plan.attemptId) as {
+      job_id: string;
+      runtime_agent_id: string | null;
+      project_id: string;
+      repository_id: string | null;
+      job_revision: number;
+      attempt_revision: number;
+    } | undefined;
+    if (!attempt
+      || attempt.job_id !== plan.jobId
+      || attempt.project_id !== plan.projectId
+      || attempt.runtime_agent_id !== plan.runtimeAgentId
+      || (attempt.repository_id ?? undefined) !== plan.repositoryId
+      || attempt.job_revision !== plan.jobRevisionAtPreparation
+      || attempt.attempt_revision !== plan.attemptRevisionAtPreparation) {
+      throw new Error(`Invalid Execution Plan durable associations: ${plan.id}`);
+    }
+    try {
+      this.database.prepare(`
+        INSERT INTO execution_plans
+          (id, attempt_id, job_id, project_id, installation_id, runtime_agent_id,
+           repository_id, checkout_binding_id, input_version, instruction,
+           job_revision, attempt_revision, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        plan.id,
+        plan.attemptId,
+        plan.jobId,
+        plan.projectId,
+        plan.installationId,
+        plan.runtimeAgentId,
+        plan.repositoryId ?? null,
+        plan.checkoutBindingId ?? null,
+        plan.input.version,
+        plan.input.instruction,
+        plan.jobRevisionAtPreparation,
+        plan.attemptRevisionAtPreparation,
+        plan.createdAt,
+      );
+    } catch (error) {
+      throw new Error(`Could not create Execution Plan ${plan.id}: ${(error as Error).message}`);
+    }
+  }
+
+  async getExecutionPlan(id: string): Promise<DurableExecutionPlan | null> {
+    this.assertOpen();
+    const row = this.database.prepare('SELECT * FROM execution_plans WHERE id = ?')
+      .get(id) as ExecutionPlanRow | undefined;
+    return row ? toExecutionPlan(row) : null;
+  }
+
+  async getExecutionPlanForAttempt(attemptId: string): Promise<DurableExecutionPlan | null> {
+    this.assertOpen();
+    const row = this.database.prepare('SELECT * FROM execution_plans WHERE attempt_id = ?')
+      .get(attemptId) as ExecutionPlanRow | undefined;
+    return row ? toExecutionPlan(row) : null;
   }
 
   async close(): Promise<void> {

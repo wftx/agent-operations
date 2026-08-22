@@ -6,6 +6,7 @@ import type {
 } from './repository.js';
 import type { RuntimeProvider, RuntimeState } from './runtime.js';
 import type { DurableJob, DurableJobAttempt, NewDurableJobAttempt } from './work.js';
+import type { DurableExecutionPlan } from './execution.js';
 
 export interface AgentOperationsInstallation {
   readonly id: string;
@@ -99,6 +100,9 @@ export interface AgentOperationsStateStore {
   getAttempt(id: string): Promise<DurableJobAttempt | null>;
   listAttemptsForJob(jobId: string): Promise<readonly DurableJobAttempt[]>;
   saveAttemptTransition(attempt: DurableJobAttempt, expectedRevision: number): Promise<void>;
+  createExecutionPlan(plan: DurableExecutionPlan): Promise<void>;
+  getExecutionPlan(id: string): Promise<DurableExecutionPlan | null>;
+  getExecutionPlanForAttempt(attemptId: string): Promise<DurableExecutionPlan | null>;
   close(): Promise<void>;
 }
 

@@ -11,6 +11,7 @@
     "scripts/project-inventory-demo.ts",
     "scripts/state-sync-demo.ts",
     "scripts/job-lifecycle-demo.ts",
+    "scripts/execution-preflight-demo.ts",
     "tests/architecture/agent-operations-boundary.test.ts"
   ],
   "exclude": ["node_modules", "dist", "dashboard"]

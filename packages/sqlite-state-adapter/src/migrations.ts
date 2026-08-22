@@ -8,7 +8,8 @@ export interface SqliteStateMigration {
 
 export const INITIAL_SCHEMA_VERSION = 1;
 export const JOB_SCHEMA_VERSION = 2;
-export const CURRENT_SCHEMA_VERSION = JOB_SCHEMA_VERSION;
+export const EXECUTION_PLAN_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = EXECUTION_PLAN_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -133,6 +134,39 @@ const JOB_AND_ATTEMPT_SCHEMA_SQL = `
   CREATE INDEX attempts_by_job ON job_attempts(job_id, sequence);
 `;
 
+const EXECUTION_PLAN_SCHEMA_SQL = `
+  CREATE UNIQUE INDEX jobs_identity_with_project ON jobs(id, project_id);
+  CREATE UNIQUE INDEX attempts_identity_with_job ON job_attempts(id, job_id);
+  CREATE UNIQUE INDEX checkout_identity_with_scope
+    ON repository_checkouts(id, repository_id, installation_id);
+
+  CREATE TABLE execution_plans (
+    id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL UNIQUE,
+    job_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    installation_id TEXT NOT NULL REFERENCES installations(id),
+    runtime_agent_id TEXT NOT NULL,
+    repository_id TEXT,
+    checkout_binding_id TEXT,
+    input_version INTEGER NOT NULL CHECK (input_version = 1),
+    instruction TEXT NOT NULL CHECK (length(trim(instruction)) > 0),
+    job_revision INTEGER NOT NULL CHECK (job_revision >= 0),
+    attempt_revision INTEGER NOT NULL CHECK (attempt_revision >= 0),
+    created_at TEXT NOT NULL,
+    CHECK (
+      (repository_id IS NULL AND checkout_binding_id IS NULL)
+      OR (repository_id IS NOT NULL AND checkout_binding_id IS NOT NULL)
+    ),
+    FOREIGN KEY (job_id, project_id) REFERENCES jobs(id, project_id),
+    FOREIGN KEY (attempt_id, job_id) REFERENCES job_attempts(id, job_id),
+    FOREIGN KEY (checkout_binding_id, repository_id, installation_id)
+      REFERENCES repository_checkouts(id, repository_id, installation_id)
+  );
+
+  CREATE INDEX execution_plans_by_job ON execution_plans(job_id, created_at, id);
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -143,6 +177,11 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: JOB_SCHEMA_VERSION,
     name: 'durable-jobs-and-attempts',
     up: database => database.exec(JOB_AND_ATTEMPT_SCHEMA_SQL),
+  },
+  {
+    version: EXECUTION_PLAN_SCHEMA_VERSION,
+    name: 'immutable-execution-plans',
+    up: database => database.exec(EXECUTION_PLAN_SCHEMA_SQL),
   },
 ];
 

@@ -19,3 +19,10 @@ export {
   type JobDetail,
   type JobLifecycleServiceOptions,
 } from './job-lifecycle-service.js';
+export {
+  ExecutionPlanningService,
+  type ExecutionPlanDetail,
+  type ExecutionPlanningServiceOptions,
+  type PrepareExecutionPlanInput,
+} from './execution-planning-service.js';
+export { ExecutionPreflightService } from './execution-preflight-service.js';

@@ -11,6 +11,7 @@ import type {
 import { createRepositoryCheckoutBindingId } from '../persistence.js';
 import type { DurableJob, DurableJobAttempt, NewDurableJobAttempt } from '../work.js';
 import { isActiveAttemptStatus } from '../work.js';
+import type { DurableExecutionPlan } from '../execution.js';
 
 export type InMemoryStateStoreOperation =
   | 'get-installation'
@@ -20,6 +21,7 @@ export type InMemoryStateStoreOperation =
   | 'record-runtime-observation'
   | 'write-job'
   | 'write-attempt'
+  | 'write-execution-plan'
   | 'close';
 
 export interface InMemoryAgentOperationsStateStoreOptions {
@@ -61,6 +63,10 @@ function copyAttempt(value: DurableJobAttempt): DurableJobAttempt {
   return { ...value };
 }
 
+function copyExecutionPlan(value: DurableExecutionPlan): DurableExecutionPlan {
+  return { ...value, input: { ...value.input } };
+}
+
 function requireNonEmpty(value: string, field: string): void {
   if (!value.trim()) throw new Error(`${field} is required`);
 }
@@ -87,6 +93,7 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   private readonly runtimeObservations = new Map<string, DurableRuntimeObservation[]>();
   private readonly jobs = new Map<string, DurableJob>();
   private readonly attempts = new Map<string, DurableJobAttempt>();
+  private readonly executionPlans = new Map<string, DurableExecutionPlan>();
   private closed = false;
 
   constructor(options: InMemoryAgentOperationsStateStoreOptions = {}) {
@@ -356,6 +363,67 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
       throw new Error(`Attempt transition cannot rewrite durable identity or assignment: ${attempt.id}`);
     }
     this.attempts.set(attempt.id, copyAttempt(attempt));
+  }
+
+  async createExecutionPlan(plan: DurableExecutionPlan): Promise<void> {
+    this.assertAvailable('write-execution-plan');
+    requireNonEmpty(plan.id, 'Execution Plan ID');
+    requireNonEmpty(plan.input.instruction, 'Execution instruction');
+    if (!plan.id.startsWith('plan:')) throw new Error(`Invalid Execution Plan ID: ${plan.id}`);
+    if (plan.input.version !== 1) throw new Error(`Unsupported execution input version: ${plan.input.version}`);
+    if (plan.jobRevisionAtPreparation < 0 || plan.attemptRevisionAtPreparation < 0) {
+      throw new Error('Execution Plan revisions must be non-negative');
+    }
+    const installation = this.installation;
+    if (plan.installationId !== installation.id) {
+      throw new Error(`Execution Plan belongs to another installation: ${plan.installationId}`);
+    }
+    const job = this.jobs.get(plan.jobId);
+    if (!job || job.projectId !== plan.projectId) {
+      throw new Error(`Invalid Execution Plan job/project association: ${plan.jobId}`);
+    }
+    const attempt = this.attempts.get(plan.attemptId);
+    if (!attempt || attempt.jobId !== job.id) {
+      throw new Error(`Invalid Execution Plan attempt/job association: ${plan.attemptId}`);
+    }
+    if (attempt.runtimeAgentId !== plan.runtimeAgentId) {
+      throw new Error(`Execution Plan runtime does not match Attempt: ${plan.attemptId}`);
+    }
+    if (job.revision !== plan.jobRevisionAtPreparation
+      || attempt.revision !== plan.attemptRevisionAtPreparation) {
+      throw new Error('Execution Plan preparation revisions do not match current durable state');
+    }
+    if (job.repositoryId !== plan.repositoryId) {
+      throw new Error(`Execution Plan repository does not match Job: ${plan.jobId}`);
+    }
+    if ((plan.repositoryId === undefined) !== (plan.checkoutBindingId === undefined)) {
+      throw new Error('Execution Plan repository and checkout must both be present or both be absent');
+    }
+    if (plan.checkoutBindingId) {
+      const binding = this.bindings.get(plan.checkoutBindingId);
+      if (!binding
+        || binding.repositoryId !== plan.repositoryId
+        || binding.installationId !== plan.installationId) {
+        throw new Error(`Invalid Execution Plan checkout association: ${plan.checkoutBindingId}`);
+      }
+    }
+    if (this.executionPlans.has(plan.id)) throw new Error(`Duplicate Execution Plan ID: ${plan.id}`);
+    if ([...this.executionPlans.values()].some(candidate => candidate.attemptId === plan.attemptId)) {
+      throw new Error(`Attempt already has an Execution Plan: ${plan.attemptId}`);
+    }
+    this.executionPlans.set(plan.id, copyExecutionPlan(plan));
+  }
+
+  async getExecutionPlan(id: string): Promise<DurableExecutionPlan | null> {
+    this.assertAvailable('read');
+    const plan = this.executionPlans.get(id);
+    return plan ? copyExecutionPlan(plan) : null;
+  }
+
+  async getExecutionPlanForAttempt(attemptId: string): Promise<DurableExecutionPlan | null> {
+    this.assertAvailable('read');
+    const plan = [...this.executionPlans.values()].find(candidate => candidate.attemptId === attemptId);
+    return plan ? copyExecutionPlan(plan) : null;
   }
 
   async close(): Promise<void> {
