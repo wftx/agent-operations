@@ -277,6 +277,44 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
   });
 });
 
+describe('AgentProcess - injection occupancy marker', () => {
+  it('persists injection time before writing novel content to the PTY', async () => {
+    const now = 1_777_777_777_999;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(now);
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+    fsMocks.writeFileSync.mockClear();
+    mockInjectMessage.mockClear();
+
+    const result = ap.injectMessageDetailed('controlled rehearsal');
+
+    expect(result).toEqual({ ok: true });
+    expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
+      '/tmp/test-ctx/state/alice/last_message_injected.flag',
+      '1777777777',
+      'utf-8',
+    );
+    expect(mockInjectMessage).toHaveBeenCalledWith(expect.any(Function), 'controlled rehearsal');
+    expect(fsMocks.writeFileSync.mock.invocationCallOrder[0])
+      .toBeLessThan(mockInjectMessage.mock.invocationCallOrder[0]);
+
+    nowSpy.mockRestore();
+  });
+
+  it('does not inject when the occupancy marker cannot be persisted', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+    fsMocks.writeFileSync.mockReset().mockImplementation(() => {
+      throw new Error('state directory is read-only');
+    });
+    mockInjectMessage.mockClear();
+
+    expect(() => ap.injectMessageDetailed('controlled rehearsal'))
+      .toThrow('state directory is read-only');
+    expect(mockInjectMessage).not.toHaveBeenCalled();
+  });
+});
+
 describe('AgentProcess - duplicate-PTY fix (death-confirmed + join-in-flight stop)', () => {
   // Model a SIGHUP-immune child: node-pty's kill() sends SIGHUP with no
   // escalation, so a wedged child never fires onExit and stays alive to the

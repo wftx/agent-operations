@@ -428,6 +428,18 @@ export class AgentProcess {
       return { ok: false, code: 'DEDUPED', message: `inject for "${this.name}" deduped — content matches MessageDedup hash window` };
     }
 
+    // Persist occupancy before writing to the PTY. Admission checks compare
+    // this marker with last_idle.flag, so allowing an injection without it
+    // could make a busy agent appear idle. Marker failures intentionally
+    // abort the injection; a marker without a message fails safely closed.
+    const stateDir = join(this.env.ctxRoot, 'state', this.name);
+    ensureDir(stateDir);
+    writeFileSync(
+      join(stateDir, 'last_message_injected.flag'),
+      String(Math.floor(Date.now() / 1000)),
+      'utf-8',
+    );
+
     if ('injectMessage' in this.pty && typeof this.pty.injectMessage === 'function') {
       this.pty.injectMessage(content);
     } else {
