@@ -14,6 +14,23 @@ ecosystem.config.js
 
 # User-created org data (not part of the framework)
 orgs/
+# The dedicated Agent Operations rehearsal fixture is reusable framework
+# configuration. Runtime state, memory, and secrets remain ignored below.
+!orgs/
+orgs/*
+!orgs/agent-operations/
+orgs/agent-operations/*
+!orgs/agent-operations/agents/
+orgs/agent-operations/agents/*
+!orgs/agent-operations/agents/rehearsal/
+!orgs/agent-operations/agents/rehearsal/**
+orgs/agent-operations/agents/rehearsal/.agents/
+orgs/agent-operations/agents/rehearsal/plugins/
+!orgs/agent-operations/context.json
+!orgs/agent-operations/goals.json
+!orgs/agent-operations/knowledge.md
+!orgs/agent-operations/brand-voice.md
+orgs/agent-operations/secrets.env
 # But community subdirectories ARE part of the framework
 !community/
 !community/**
@@ -56,6 +73,8 @@ docs/*
 docs/architecture/*
 !docs/architecture/decisions/
 !docs/architecture/decisions/**
+!docs/agent-operations/
+!docs/agent-operations/runtime-rehearsal-setup.md
 
 # Internal developer/planning notes (not for public repo)
 KNOWN-ISSUES.md
@@ -63,6 +82,7 @@ WINDOWS-IMPLEMENTATION-PLAN.md
 WINDOWS-SUPPORT-INVESTIGATION.md
 BRAINDUMP*.md
 AGENTS.md
+!orgs/agent-operations/agents/rehearsal/AGENTS.md
 dashboard/screenshots/
 dashboard/test-*.py
 

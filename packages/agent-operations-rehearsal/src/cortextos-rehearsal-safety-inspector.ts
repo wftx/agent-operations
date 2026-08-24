@@ -35,6 +35,9 @@ export class CortextOSRehearsalSafetyInspector implements RuntimeCandidateSafety
   async inspect(runtime: AgentRuntimeDetail): Promise<RuntimeCandidateSafety> {
     const activeWorkEvidence: string[] = [];
     const integrations = this.detectIntegrations(runtime);
+    if (runtime.health.state !== 'running') {
+      activeWorkEvidence.push(`runtime health is ${runtime.health.state}, not running`);
+    }
     if (runtime.provider !== 'claude' && runtime.provider !== 'codex') {
       return {
         safe: false,
@@ -60,7 +63,6 @@ export class CortextOSRehearsalSafetyInspector implements RuntimeCandidateSafety
     const idle = this.readEpoch(join(stateDir, 'last_idle.flag'));
     const injected = this.readEpoch(join(stateDir, 'last_message_injected.flag'));
     if (idle === null) activeWorkEvidence.push('no readable last_idle.flag');
-    if (injected === null) activeWorkEvidence.push('no readable last_message_injected.flag');
     if (idle !== null && injected !== null && idle < injected) {
       activeWorkEvidence.push('last injected message is newer than the last idle signal');
     }

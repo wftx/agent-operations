@@ -1,0 +1,25 @@
+{
+  "agent_name": "rehearsal",
+  "enabled": true,
+  "runtime": "codex-app-server",
+  "model": "gpt-5-codex",
+  "startup_delay": 0,
+  "max_session_seconds": 255600,
+  "max_crashes_per_day": 10,
+  "working_directory": "/Users/westhompson/.cortextos/default/workspaces/rehearsal",
+  "timezone": "UTC",
+  "telegram_polling": false,
+  "crons": [],
+  "day_mode_start": "08:00",
+  "day_mode_end": "00:00",
+  "communication_style": "plain and concise",
+  "approval_rules": {
+    "always_ask": [
+      "external-comms",
+      "financial",
+      "deployment",
+      "data-deletion"
+    ],
+    "never_ask": []
+  }
+}

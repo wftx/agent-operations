@@ -35,7 +35,7 @@ afterEach(() => {
   }
 });
 
-function runtime(state: 'running' | 'stopped' = 'running'): AgentRuntimeDetail {
+function runtime(state: 'running' | 'stopped' | 'degraded' = 'running'): AgentRuntimeDetail {
   return {
     id: RUNTIME_ID,
     name: 'safe-agent',
@@ -183,38 +183,81 @@ describe('live rehearsal execution gates', () => {
 });
 
 describe('CortextOS rehearsal candidate safety', () => {
-  it('requires recent idle-after-injection evidence and empty message queues', async () => {
+  function safetyFixture(
+    state: 'running' | 'stopped' | 'degraded' = 'running',
+  ): { ctxRoot: string; stateDir: string; inspector: CortextOSRehearsalSafetyInspector; runtime: AgentRuntimeDetail } {
     const ctxRoot = mkdtempSync(join(tmpdir(), 'ao-rehearsal-safety-'));
     temporaryDirectories.push(ctxRoot);
-    const state = join(ctxRoot, 'state', 'safe-agent');
-    mkdirSync(state, { recursive: true });
-    writeFileSync(join(state, 'last_message_injected.flag'), '1787374500');
-    writeFileSync(join(state, 'last_idle.flag'), '1787374560');
+    const stateDir = join(ctxRoot, 'state', 'safe-agent');
+    mkdirSync(stateDir, { recursive: true });
     const inspector = new CortextOSRehearsalSafetyInspector({
       ctxRoot,
       frameworkRoot: ctxRoot,
       now: () => new Date('2026-08-22T05:00:00.000Z'),
     });
-    expect(await inspector.inspect(runtime())).toMatchObject({
+    return { ctxRoot, stateDir, inspector, runtime: runtime(state) };
+  }
+
+  it('accepts a fresh running agent with recent idle evidence and no prior injection', async () => {
+    const fixture = safetyFixture();
+    writeFileSync(join(fixture.stateDir, 'last_idle.flag'), '1787374560');
+    expect(await fixture.inspector.inspect(fixture.runtime)).toMatchObject({
       safe: true,
       activeWorkEvidence: [],
     });
   });
 
-  it('fails closed on incomplete occupancy evidence', async () => {
-    const ctxRoot = mkdtempSync(join(tmpdir(), 'ao-rehearsal-safety-'));
-    temporaryDirectories.push(ctxRoot);
-    const state = join(ctxRoot, 'state', 'safe-agent');
-    mkdirSync(state, { recursive: true });
-    writeFileSync(join(state, 'last_idle.flag'), '1787370000');
-    const inspector = new CortextOSRehearsalSafetyInspector({
-      ctxRoot,
-      frameworkRoot: ctxRoot,
-      now: () => new Date('2026-08-22T05:00:00.000Z'),
+  it('accepts recent idle evidence newer than the most recent injection', async () => {
+    const fixture = safetyFixture();
+    writeFileSync(join(fixture.stateDir, 'last_message_injected.flag'), '1787374500');
+    writeFileSync(join(fixture.stateDir, 'last_idle.flag'), '1787374560');
+    expect(await fixture.inspector.inspect(fixture.runtime)).toMatchObject({
+      safe: true,
+      activeWorkEvidence: [],
     });
-    const result = await inspector.inspect(runtime());
+  });
+
+  it('blocks when an injection is newer than the last idle signal', async () => {
+    const fixture = safetyFixture();
+    writeFileSync(join(fixture.stateDir, 'last_idle.flag'), '1787374560');
+    writeFileSync(join(fixture.stateDir, 'last_message_injected.flag'), '1787374700');
+    const result = await fixture.inspector.inspect(fixture.runtime);
     expect(result.safe).toBe(false);
-    expect(result.activeWorkEvidence).toContain('no readable last_message_injected.flag');
+    expect(result.activeWorkEvidence).toContain('last injected message is newer than the last idle signal');
+  });
+
+  it('blocks when the inbox is nonempty', async () => {
+    const fixture = safetyFixture();
+    writeFileSync(join(fixture.stateDir, 'last_idle.flag'), '1787374560');
+    const inbox = join(fixture.ctxRoot, 'inbox', 'safe-agent');
+    mkdirSync(inbox, { recursive: true });
+    writeFileSync(join(inbox, 'pending.json'), '{}');
+    expect((await fixture.inspector.inspect(fixture.runtime)).activeWorkEvidence)
+      .toContain('1 pending inbox message(s)');
+  });
+
+  it('blocks when inflight work exists', async () => {
+    const fixture = safetyFixture();
+    writeFileSync(join(fixture.stateDir, 'last_idle.flag'), '1787374560');
+    const inflight = join(fixture.ctxRoot, 'inflight', 'safe-agent');
+    mkdirSync(inflight, { recursive: true });
+    writeFileSync(join(inflight, 'active.json'), '{}');
+    expect((await fixture.inspector.inspect(fixture.runtime)).activeWorkEvidence)
+      .toContain('1 inflight message(s)');
+  });
+
+  it.each(['stopped', 'degraded'] as const)('blocks a %s runtime', async state => {
+    const fixture = safetyFixture(state);
+    writeFileSync(join(fixture.stateDir, 'last_idle.flag'), '1787374560');
+    expect((await fixture.inspector.inspect(fixture.runtime)).activeWorkEvidence)
+      .toContain(`runtime health is ${state}, not running`);
+  });
+
+  it('blocks stale idle evidence even when there has never been an injection', async () => {
+    const fixture = safetyFixture();
+    writeFileSync(join(fixture.stateDir, 'last_idle.flag'), '1787370000');
+    const result = await fixture.inspector.inspect(fixture.runtime);
+    expect(result.safe).toBe(false);
     expect(result.activeWorkEvidence).toContain('last idle signal is older than ten minutes');
   });
 });
