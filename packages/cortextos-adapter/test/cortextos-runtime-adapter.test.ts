@@ -99,6 +99,12 @@ describe('CortextOSRuntimeAdapter', () => {
       capabilities: ['session-resume'],
       health: { pid: 1001, lastHeartbeat: '2026-02-03T04:00:00.000Z' },
     });
+    expect(agents.find(agent => agent.name === 'coder')?.capabilities)
+      .toEqual(['session-resume', 'exact-turn-correlation']);
+    expect(agents.find(agent => agent.name === 'forge')?.capabilities)
+      .toEqual(['session-resume']);
+    expect(agents.find(agent => agent.name === 'analyst')?.capabilities)
+      .toEqual(['session-resume']);
     expect(JSON.stringify(agents)).not.toContain('private-core-shape');
     expect(JSON.stringify(agents)).not.toContain('crashCount');
     expect(await subject.getHealth()).toEqual({

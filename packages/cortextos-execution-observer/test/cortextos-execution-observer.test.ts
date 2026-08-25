@@ -12,6 +12,7 @@ const REQUEST = {
   runtimeAgentId: 'engineering/coder',
   acceptedAt: '2026-08-21T19:59:00.000Z',
 };
+const EXACT_REFERENCE = 'cortextos:codex-turn:v1:thread-1:turn-1';
 const directories: string[] = [];
 
 afterEach(() => {
@@ -40,6 +41,27 @@ function runtime(
     health: { state, ...(reason ? { reason } : {}) },
     observedAt: TIME,
   }]);
+}
+
+function writeTurnRecord(
+  ctxRoot: string,
+  threadId: string,
+  turnId: string,
+  status: 'inProgress' | 'completed' | 'failed' | 'interrupted',
+): void {
+  const directory = join(ctxRoot, 'state', 'coder', 'codex-turns', threadId);
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(join(directory, `${turnId}.json`), JSON.stringify({
+    version: 1,
+    provider: 'codex',
+    threadId,
+    turnId,
+    status,
+    observedAt: TIME,
+    startedAt: TIME,
+    ...(status === 'inProgress' ? {} : { completedAt: TIME }),
+    ...(status === 'failed' ? { error: 'fixture failure' } : {}),
+  }));
 }
 
 describe('CortextOSExecutionObserver', () => {
@@ -115,5 +137,62 @@ describe('CortextOSExecutionObserver', () => {
       });
       expect(await observer.observe(REQUEST)).toHaveLength(1);
     }
+  });
+
+  it('emits exact evidence only for the stored matching thread and turn', async () => {
+    const ctxRoot = root();
+    writeTurnRecord(ctxRoot, 'thread-1', 'turn-1', 'completed');
+    const observer = new CortextOSExecutionObserver({ runtimeAdapter: runtime(), ctxRoot });
+    const observations = await observer.observe({ ...REQUEST, externalReference: EXACT_REFERENCE });
+    expect(observations.at(-1)).toMatchObject({
+      source: 'cortextos-codex-turn-record',
+      kind: 'turn-completed',
+      correlation: 'exact',
+      correlatedDispatchId: REQUEST.dispatchId,
+      runtimeSessionId: 'thread-1',
+      externalReference: EXACT_REFERENCE,
+    });
+  });
+
+  it.each([
+    ['inProgress', 'runtime-running'],
+    ['failed', 'runtime-crashed'],
+    ['interrupted', 'runtime-crashed'],
+  ] as const)('maps exact Codex status %s to %s without deciding an outcome', async (status, kind) => {
+    const ctxRoot = root();
+    writeTurnRecord(ctxRoot, 'thread-1', 'turn-1', status);
+    const observer = new CortextOSExecutionObserver({ runtimeAdapter: runtime(), ctxRoot });
+    expect((await observer.observe({ ...REQUEST, externalReference: EXACT_REFERENCE })).at(-1))
+      .toMatchObject({ kind, correlation: 'exact' });
+  });
+
+  it('does not match older, newer, wrong-thread, or wrong-turn records', async () => {
+    const ctxRoot = root();
+    writeTurnRecord(ctxRoot, 'thread-1', 'turn-old', 'completed');
+    writeTurnRecord(ctxRoot, 'thread-1', 'turn-new', 'completed');
+    writeTurnRecord(ctxRoot, 'thread-other', 'turn-1', 'completed');
+    const observer = new CortextOSExecutionObserver({ runtimeAdapter: runtime(), ctxRoot });
+    const observations = await observer.observe({ ...REQUEST, externalReference: EXACT_REFERENCE });
+    expect(observations.some(item => item.kind === 'turn-completed')).toBe(false);
+    expect(observations.at(-1)).toMatchObject({ kind: 'unknown', correlation: 'uncorrelated' });
+  });
+
+  it('fails closed on a malformed reference or mismatched structured record', async () => {
+    const ctxRoot = root();
+    writeTurnRecord(ctxRoot, 'thread-1', 'turn-1', 'completed');
+    const recordPath = join(ctxRoot, 'state', 'coder', 'codex-turns', 'thread-1', 'turn-1.json');
+    writeFileSync(recordPath, JSON.stringify({
+      version: 1,
+      provider: 'codex',
+      threadId: 'thread-1',
+      turnId: 'different-turn',
+      status: 'completed',
+      observedAt: TIME,
+    }));
+    const observer = new CortextOSExecutionObserver({ runtimeAdapter: runtime(), ctxRoot });
+    expect((await observer.observe({ ...REQUEST, externalReference: EXACT_REFERENCE })).at(-1))
+      .toMatchObject({ kind: 'unknown', correlation: 'uncorrelated' });
+    expect((await observer.observe({ ...REQUEST, externalReference: 'not-a-codex-reference' })).at(-1))
+      .toMatchObject({ kind: 'unknown', correlation: 'uncorrelated' });
   });
 });

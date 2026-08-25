@@ -48,6 +48,39 @@ interface ThreadResponse {
   };
 }
 
+interface CodexTurn {
+  id: string;
+  status?: string;
+  error?: { message?: string } | null;
+  startedAt?: number | null;
+  completedAt?: number | null;
+  durationMs?: number | null;
+}
+
+interface TurnResponse {
+  turn: CodexTurn;
+}
+
+interface CorrelatedTurnRecord {
+  version: 1;
+  provider: 'codex';
+  threadId: string;
+  turnId: string;
+  correlationId?: string;
+  status: 'inProgress' | 'completed' | 'failed' | 'interrupted';
+  observedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+  error?: string;
+}
+
+export interface CorrelationSafeTurnReference {
+  readonly provider: 'codex';
+  readonly sessionId: string;
+  readonly turnId: string;
+}
+
 interface SkillsListResponse {
   data?: Array<{
     cwd: string;
@@ -97,6 +130,8 @@ export class CodexAppServerPTY {
   private _alive = false;
   private _executing = false;
   private _activeTurnId: string | null = null;
+  private _protectedTurnId: string | null = null;
+  private _correlationStartPending = false;
   private _writeBuffer = '';
   private _turnQueue: unknown[][] = [];
   private _turnCompletion: {
@@ -184,6 +219,8 @@ export class CodexAppServerPTY {
   kill(): void {
     this._alive = false;
     this._activeTurnId = null;
+    this._protectedTurnId = null;
+    this._correlationStartPending = false;
     this._turnQueue = [];
     this.rejectTurnCompletion(new Error('Codex app-server stopped'));
     if (this._rpc) {
@@ -217,6 +254,80 @@ export class CodexAppServerPTY {
 
   getOutputBuffer(): OutputBuffer {
     return this._outputBuffer;
+  }
+
+  /** True only when a new turn can be created without steering or queueing. */
+  canStartCorrelationSafeTurn(): boolean {
+    return this._alive
+      && Boolean(this._threadId)
+      && !this._executing
+      && !this._activeTurnId
+      && !this._turnCompletion
+      && this._turnQueue.length === 0;
+  }
+
+  /**
+   * Start one new Codex turn and return its provider identity without waiting
+   * for completion. This opt-in path never steers an active turn.
+   */
+  async startCorrelationSafeTurn(
+    content: string,
+    correlationId: string,
+  ): Promise<CorrelationSafeTurnReference> {
+    if (!this.canStartCorrelationSafeTurn() || !this._threadId) {
+      throw new Error('RUNTIME_BUSY');
+    }
+    const cleanCorrelationId = correlationId.trim();
+    if (!cleanCorrelationId || cleanCorrelationId.length > 500) {
+      throw new Error('INVALID_CORRELATION_ID');
+    }
+
+    const threadId = this._threadId;
+    this._executing = true;
+    this._correlationStartPending = true;
+    const completion = this.createTurnCompletion();
+    const settled = completion.then(
+      () => this.finishCorrelationSafeTurn(),
+      () => this.finishCorrelationSafeTurn(),
+    );
+    let turnIdentityKnown = false;
+
+    try {
+      const response = await this.request<TurnResponse>('turn/start', {
+        threadId,
+        clientUserMessageId: cleanCorrelationId,
+        input: [{ type: 'text', text: content, text_elements: [] }],
+        ...TURN_PERMISSION_OVERRIDES,
+      });
+      const turn = response.result?.turn;
+      if (!turn || !validCodexId(turn.id)) {
+        throw new Error('Codex turn/start returned no valid turn identity');
+      }
+      turnIdentityKnown = true;
+      if (this._activeTurnId && this._activeTurnId !== turn.id) {
+        throw new Error('Codex reported a different active turn during correlated turn creation');
+      }
+      this._correlationStartPending = false;
+      if (this._executing) {
+        this._activeTurnId = turn.id;
+        this._protectedTurnId = turn.id;
+      }
+      if (!this.writeCorrelatedTurnRecord(threadId, turn, cleanCorrelationId)) {
+        throw new Error('Codex turn started but correlated state could not be persisted');
+      }
+      void settled;
+      return { provider: 'codex', sessionId: threadId, turnId: turn.id };
+    } catch (error) {
+      if (turnIdentityKnown) {
+        this._correlationStartPending = false;
+      }
+      // Once turn/start has been attempted, a rejected/ambiguous acknowledgement
+      // must not make the runtime appear available. Keep the pending/protected
+      // turn busy until a native terminal event (or the existing timeout) settles
+      // it, so unrelated input cannot be steered into the uncertain execution.
+      void settled;
+      throw error;
+    }
   }
 
   setTelegramHandle(api: TelegramAPI, chatId: string): void {
@@ -545,6 +656,10 @@ export class CodexAppServerPTY {
    * no message is ever lost. CODEX_STEER_DISABLED=1 reverts to pure queueing.
    */
   private queueTurn(input: unknown[]): void {
+    if (this._correlationStartPending || this._protectedTurnId) {
+      this.enqueueTurn(input);
+      return;
+    }
     if (this._executing && this._activeTurnId && process.env.CODEX_STEER_DISABLED !== '1') {
       this.steerActiveTurn(input).catch((err) => {
         this._outputBuffer.push(`[codex-app-server] steer path failed: ${err}\n`);
@@ -695,22 +810,49 @@ export class CodexAppServerPTY {
         this._outputBuffer.push(`[codex-app-server] status ${JSON.stringify(params.status)}\n`);
         if (isRecord(params.status) && params.status.type === 'idle') {
           this.writeIdleFlag();
+          if (this._correlationStartPending || this._protectedTurnId) {
+            this.rejectTurnCompletion(new Error(
+              'Codex became idle without a matching correlated terminal event',
+            ));
+          }
         } else {
           this.maybeFireTyping();
         }
         break;
       case 'turn/started':
         if (isRecord(params.turn) && typeof params.turn.id === 'string') {
-          this._activeTurnId = params.turn.id;
+          if (this._protectedTurnId && this._protectedTurnId !== params.turn.id) {
+            this._outputBuffer.push(
+              `[codex-app-server] ignored unrelated turn/started ${params.turn.id} while protecting ${this._protectedTurnId}\n`,
+            );
+          } else {
+            this._activeTurnId = params.turn.id;
+            if (this._correlationStartPending) this._protectedTurnId = params.turn.id;
+          }
         }
         this.maybeFireTyping();
         this._outputBuffer.push('[codex-app-server] turn started\n');
         break;
       case 'turn/completed':
-        this._activeTurnId = null;
-        this.writeIdleFlag();
+        if (typeof params.threadId === 'string' && isRecord(params.turn)
+          && typeof params.turn.id === 'string'
+          && this.hasCorrelatedTurnRecord(params.threadId, params.turn.id)) {
+          this.writeCorrelatedTurnRecord(params.threadId, params.turn as unknown as CodexTurn);
+        }
+        {
+          const completedTurnId = isRecord(params.turn) && typeof params.turn.id === 'string'
+            ? params.turn.id
+            : null;
+          const completionMatches = this._protectedTurnId
+            ? completedTurnId === this._protectedTurnId
+            : (!completedTurnId || !this._activeTurnId || this._activeTurnId === completedTurnId);
+          if (completionMatches) {
+            this._activeTurnId = null;
+            this.resolveTurnCompletion();
+            this.writeIdleFlag();
+          }
+        }
         this._outputBuffer.push('[codex-app-server] turn completed\n');
-        this.resolveTurnCompletion();
         break;
       case 'item/agentMessage/delta':
         if (typeof params.delta === 'string') {
@@ -737,6 +879,24 @@ export class CodexAppServerPTY {
         this._outputBuffer.push('[goal] cleared\n');
         break;
       case 'error':
+        if (this._protectedTurnId
+          && (params.turnId !== this._protectedTurnId || params.willRetry === true)) {
+          this._outputBuffer.push(
+            `[codex-app-server] ignored unrelated/retrying error while protecting ${this._protectedTurnId}\n`,
+          );
+          break;
+        }
+        if (typeof params.threadId === 'string' && typeof params.turnId === 'string'
+          && params.willRetry !== true
+          && this.hasCorrelatedTurnRecord(params.threadId, params.turnId)) {
+          this.writeCorrelatedTurnRecord(params.threadId, {
+            id: params.turnId,
+            status: 'failed',
+            error: isRecord(params.error) && typeof params.error.message === 'string'
+              ? { message: params.error.message }
+              : null,
+          });
+        }
         this._activeTurnId = null;
         this._outputBuffer.push(`[codex-app-server] error: ${JSON.stringify(params)}\n`);
         this.rejectTurnCompletion(new Error(JSON.stringify(params)));
@@ -790,6 +950,75 @@ export class CodexAppServerPTY {
     this._turnCompletion = null;
     clearTimeout(pending.timer);
     pending.reject(err);
+  }
+
+  private finishCorrelationSafeTurn(): void {
+    this._activeTurnId = null;
+    this._protectedTurnId = null;
+    this._correlationStartPending = false;
+    this._executing = false;
+    if (this._alive && this._turnQueue.length > 0) {
+      this.drainQueue().catch((error) => {
+        this._outputBuffer.push(`[codex-app-server] turn queue failed: ${error}\n`);
+      });
+    }
+  }
+
+  private correlatedTurnRecordPath(threadId: string, turnId: string): string | null {
+    if (!validCodexId(threadId) || !validCodexId(turnId)) return null;
+    return join(this._stateDir, 'codex-turns', threadId, `${turnId}.json`);
+  }
+
+  private hasCorrelatedTurnRecord(threadId: string, turnId: string): boolean {
+    const path = this.correlatedTurnRecordPath(threadId, turnId);
+    return Boolean(path && existsSync(path));
+  }
+
+  private writeCorrelatedTurnRecord(
+    threadId: string,
+    turn: CodexTurn,
+    correlationId?: string,
+  ): boolean {
+    const path = this.correlatedTurnRecordPath(threadId, turn.id);
+    if (!path) return false;
+    let previous: CorrelatedTurnRecord | null = null;
+    try {
+      if (existsSync(path)) {
+        previous = JSON.parse(readFileSync(path, 'utf-8')) as CorrelatedTurnRecord;
+      }
+    } catch {
+      previous = null;
+    }
+    const status = previous && ['completed', 'failed', 'interrupted'].includes(previous.status)
+      ? previous.status
+      : normalizeTurnStatus(turn.status);
+    const startedAt = epochSecondsToIso(turn.startedAt) ?? previous?.startedAt;
+    const completedAt = epochSecondsToIso(turn.completedAt) ?? previous?.completedAt;
+    const durationMs = typeof turn.durationMs === 'number' ? turn.durationMs : previous?.durationMs;
+    const error = turn.error?.message ?? previous?.error;
+    const record: CorrelatedTurnRecord = {
+      version: 1,
+      provider: 'codex',
+      threadId,
+      turnId: turn.id,
+      ...((correlationId ?? previous?.correlationId)
+        ? { correlationId: correlationId ?? previous!.correlationId }
+        : {}),
+      status,
+      observedAt: new Date().toISOString(),
+      ...(startedAt ? { startedAt } : {}),
+      ...(completedAt ? { completedAt } : {}),
+      ...(durationMs !== undefined ? { durationMs } : {}),
+      ...(error ? { error: error.slice(0, 2_000) } : {}),
+    };
+    try {
+      ensureDir(join(this._stateDir, 'codex-turns', threadId));
+      atomicWriteSync(path, JSON.stringify(record));
+      return true;
+    } catch (writeError) {
+      this._outputBuffer.push(`[codex-app-server] failed to persist correlated turn state: ${writeError}\n`);
+      return false;
+    }
   }
 
   private emitUnsupportedRequestEvent(method: string): void {
@@ -1043,6 +1272,21 @@ export class CodexAppServerPTY {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
+}
+
+function validCodexId(value: string): boolean {
+  return /^[A-Za-z0-9_-]{1,200}$/.test(value);
+}
+
+function normalizeTurnStatus(value: unknown): CorrelatedTurnRecord['status'] {
+  return value === 'completed' || value === 'failed' || value === 'interrupted'
+    ? value
+    : 'inProgress';
+}
+
+function epochSecondsToIso(value: unknown): string | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return undefined;
+  return new Date(value * 1000).toISOString();
 }
 
 function sleep(ms: number): Promise<void> {

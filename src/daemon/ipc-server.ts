@@ -506,7 +506,7 @@ export class IPCServer {
           try {
             const request: IPCRequest = JSON.parse(data);
             data = '';
-            this.handleRequest(request, socket);
+            void this.handleRequest(request, socket);
           } catch {
             // Incomplete JSON, wait for more data
           }
@@ -567,7 +567,7 @@ export class IPCServer {
   /**
    * Handle an incoming IPC request.
    */
-  private handleRequest(request: IPCRequest, socket: Socket): void {
+  private async handleRequest(request: IPCRequest, socket: Socket): Promise<void> {
     // BUG-015: log every incoming IPC request with its source so we can
     // trace which CLI command triggered which daemon action. The source
     // field is populated by CLI clients (cortextos enable / disable / stop
@@ -718,8 +718,35 @@ export class IPCServer {
         case 'inject-agent': {
           const agentToInject = request.agent;
           const textToInject = request.data?.text as string | undefined;
+          const requireNewTurn = request.data?.requireNewTurn === true;
+          const correlationId = request.data?.correlationId;
           if (!agentToInject || !textToInject) {
             response = { success: false, error: 'inject-agent requires: agent, data.text', code: 'INVALID_INPUT' };
+          } else if (requireNewTurn && (typeof correlationId !== 'string'
+            || !correlationId.trim() || correlationId.length > 500)) {
+            response = { success: false, error: 'correlation-safe inject-agent requires a correlationId of 1-500 characters', code: 'INVALID_INPUT' };
+          } else if (requireNewTurn) {
+            const result = await this.agentManager.injectAgentCorrelatedDetailed(
+              agentToInject,
+              textToInject,
+              correlationId as string,
+            );
+            if (result.ok) {
+              response = {
+                success: true,
+                data: {
+                  message: `Started a new correlated turn for agent ${agentToInject}`,
+                  execution: {
+                    provider: result.provider,
+                    sessionId: result.sessionId,
+                    turnId: result.turnId,
+                  },
+                },
+              };
+            } else {
+              console.log(`[ipc] inject-agent ${agentToInject}: ${result.code} — ${result.message}`);
+              response = { success: false, error: result.message, code: result.code };
+            }
           } else {
             // Structured outcome distinguishes NOT_FOUND (agent not in registry)
             // from NOT_RUNNING (registered but PTY dead) from DEDUPED (content

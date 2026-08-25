@@ -1,11 +1,13 @@
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import { createConnection } from 'node:net';
 import type {
   RuntimeDispatchRequest,
   RuntimeDispatchResult,
   RuntimeExecutionAdapter,
 } from '../../agent-operations-contracts/src/index.js';
+import {
+  createCodexExecutionReference,
+  resolveCortextOSSocketPath,
+} from '../../cortextos-adapter/src/index.js';
 
 type RequestSender = (
   agentName: string,
@@ -17,6 +19,8 @@ export interface CortextOSExecutionAdapterOptions {
   readonly instanceId?: string;
   readonly socketPath?: string;
   readonly timeoutMs?: number;
+  /** Require one newly created structured Codex turn rather than generic injection. */
+  readonly requireExactTurnCorrelation?: boolean;
   /** Test/embedding seam around the established inject-agent IPC command. */
   readonly requestSender?: RequestSender;
 }
@@ -34,12 +38,15 @@ export class CortextOSExecutionTransportError extends Error {
 /** Mutation-capable adapter for the existing acknowledged inject-agent daemon IPC command. */
 export class CortextOSExecutionAdapter implements RuntimeExecutionAdapter {
   private readonly sender: RequestSender;
+  private readonly requireExactTurnCorrelation: boolean;
 
   constructor(options: CortextOSExecutionAdapterOptions = {}) {
     const instanceId = options.instanceId ?? process.env.CTX_INSTANCE_ID ?? 'default';
     if (!/^[A-Za-z0-9_-]+$/.test(instanceId)) throw new Error(`Invalid CortextOS instance ID: ${instanceId}`);
-    const socketPath = options.socketPath ?? defaultSocketPath(instanceId);
+    const socketPath = options.socketPath ?? resolveCortextOSSocketPath(instanceId);
     const timeoutMs = options.timeoutMs ?? 5_000;
+    const requireExactTurnCorrelation = options.requireExactTurnCorrelation ?? true;
+    this.requireExactTurnCorrelation = requireExactTurnCorrelation;
     this.sender = options.requestSender
       ?? ((agentName, instruction, request) => sendInjectRequest(
         socketPath,
@@ -47,6 +54,8 @@ export class CortextOSExecutionAdapter implements RuntimeExecutionAdapter {
         agentName,
         instruction,
         request.dispatchId,
+        request.idempotencyKey,
+        requireExactTurnCorrelation,
       ));
   }
 
@@ -58,11 +67,49 @@ export class CortextOSExecutionAdapter implements RuntimeExecutionAdapter {
         return { status: 'uncertain', message: 'CortextOS daemon returned a malformed acknowledgement.' };
       }
       if (response.success) {
+        const data = isRecord(response.data) ? response.data : null;
+        const execution = data && isRecord(data.execution) ? data.execution : null;
+        if (execution) {
+          if (execution.provider !== 'codex'
+            || typeof execution.sessionId !== 'string'
+            || typeof execution.turnId !== 'string') {
+            return { status: 'uncertain', message: 'CortextOS returned a malformed structured execution reference.' };
+          }
+          try {
+            const message = typeof data?.message === 'string'
+              ? data.message
+              : `CortextOS started a correlated Codex turn for ${agentName}.`;
+            return {
+              status: 'accepted',
+              externalReference: createCodexExecutionReference(
+                execution.sessionId,
+                execution.turnId,
+              ),
+              message,
+            };
+          } catch {
+            return { status: 'uncertain', message: 'CortextOS returned invalid Codex turn identifiers.' };
+          }
+        }
+        if (this.requireExactTurnCorrelation) {
+          return {
+            status: 'uncertain',
+            message: 'CortextOS accepted injection without a structured turn reference.',
+          };
+        }
         return {
           status: 'accepted',
           message: typeof response.data === 'string'
             ? response.data
             : `CortextOS accepted injection for ${agentName}.`,
+        };
+      }
+      if (response.code === 'SUBMISSION_UNCERTAIN') {
+        return {
+          status: 'uncertain',
+          message: typeof response.error === 'string'
+            ? response.error
+            : `CortextOS could not prove whether a turn started for ${agentName}.`,
         };
       }
       return {
@@ -90,17 +137,11 @@ function runtimeAgentName(runtimeAgentId: string): string {
   }
   try {
     const name = decodeURIComponent(segments[1]);
-    if (!name.trim()) throw new Error('empty name');
+    if (!/^[A-Za-z0-9_-]+$/.test(name)) throw new Error('invalid name');
     return name;
   } catch {
     throw new Error(`Invalid Agent Operations runtime ID: ${runtimeAgentId}`);
   }
-}
-
-function defaultSocketPath(instanceId: string): string {
-  return process.platform === 'win32'
-    ? `\\\\.\\pipe\\cortextos-${instanceId}`
-    : join(homedir(), '.cortextos', instanceId, 'daemon.sock');
 }
 
 function sendInjectRequest(
@@ -109,6 +150,8 @@ function sendInjectRequest(
   agentName: string,
   instruction: string,
   dispatchId: string,
+  correlationId: string,
+  requireExactTurnCorrelation: boolean,
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const socket = createConnection(socketPath);
@@ -127,7 +170,12 @@ function sendInjectRequest(
       socket.write(JSON.stringify({
         type: 'inject-agent',
         agent: agentName,
-        data: { text: instruction },
+        data: {
+          text: instruction,
+          ...(requireExactTurnCorrelation
+            ? { requireNewTurn: true, correlationId }
+            : {}),
+        },
         source: `agent-operations manual dispatch ${dispatchId}`,
       }));
     });

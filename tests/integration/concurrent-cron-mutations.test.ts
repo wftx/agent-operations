@@ -32,6 +32,7 @@ import {
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFile } from 'child_process';
+import { createServer, type Server } from 'net';
 import { promisify } from 'util';
 import type { CronDefinition } from '../../src/types/index';
 
@@ -42,13 +43,35 @@ const DIST_CLI  = join(REPO_ROOT, 'dist', 'cli.js');
 const CRONS_DIR = '.cortextOS/state/agents';
 
 let tmpRoot: string;
+let isolatedDaemon: Server;
+let isolatedReloadRequests: number;
 const originalCtxRoot = process.env.CTX_ROOT;
 
-beforeEach(() => {
+beforeEach(async () => {
   tmpRoot = mkdtempSync(join(tmpdir(), 'concurrent-crons-'));
+  mkdirSync(join(tmpRoot, 'home'), { recursive: true });
+  isolatedReloadRequests = 0;
+  isolatedDaemon = createServer(socket => {
+    let body = '';
+    socket.on('data', chunk => {
+      body += chunk.toString();
+      try {
+        const request = JSON.parse(body) as { type?: string };
+        if (request.type === 'reload-crons') isolatedReloadRequests++;
+        socket.end(JSON.stringify({ success: true, data: 'isolated fixture acknowledgement' }));
+      } catch {
+        // A partial request will be retried when the next data chunk arrives.
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    isolatedDaemon.once('error', reject);
+    isolatedDaemon.listen(join(tmpRoot, 'daemon.sock'), resolve);
+  });
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await new Promise<void>(resolve => isolatedDaemon.close(() => resolve()));
   if (originalCtxRoot !== undefined) {
     process.env.CTX_ROOT = originalCtxRoot;
   } else {
@@ -95,7 +118,15 @@ async function runUpdate(agent: string, name: string, newPrompt: string): Promis
   await execFileAsync(
     process.execPath,
     [DIST_CLI, 'bus', 'update-cron', agent, name, '--prompt', newPrompt],
-    { env: { ...process.env, CTX_ROOT: tmpRoot } },
+    {
+      env: {
+        ...process.env,
+        HOME: join(tmpRoot, 'home'),
+        USERPROFILE: join(tmpRoot, 'home'),
+        CTX_ROOT: tmpRoot,
+        CTX_INSTANCE_ID: `vitest-concurrent-${process.pid}`,
+      },
+    },
   );
 }
 
@@ -127,6 +158,10 @@ describe.skipIf(!existsSync(DIST_CLI))('Iter 12 audit: concurrent bus update-cro
       }
       lostUpdatesPerIteration.push(lost);
     }
+
+    // Every compiled CLI child must notify this isolated fixture. Before the
+    // Phase 14 fix these 40 requests fell through to ~/.cortextos/default.
+    expect(isolatedReloadRequests).toBe(N * ITERATIONS);
 
     const totalLost = lostUpdatesPerIteration.reduce((a, b) => a + b, 0);
     // Diagnostic for debugging:

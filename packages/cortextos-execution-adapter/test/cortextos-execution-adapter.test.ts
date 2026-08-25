@@ -14,17 +14,24 @@ const REQUEST: RuntimeDispatchRequest = {
 };
 
 describe('CortextOSExecutionAdapter', () => {
-  it('maps provider-neutral input directly to acknowledged inject-agent IPC', async () => {
+  it('maps a structured Codex turn acknowledgement to one opaque external reference', async () => {
     const captured: unknown[] = [];
     const adapter = new CortextOSExecutionAdapter({
       requestSender: async (agentName, instruction, request) => {
         captured.push({ agentName, instruction, request });
-        return { success: true, data: 'Injected into agent coder' };
+        return {
+          success: true,
+          data: {
+            message: 'Started a new correlated turn for agent coder',
+            execution: { provider: 'codex', sessionId: 'thread-1', turnId: 'turn-1' },
+          },
+        };
       },
     });
     await expect(adapter.dispatch(REQUEST)).resolves.toEqual({
       status: 'accepted',
-      message: 'Injected into agent coder',
+      externalReference: 'cortextos:codex-turn:v1:thread-1:turn-1',
+      message: 'Started a new correlated turn for agent coder',
     });
     expect(captured).toEqual([{
       agentName: 'coder',
@@ -33,7 +40,34 @@ describe('CortextOSExecutionAdapter', () => {
     }]);
   });
 
-  it.each(['NOT_FOUND', 'NOT_RUNNING', 'DEDUPED', 'INVALID_INPUT'])(
+  it('keeps legacy acknowledged injection available only when exact correlation is disabled', async () => {
+    const adapter = new CortextOSExecutionAdapter({
+      requireExactTurnCorrelation: false,
+      requestSender: async () => ({ success: true, data: 'Injected into agent coder' }),
+    });
+    await expect(adapter.dispatch(REQUEST)).resolves.toEqual({
+      status: 'accepted',
+      message: 'Injected into agent coder',
+    });
+  });
+
+  it('treats acceptance without a valid exact turn identity as uncertain', async () => {
+    const missing = new CortextOSExecutionAdapter({
+      requestSender: async () => ({ success: true, data: 'legacy acknowledgement' }),
+    });
+    expect((await missing.dispatch(REQUEST)).status).toBe('uncertain');
+
+    const malformed = new CortextOSExecutionAdapter({
+      requestSender: async () => ({
+        success: true,
+        data: { execution: { provider: 'codex', sessionId: 'thread:bad', turnId: 'turn-1' } },
+      }),
+    });
+    expect((await malformed.dispatch(REQUEST)).status).toBe('uncertain');
+  });
+
+  it.each(['NOT_FOUND', 'NOT_RUNNING', 'DEDUPED', 'INVALID_INPUT',
+    'CORRELATION_UNSUPPORTED', 'RUNTIME_BUSY', 'MARKER_WRITE_FAILED'])(
     'maps explicit daemon rejection %s to rejected',
     async code => {
       const adapter = new CortextOSExecutionAdapter({
@@ -45,6 +79,20 @@ describe('CortextOSExecutionAdapter', () => {
       });
     },
   );
+
+  it('preserves post-submission ambiguity reported by the daemon', async () => {
+    const adapter = new CortextOSExecutionAdapter({
+      requestSender: async () => ({
+        success: false,
+        code: 'SUBMISSION_UNCERTAIN',
+        error: 'turn may have started before acknowledgement was lost',
+      }),
+    });
+    await expect(adapter.dispatch(REQUEST)).resolves.toEqual({
+      status: 'uncertain',
+      message: 'turn may have started before acknowledgement was lost',
+    });
+  });
 
   it('distinguishes proven pre-submission unavailability from ambiguous transport loss', async () => {
     const unavailable = new CortextOSExecutionAdapter({

@@ -1,5 +1,6 @@
 import { homedir } from 'os';
-import { join } from 'path';
+import { isAbsolute, join, relative, resolve, sep } from 'path';
+import { createHash } from 'crypto';
 import type { BusPaths } from '../types/index.js';
 import { validateInstanceId } from './validate.js';
 
@@ -52,10 +53,38 @@ export function resolvePaths(
  * Get the IPC socket path for daemon communication.
  * Unix domain socket on macOS/Linux, named pipe on Windows.
  */
-export function getIpcPath(instanceId: string = 'default'): string {
+export interface IpcPathOptions {
+  readonly environment?: NodeJS.ProcessEnv;
+  readonly homeDirectory?: string;
+}
+
+export function getIpcPath(instanceId: string = 'default', options: IpcPathOptions = {}): string {
   validateInstanceId(instanceId);
+  const environment = options.environment ?? process.env;
+  const homeDirectory = options.homeDirectory ?? homedir();
+
+  // Vitest and its child processes must use the explicitly isolated CTX_ROOT.
+  // Never fall through to a user's ~/.cortextos tree while tests are running.
+  if (environment.VITEST === 'true') {
+    const configuredRoot = environment.CTX_ROOT?.trim();
+    if (!configuredRoot) {
+      throw new Error('CortextOS tests require an explicit isolated CTX_ROOT for daemon IPC');
+    }
+    const ctxRoot = resolve(configuredRoot);
+    const userStateRoot = resolve(homeDirectory, '.cortextos');
+    const fromUserState = relative(userStateRoot, ctxRoot);
+    if (fromUserState === '' || (!fromUserState.startsWith(`..${sep}`)
+      && fromUserState !== '..' && !isAbsolute(fromUserState))) {
+      throw new Error('CortextOS tests may not resolve daemon IPC inside the user home-state directory');
+    }
+    if (process.platform === 'win32') {
+      const suffix = createHash('sha256').update(ctxRoot).digest('hex').slice(0, 16);
+      return `\\\\.\\pipe\\cortextos-test-${suffix}`;
+    }
+    return join(ctxRoot, 'daemon.sock');
+  }
   if (process.platform === 'win32') {
     return `\\\\.\\pipe\\cortextos-${instanceId}`;
   }
-  return join(homedir(), '.cortextos', instanceId, 'daemon.sock');
+  return join(homeDirectory, '.cortextos', instanceId, 'daemon.sock');
 }

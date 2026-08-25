@@ -2,6 +2,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createConnection } from 'node:net';
+import { resolveCortextOSSocketPath } from './cortextos-state-location.js';
 import type {
   AgentRuntimeAdapter,
   AgentRuntimeDetail,
@@ -71,7 +72,10 @@ export function normalizeCortextOSProvider(value: unknown): RuntimeProvider {
 }
 
 function capabilitiesFor(provider: RuntimeProvider): readonly RuntimeCapability[] {
-  return provider === 'unknown' ? [] : ['session-resume'];
+  if (provider === 'unknown') return [];
+  return provider === 'codex'
+    ? ['session-resume', 'exact-turn-correlation']
+    : ['session-resume'];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -142,16 +146,9 @@ function parseDaemonSnapshot(value: unknown): DaemonSnapshot {
   };
 }
 
-function ipcPath(instanceId: string): string {
-  if (!/^[A-Za-z0-9_-]+$/.test(instanceId)) throw new Error(`Invalid CortextOS instance ID: ${instanceId}`);
-  return process.platform === 'win32'
-    ? `\\\\.\\pipe\\cortextos-${instanceId}`
-    : join(homedir(), '.cortextos', instanceId, 'daemon.sock');
-}
-
 function requestDaemonStatus(instanceId: string, timeoutMs: number): Promise<unknown> {
   return new Promise(resolve => {
-    const socket = createConnection(ipcPath(instanceId));
+    const socket = createConnection(resolveCortextOSSocketPath(instanceId));
     let data = '';
     let settled = false;
 

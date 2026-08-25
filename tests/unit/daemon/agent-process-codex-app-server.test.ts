@@ -13,6 +13,12 @@ const mockCodexAppServerPty = {
   }),
   getOutputBuffer: vi.fn().mockReturnValue({ isBootstrapped: vi.fn().mockReturnValue(true) }),
   setTelegramHandle: vi.fn(),
+  canStartCorrelationSafeTurn: vi.fn().mockReturnValue(true),
+  startCorrelationSafeTurn: vi.fn().mockResolvedValue({
+    provider: 'codex',
+    sessionId: 'thread-1',
+    turnId: 'turn-1',
+  }),
 };
 
 const mockAgentPty = {
@@ -103,6 +109,12 @@ beforeEach(() => {
     pty.getOutputBuffer.mockClear();
   }
   mockCodexAppServerPty.setTelegramHandle.mockClear();
+  mockCodexAppServerPty.canStartCorrelationSafeTurn.mockReset().mockReturnValue(true);
+  mockCodexAppServerPty.startCorrelationSafeTurn.mockReset().mockResolvedValue({
+    provider: 'codex',
+    sessionId: 'thread-1',
+    turnId: 'turn-1',
+  });
   mockInjectMessage.mockClear();
   fsMocks.existsSync.mockReset().mockReturnValue(false);
   fsMocks.readFileSync.mockReset();
@@ -198,6 +210,53 @@ describe('AgentProcess codex-app-server runtime', () => {
     await stopPromise;
     expect(mockCodexAppServerPty.kill).toHaveBeenCalled();
   }, 10000);
+
+  it('persists occupancy before starting a correlation-safe Codex turn', async () => {
+    const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
+    await ap.start();
+    fsMocks.writeFileSync.mockClear();
+
+    await expect(ap.injectCorrelatedMessageDetailed('bounded task', 'dispatch-plan:plan-1'))
+      .resolves.toEqual({ ok: true, provider: 'codex', sessionId: 'thread-1', turnId: 'turn-1' });
+    expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
+      '/tmp/test-ctx/state/codex-app-agent/last_message_injected.flag',
+      expect.stringMatching(/^\d+$/),
+      'utf-8',
+    );
+    expect(fsMocks.writeFileSync.mock.invocationCallOrder.at(-1))
+      .toBeLessThan(mockCodexAppServerPty.startCorrelationSafeTurn.mock.invocationCallOrder[0]);
+  });
+
+  it('rejects a busy Codex runtime before marker or turn creation', async () => {
+    mockCodexAppServerPty.canStartCorrelationSafeTurn.mockReturnValue(false);
+    const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
+    await ap.start();
+    fsMocks.writeFileSync.mockClear();
+
+    await expect(ap.injectCorrelatedMessageDetailed('must not steer', 'dispatch-plan:plan-2'))
+      .resolves.toMatchObject({ ok: false, code: 'RUNTIME_BUSY' });
+    expect(fsMocks.writeFileSync).not.toHaveBeenCalled();
+    expect(mockCodexAppServerPty.startCorrelationSafeTurn).not.toHaveBeenCalled();
+  });
+
+  it('fails closed before turn creation when the occupancy marker cannot be written', async () => {
+    const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
+    await ap.start();
+    fsMocks.writeFileSync.mockReset().mockImplementation(() => { throw new Error('read-only'); });
+
+    await expect(ap.injectCorrelatedMessageDetailed('bounded task', 'dispatch-plan:plan-3'))
+      .resolves.toMatchObject({ ok: false, code: 'MARKER_WRITE_FAILED' });
+    expect(mockCodexAppServerPty.startCorrelationSafeTurn).not.toHaveBeenCalled();
+  });
+
+  it('reports ambiguity after turn creation may have started', async () => {
+    mockCodexAppServerPty.startCorrelationSafeTurn.mockRejectedValue(new Error('connection lost'));
+    const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
+    await ap.start();
+
+    await expect(ap.injectCorrelatedMessageDetailed('bounded task', 'dispatch-plan:plan-4'))
+      .resolves.toMatchObject({ ok: false, code: 'SUBMISSION_UNCERTAIN' });
+  });
 
   it('ignores stale Claude JSONL when picking continue vs fresh — uses codex thread state only', async () => {
     // Regression: testorg codex-agent (runtime codex-app-server) had a leftover

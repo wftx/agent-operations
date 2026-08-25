@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type {
@@ -7,7 +8,22 @@ import type {
   RuntimeExecutionObservationAdapter,
   RuntimeExecutionObservationRequest,
 } from '../../agent-operations-contracts/src/index.js';
-import { CortextOSRuntimeAdapter } from '../../cortextos-adapter/src/index.js';
+import {
+  CortextOSRuntimeAdapter,
+  parseCodexExecutionReference,
+} from '../../cortextos-adapter/src/index.js';
+
+interface CorrelatedTurnRecord {
+  readonly version: 1;
+  readonly provider: 'codex';
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly status: 'inProgress' | 'completed' | 'failed' | 'interrupted';
+  readonly observedAt: string;
+  readonly startedAt?: string;
+  readonly completedAt?: string;
+  readonly error?: string;
+}
 
 export interface CortextOSExecutionObserverOptions {
   readonly runtimeAdapter?: AgentRuntimeAdapter;
@@ -17,8 +33,8 @@ export interface CortextOSExecutionObserverOptions {
 }
 
 /**
- * Read-only CortextOS observer. Current CortextOS exposes agent/session activity,
- * not an inject-agent correlation ID, so every emitted signal is deliberately weak.
+ * Read-only CortextOS observer. Generic running/idle signals remain weak; a
+ * native Codex turn record may additionally produce exact turn evidence.
  */
 export class CortextOSExecutionObserver implements RuntimeExecutionObservationAdapter {
   private readonly runtimes: AgentRuntimeAdapter;
@@ -28,7 +44,9 @@ export class CortextOSExecutionObserver implements RuntimeExecutionObservationAd
   constructor(options: CortextOSExecutionObserverOptions = {}) {
     const instanceId = options.instanceId ?? process.env.CTX_INSTANCE_ID ?? 'default';
     this.runtimes = options.runtimeAdapter ?? new CortextOSRuntimeAdapter({ instanceId });
-    this.ctxRoot = options.ctxRoot ?? join(homedir(), '.cortextos', instanceId);
+    this.ctxRoot = options.ctxRoot
+      ?? process.env.CTX_ROOT
+      ?? join(homedir(), '.cortextos', instanceId);
     this.now = options.now ?? (() => new Date());
   }
 
@@ -62,6 +80,8 @@ export class CortextOSExecutionObserver implements RuntimeExecutionObservationAd
 
       const idle = this.readIdleObservation(request, runtime.provider);
       if (idle) observations.push(idle);
+      const exact = this.readExactTurnObservation(request, runtime.provider);
+      if (exact) observations.push(exact);
       return observations;
     } catch (error) {
       return [this.unavailable(
@@ -97,6 +117,86 @@ export class CortextOSExecutionObserver implements RuntimeExecutionObservationAd
     }
   }
 
+  private readExactTurnObservation(
+    request: RuntimeExecutionObservationRequest,
+    provider: string,
+  ): RuntimeExecutionObservation | null {
+    if (!request.externalReference) return null;
+    if (provider !== 'codex') {
+      return this.unknownReference(request, 'The runtime provider cannot resolve a Codex turn reference.');
+    }
+    const reference = parseCodexExecutionReference(request.externalReference);
+    if (!reference) {
+      return this.unknownReference(request, 'The stored Codex turn reference is malformed.');
+    }
+    const name = runtimeAgentName(request.runtimeAgentId);
+    const path = join(
+      this.ctxRoot,
+      'state',
+      name,
+      'codex-turns',
+      reference.threadId,
+      `${reference.turnId}.json`,
+    );
+    if (!existsSync(path)) {
+      return this.unknownReference(request, 'No structured record exists for the accepted Codex turn.');
+    }
+    try {
+      const record = JSON.parse(readFileSync(path, 'utf8')) as CorrelatedTurnRecord;
+      if (record.version !== 1 || record.provider !== 'codex'
+        || record.threadId !== reference.threadId || record.turnId !== reference.turnId
+        || !['inProgress', 'completed', 'failed', 'interrupted'].includes(record.status)
+        || Number.isNaN(new Date(record.observedAt).getTime())) {
+        return this.unknownReference(request, 'The structured Codex turn record is malformed or mismatched.');
+      }
+      const kind = record.status === 'completed'
+        ? 'turn-completed'
+        : record.status === 'failed' || record.status === 'interrupted'
+          ? 'runtime-crashed'
+          : 'runtime-running';
+      const candidateObservedAt = kind === 'runtime-running'
+        ? (record.startedAt ?? record.observedAt)
+        : (record.completedAt ?? record.observedAt);
+      const observedAt = Number.isNaN(new Date(candidateObservedAt).getTime())
+        ? record.observedAt
+        : candidateObservedAt;
+      return {
+        source: 'cortextos-codex-turn-record',
+        sourceEventId: `codex-turn:${record.threadId}:${record.turnId}:${record.status}`,
+        kind,
+        correlation: 'exact',
+        correlatedDispatchId: request.dispatchId,
+        runtimeSessionId: record.threadId,
+        externalReference: request.externalReference,
+        observedAt,
+        message: record.status === 'completed'
+          ? 'Codex reported structured completion for the exact accepted turn; semantic success still requires human judgment.'
+          : record.status === 'inProgress'
+            ? 'The exact accepted Codex turn is still in progress.'
+            : `The exact accepted Codex turn ended with status ${record.status}${record.error ? `: ${record.error}` : '.'}`,
+      };
+    } catch {
+      return this.unknownReference(request, 'The structured Codex turn record could not be read.');
+    }
+  }
+
+  private unknownReference(
+    request: RuntimeExecutionObservationRequest,
+    message: string,
+  ): RuntimeExecutionObservation {
+    return {
+      source: 'cortextos-codex-turn-record',
+      sourceEventId: `codex-turn-unavailable:${createHash('sha256')
+        .update(`${request.externalReference ?? 'missing'}\0${message}`)
+        .digest('hex')}`,
+      kind: 'unknown',
+      correlation: 'uncorrelated',
+      observedAt: this.now().toISOString(),
+      ...(request.externalReference ? { externalReference: request.externalReference } : {}),
+      message,
+    };
+  }
+
   private unavailable(
     request: RuntimeExecutionObservationRequest,
     message: string,
@@ -116,6 +216,6 @@ function runtimeAgentName(runtimeAgentId: string): string {
   const segments = runtimeAgentId.split('/');
   if (segments.length !== 2 || !segments[1]) throw new Error(`Invalid runtime ID: ${runtimeAgentId}`);
   const name = decodeURIComponent(segments[1]);
-  if (!name.trim()) throw new Error(`Invalid runtime ID: ${runtimeAgentId}`);
+  if (!/^[A-Za-z0-9_-]+$/.test(name)) throw new Error(`Invalid runtime ID: ${runtimeAgentId}`);
   return name;
 }

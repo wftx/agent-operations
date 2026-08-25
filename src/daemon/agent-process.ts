@@ -15,6 +15,15 @@ import { resolvePaths } from '../utils/paths.js';
 
 type LogFn = (msg: string) => void;
 
+export type CorrelatedInjectionResult =
+  | { ok: true; provider: 'codex'; sessionId: string; turnId: string }
+  | {
+      ok: false;
+      code: 'NOT_RUNNING' | 'DEDUPED' | 'CORRELATION_UNSUPPORTED' | 'RUNTIME_BUSY'
+        | 'MARKER_WRITE_FAILED' | 'SUBMISSION_UNCERTAIN';
+      message: string;
+    };
+
 // opencode --continue wedge auto-recovery thresholds. A wedged session exits
 // code 0 almost immediately on every `--continue` re-attach, so a "wedge exit"
 // is an exit_code=0 that arrives within FAST_EXIT_MS of the spawn. After
@@ -432,13 +441,7 @@ export class AgentProcess {
     // this marker with last_idle.flag, so allowing an injection without it
     // could make a busy agent appear idle. Marker failures intentionally
     // abort the injection; a marker without a message fails safely closed.
-    const stateDir = join(this.env.ctxRoot, 'state', this.name);
-    ensureDir(stateDir);
-    writeFileSync(
-      join(stateDir, 'last_message_injected.flag'),
-      String(Math.floor(Date.now() / 1000)),
-      'utf-8',
-    );
+    this.persistInjectionMarker();
 
     if ('injectMessage' in this.pty && typeof this.pty.injectMessage === 'function') {
       this.pty.injectMessage(content);
@@ -451,12 +454,70 @@ export class AgentProcess {
   }
 
   /**
+   * Opt-in correlation-safe injection for providers that can create and name a
+   * new structured turn. It never steers or queues into an active Codex turn.
+   */
+  async injectCorrelatedMessageDetailed(
+    content: string,
+    correlationId: string,
+  ): Promise<CorrelatedInjectionResult> {
+    if (!this.pty || this.status !== 'running') {
+      return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
+    }
+    if (!('startCorrelationSafeTurn' in this.pty)
+      || typeof this.pty.startCorrelationSafeTurn !== 'function'
+      || !('canStartCorrelationSafeTurn' in this.pty)
+      || typeof this.pty.canStartCorrelationSafeTurn !== 'function') {
+      return { ok: false, code: 'CORRELATION_UNSUPPORTED', message: `agent "${this.name}" does not support exact turn correlation` };
+    }
+    if (!this.pty.canStartCorrelationSafeTurn()) {
+      return { ok: false, code: 'RUNTIME_BUSY', message: `agent "${this.name}" already has active or queued work` };
+    }
+    if (this.dedup.isDuplicate(content)) {
+      this.log('Dedup: skipping duplicate correlated message');
+      return { ok: false, code: 'DEDUPED', message: `inject for "${this.name}" deduped — content matches MessageDedup hash window` };
+    }
+    try {
+      this.persistInjectionMarker();
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'MARKER_WRITE_FAILED',
+        message: `agent "${this.name}" injection marker could not be persisted: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    try {
+      const reference = await this.pty.startCorrelationSafeTurn(content, correlationId);
+      return { ok: true, ...reference };
+    } catch (error) {
+      if (error instanceof Error && error.message === 'RUNTIME_BUSY') {
+        return { ok: false, code: 'RUNTIME_BUSY', message: `agent "${this.name}" became busy before a new turn could be created` };
+      }
+      return {
+        ok: false,
+        code: 'SUBMISSION_UNCERTAIN',
+        message: `agent "${this.name}" turn acknowledgement is uncertain: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  /**
    * Inject a message into the agent's PTY (back-compat boolean wrapper).
    * New callers that need to distinguish DEDUPED from NOT_RUNNING should use
    * `injectMessageDetailed()` instead.
    */
   injectMessage(content: string): boolean {
     return this.injectMessageDetailed(content).ok;
+  }
+
+  private persistInjectionMarker(): void {
+    const stateDir = join(this.env.ctxRoot, 'state', this.name);
+    ensureDir(stateDir);
+    writeFileSync(
+      join(stateDir, 'last_message_injected.flag'),
+      String(Math.floor(Date.now() / 1000)),
+      'utf-8',
+    );
   }
 
   /**

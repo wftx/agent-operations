@@ -680,6 +680,142 @@ describe('CodexAppServerPTY mid-turn steer', () => {
   });
 });
 
+describe('CodexAppServerPTY correlation-safe turn creation', () => {
+  function makeReadyPty() {
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _alive: boolean })._alive = true;
+    (pty as unknown as { _threadId: string })._threadId = 'thread-1';
+    (pty as unknown as { _rpc: { request: typeof requestMock; respondError: typeof respondErrorMock } })._rpc = {
+      request: requestMock,
+      respondError: respondErrorMock,
+    };
+    return pty;
+  }
+
+  function rpc(pty: InstanceType<typeof CodexAppServerPTY>) {
+    return pty as unknown as { handleRpcMessage(message: unknown): void };
+  }
+
+  function flush() {
+    return new Promise(resolve => setTimeout(resolve, 0));
+  }
+
+  it('returns the exact new turn identity without waiting for completion', async () => {
+    requestMock.mockResolvedValue({
+      result: { turn: { id: 'turn-1', status: 'inProgress', startedAt: 1_777_777_777 } },
+    });
+    const pty = makeReadyPty();
+
+    await expect(pty.startCorrelationSafeTurn('one bounded task', 'dispatch-plan:plan-1'))
+      .resolves.toEqual({ provider: 'codex', sessionId: 'thread-1', turnId: 'turn-1' });
+    expect(requestMock).toHaveBeenCalledWith('turn/start', {
+      threadId: 'thread-1',
+      clientUserMessageId: 'dispatch-plan:plan-1',
+      input: [{ type: 'text', text: 'one bounded task', text_elements: [] }],
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'dangerFullAccess' },
+    });
+    expect(atomicWriteSyncMock).toHaveBeenCalledWith(
+      '/tmp/ctx/state/codex-app-agent/codex-turns/thread-1/turn-1.json',
+      expect.stringContaining('"turnId":"turn-1"'),
+    );
+
+    rpc(pty).handleRpcMessage({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } },
+    });
+    await flush();
+  });
+
+  it('rejects an active turn before sending or steering any text', async () => {
+    const pty = makeReadyPty();
+    (pty as unknown as { _executing: boolean; _activeTurnId: string })._executing = true;
+    (pty as unknown as { _activeTurnId: string })._activeTurnId = 'turn-existing';
+
+    await expect(pty.startCorrelationSafeTurn('must not steer', 'dispatch-plan:plan-2'))
+      .rejects.toThrow('RUNTIME_BUSY');
+    expect(requestMock).not.toHaveBeenCalled();
+  });
+
+  it('protects a correlated turn from later generic steering', async () => {
+    requestMock.mockResolvedValue({ result: { turn: { id: 'turn-1', status: 'inProgress' } } });
+    const pty = makeReadyPty();
+    await pty.startCorrelationSafeTurn('correlated', 'dispatch-plan:plan-3');
+
+    pty.write('unrelated follow-up');
+    pty.write('\r');
+    await flush();
+    expect(requestMock.mock.calls.filter(([method]) => method === 'turn/steer')).toHaveLength(0);
+    expect(requestMock.mock.calls.filter(([method]) => method === 'turn/start')).toHaveLength(1);
+
+    rpc(pty).handleRpcMessage({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } },
+    });
+    await flush();
+    expect(requestMock.mock.calls.filter(([method]) => method === 'turn/start')).toHaveLength(2);
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+  });
+
+  it('ignores unrelated or unidentified terminal events while protecting the exact turn', async () => {
+    requestMock.mockResolvedValue({ result: { turn: { id: 'turn-1', status: 'inProgress' } } });
+    const pty = makeReadyPty();
+    await pty.startCorrelationSafeTurn('correlated', 'dispatch-plan:plan-terminal-isolation');
+
+    rpc(pty).handleRpcMessage({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-other', status: 'completed' } },
+    });
+    rpc(pty).handleRpcMessage({ method: 'turn/completed', params: {} });
+    rpc(pty).handleRpcMessage({
+      method: 'error',
+      params: { threadId: 'thread-1', turnId: 'turn-other', willRetry: false },
+    });
+    expect(pty.canStartCorrelationSafeTurn()).toBe(false);
+
+    rpc(pty).handleRpcMessage({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } },
+    });
+    await flush();
+    expect(pty.canStartCorrelationSafeTurn()).toBe(true);
+  });
+
+  it('fails the acknowledgement when exact turn state cannot be persisted', async () => {
+    requestMock.mockResolvedValue({ result: { turn: { id: 'turn-1', status: 'inProgress' } } });
+    atomicWriteSyncMock.mockImplementationOnce(() => { throw new Error('disk full'); });
+    const pty = makeReadyPty();
+    await expect(pty.startCorrelationSafeTurn('correlated', 'dispatch-plan:plan-4'))
+      .rejects.toThrow('correlated state could not be persisted');
+    expect(pty.canStartCorrelationSafeTurn()).toBe(false);
+    rpc(pty).handleRpcMessage({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } },
+    });
+    await flush();
+  });
+
+  it('updates only the correlated native turn record on terminal events', async () => {
+    requestMock.mockResolvedValue({ result: { turn: { id: 'turn-1', status: 'inProgress' } } });
+    const pty = makeReadyPty();
+    await pty.startCorrelationSafeTurn('correlated', 'dispatch-plan:plan-5');
+    const initial = String(atomicWriteSyncMock.mock.calls.at(-1)?.[1]);
+    fsMocks.existsSync.mockReturnValue(true);
+    fsMocks.readFileSync.mockReturnValue(initial);
+
+    rpc(pty).handleRpcMessage({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-1', status: 'completed', completedAt: 1_777_777_779, durationMs: 2_000 },
+      },
+    });
+    expect(String(atomicWriteSyncMock.mock.calls.at(-1)?.[1]))
+      .toContain('"status":"completed"');
+    await flush();
+  });
+});
+
 describe('CodexAppServerPTY extractTelegramPayload media types', () => {
   function extract(content: string, options?: { existsSync?: boolean; readFileSync?: string }): string | null {
     if (options?.existsSync !== undefined) fsMocks.existsSync.mockReturnValue(options.existsSync);
