@@ -283,6 +283,52 @@ describe('CortextOS rehearsal candidate safety', () => {
 });
 
 describe('live rehearsal durable orchestration', () => {
+  it('creates fresh work without reusing the preserved Phase 16 rehearsal project', async () => {
+    const store = new InMemoryAgentOperationsStateStore();
+    const execution = new FakeRuntimeExecutionAdapter({ status: 'accepted' });
+    const built = operations(store, execution);
+    const phase16ProjectId = 'ao-restricted-live-rehearsal';
+    await store.applyProjectConfiguration({
+      project: {
+        id: phase16ProjectId,
+        name: 'Preserved Phase 16 Rehearsal',
+        createdAt: TIME,
+        updatedAt: TIME,
+      },
+      repositories: [],
+      checkoutBindings: [],
+      runtimeAgentIds: [RUNTIME_ID],
+    });
+    const phase16Job = {
+      id: 'job:phase16-rejected',
+      projectId: phase16ProjectId,
+      title: 'Preserved rejected Phase 16 Job',
+      status: 'draft' as const,
+      preferredRuntimeAgentId: RUNTIME_ID,
+      revision: 0,
+      createdAt: TIME,
+      updatedAt: TIME,
+    };
+    await store.createJob(phase16Job);
+    await store.saveJobTransition({
+      ...phase16Job,
+      status: 'ready',
+      revision: 1,
+    }, 0);
+
+    const prepared = await built.value.prepare(candidate(), NONCE);
+
+    expect(prepared.projectId).toBe(LIVE_REHEARSAL_PROJECT_ID);
+    expect(prepared.projectId).not.toBe(phase16ProjectId);
+    expect(await store.listJobs(phase16ProjectId)).toEqual([
+      expect.objectContaining({ id: 'job:phase16-rejected', status: 'ready' }),
+    ]);
+    expect(await store.listJobs(LIVE_REHEARSAL_PROJECT_ID)).toEqual([
+      expect.objectContaining({ id: 'job:live-rehearsal', status: 'ready' }),
+    ]);
+    expect(execution.callCount).toBe(0);
+  });
+
   it('prepares durable work and current preflight without invoking a Dispatch', async () => {
     const store = new InMemoryAgentOperationsStateStore();
     const execution = new FakeRuntimeExecutionAdapter({ status: 'accepted' });

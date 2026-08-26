@@ -32,7 +32,7 @@ import {
 } from '../../agent-operations-core/src/index.js';
 
 export const LIVE_REHEARSAL_CONFIRMATION = 'LIVE_REHEARSAL';
-export const LIVE_REHEARSAL_PROJECT_ID = 'ao-restricted-live-rehearsal';
+export const LIVE_REHEARSAL_PROJECT_ID = 'ao-restricted-exact-correlation-live-rehearsal';
 
 export interface RuntimeCandidateSafety {
   readonly safe: boolean;
@@ -351,7 +351,7 @@ export class LiveRehearsalOperations {
       await this.store.applyProjectConfiguration({
         project: {
           id: LIVE_REHEARSAL_PROJECT_ID,
-          name: 'Agent Operations Restricted Live Rehearsal',
+          name: 'Agent Operations Restricted Exact-Correlation Live Rehearsal',
           createdAt: timestamp,
           updatedAt: timestamp,
         },
