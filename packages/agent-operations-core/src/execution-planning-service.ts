@@ -6,16 +6,19 @@ import type {
   DurableProject,
   DurableRepository,
   RepositoryCheckoutBinding,
+  RuntimeExecutionPolicy,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   createExecutionInputEnvelope,
   createExecutionPlanId,
+  createRuntimeExecutionPolicy,
 } from '../../agent-operations-contracts/src/index.js';
 
 export interface PrepareExecutionPlanInput {
   readonly projectId: string;
   readonly attemptId: string;
   readonly instruction: string;
+  readonly requestedPolicy: RuntimeExecutionPolicy;
   readonly checkoutBindingId?: string;
 }
 
@@ -85,6 +88,7 @@ export class ExecutionPlanningService {
       installation.id,
       input.checkoutBindingId,
     );
+    const requestedPolicy = copyPolicy(input.requestedPolicy);
     const plan: DurableExecutionPlan = {
       id: this.planIdFactory(),
       attemptId: attempt.id,
@@ -95,6 +99,7 @@ export class ExecutionPlanningService {
       ...(job.repositoryId ? { repositoryId: job.repositoryId } : {}),
       ...(checkout ? { checkoutBindingId: checkout.id } : {}),
       input: createExecutionInputEnvelope(input.instruction),
+      requestedPolicy,
       jobRevisionAtPreparation: job.revision,
       attemptRevisionAtPreparation: attempt.revision,
       createdAt: this.now().toISOString(),
@@ -156,6 +161,11 @@ export class ExecutionPlanningService {
     }
     return currentBindings[0];
   }
+}
+
+function copyPolicy(policy: RuntimeExecutionPolicy): RuntimeExecutionPolicy {
+  if (!policy) throw new Error('Requested runtime execution policy is required');
+  return createRuntimeExecutionPolicy(policy);
 }
 
 function required(value: string, field: string): string {

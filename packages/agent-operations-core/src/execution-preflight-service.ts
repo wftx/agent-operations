@@ -9,7 +9,9 @@ import type {
   ExecutionPreflightFindingSeverity,
   ExecutionPreflightResult,
   RepositoryInventoryAdapter,
+  RuntimeExecutionPolicy,
 } from '../../agent-operations-contracts/src/index.js';
+import { resolveRuntimeExecutionPolicy } from '../../agent-operations-contracts/src/index.js';
 
 /** Current, read-only validation. It neither stores observations nor changes lifecycle state. */
 export class ExecutionPreflightService {
@@ -26,6 +28,7 @@ export class ExecutionPreflightService {
     const checks: ExecutionPreflightFinding[] = [];
     await this.checkDurableState(plan, checks);
     const runtime = await this.checkRuntime(plan, checks);
+    const effectivePolicy = this.checkRuntimePolicy(plan, runtime, checks);
     await this.checkRepository(plan, checks, runtime);
     const dispatchable = !checks.some(check => check.severity === 'blocking');
     return {
@@ -35,8 +38,47 @@ export class ExecutionPreflightService {
         ? checks.some(check => check.severity === 'warning') ? 'warning' : 'ready'
         : 'blocked',
       dispatchable,
+      requestedPolicy: plan.requestedPolicy ? { ...plan.requestedPolicy } : null,
+      effectivePolicy,
       checks,
     };
+  }
+
+  private checkRuntimePolicy(
+    plan: DurableExecutionPlan,
+    runtime: AgentRuntimeDetail | null,
+    checks: ExecutionPreflightFinding[],
+  ): RuntimeExecutionPolicy | null {
+    if (!plan.requestedPolicy) {
+      add(
+        checks,
+        'runtime-policy-unspecified',
+        'blocking',
+        'Plan predates runtime capability policy and cannot be dispatched by the Phase 15 boundary.',
+      );
+      return null;
+    }
+    if (!runtime) {
+      add(
+        checks,
+        'runtime-policy-unsupported',
+        'blocking',
+        'Runtime policy cannot be evaluated because the runtime is unavailable.',
+      );
+      return null;
+    }
+    const resolution = resolveRuntimeExecutionPolicy(plan.requestedPolicy, runtime.capabilities);
+    if (!resolution.supported) {
+      add(checks, 'runtime-policy-unsupported', 'blocking', resolution.reason);
+      return null;
+    }
+    add(
+      checks,
+      'runtime-policy-supported',
+      'pass',
+      `Runtime can enforce filesystem=${resolution.effectivePolicy.filesystem}, network=${resolution.effectivePolicy.network}, environment=${resolution.effectivePolicy.environment}.`,
+    );
+    return { ...resolution.effectivePolicy };
   }
 
   private async checkDurableState(

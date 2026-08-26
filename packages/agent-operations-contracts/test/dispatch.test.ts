@@ -32,6 +32,7 @@ describe('Execution Dispatch contracts', () => {
       runtimeAgentId: 'engineering/coder',
       executionPlanId: 'plan:test',
       input: { version: 1 as const, instruction: 'Inspect.' },
+      requestedPolicy: { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const },
     };
     await expect(fake.dispatch(request)).resolves.toEqual({ status: 'rejected', message: 'No capacity' });
     expect(fake.callCount).toBe(1);

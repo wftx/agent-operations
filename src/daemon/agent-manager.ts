@@ -1,6 +1,14 @@
 import { readdirSync, readFileSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from 'fs';
 import { join, relative } from 'path';
-import type { AgentConfig, AgentStatus, CtxEnv, BusPaths, WorkerStatus, TelegramMessage } from '../types/index.js';
+import type {
+  AgentConfig,
+  AgentStatus,
+  CtxEnv,
+  BusPaths,
+  WorkerStatus,
+  TelegramMessage,
+  RuntimeExecutionPolicyEnvelope,
+} from '../types/index.js';
 import { AgentProcess, type CorrelatedInjectionResult } from './agent-process.js';
 import { WorkerProcess } from './worker-process.js';
 import { FastChecker } from './fast-checker.js';
@@ -1854,12 +1862,13 @@ export class AgentManager {
     agentName: string,
     text: string,
     correlationId: string,
+    executionPolicy?: RuntimeExecutionPolicyEnvelope,
   ): Promise<CorrelatedInjectionResult | { ok: false; code: 'NOT_FOUND'; message: string }> {
     const entry = this.agents.get(agentName);
     if (!entry) {
       return { ok: false, code: 'NOT_FOUND', message: `agent "${agentName}" not in registry` };
     }
-    return entry.process.injectCorrelatedMessageDetailed(text, correlationId);
+    return entry.process.injectCorrelatedMessageDetailed(text, correlationId, executionPolicy);
   }
 
   /**

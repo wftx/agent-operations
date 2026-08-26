@@ -74,7 +74,16 @@ export function normalizeCortextOSProvider(value: unknown): RuntimeProvider {
 function capabilitiesFor(provider: RuntimeProvider): readonly RuntimeCapability[] {
   if (provider === 'unknown') return [];
   return provider === 'codex'
-    ? ['session-resume', 'exact-turn-correlation']
+    ? [
+        'session-resume',
+        'exact-turn-correlation',
+        'filesystem-read-only',
+        'filesystem-workspace-write',
+        'network-denial',
+        'environment-empty',
+        'environment-minimal',
+        'environment-inherit',
+      ]
     : ['session-resume'];
 }
 

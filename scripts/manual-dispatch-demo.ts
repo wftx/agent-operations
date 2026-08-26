@@ -58,6 +58,7 @@ async function main(): Promise<void> {
         projectId: PROJECT_ID,
         attemptId: attempt.id,
         instruction: `Demonstrate the ${label} result without contacting a real runtime.`,
+        requestedPolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
       }));
     }
 
@@ -68,7 +69,7 @@ async function main(): Promise<void> {
       provider: 'codex',
       enabled: true,
       configured: true,
-      capabilities: [],
+      capabilities: ['filesystem-read-only', 'network-denial', 'environment-empty'],
       health: { state: 'running' },
       observedAt: now,
     }]);

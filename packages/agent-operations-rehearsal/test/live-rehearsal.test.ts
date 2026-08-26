@@ -43,7 +43,7 @@ function runtime(state: 'running' | 'stopped' | 'degraded' = 'running'): AgentRu
     provider: 'claude',
     enabled: true,
     configured: true,
-    capabilities: ['session-resume'],
+    capabilities: ['session-resume', 'filesystem-read-only', 'network-denial', 'environment-empty'],
     health: { state },
     observedAt: TIME,
   };
@@ -136,6 +136,19 @@ describe('live rehearsal execution gates', () => {
       repository: null,
       executionAuthorized: false,
       willContactRealRuntime: false,
+      requestedPolicy: {
+        version: 1,
+        filesystem: 'read-only',
+        network: 'deny',
+        environment: 'empty',
+      },
+      effectivePolicy: {
+        version: 1,
+        filesystem: 'read-only',
+        network: 'deny',
+        environment: 'empty',
+      },
+      policyEnforceable: true,
     });
     expect(factoryCalls).toBe(0);
   });

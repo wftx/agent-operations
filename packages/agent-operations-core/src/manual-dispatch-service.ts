@@ -9,6 +9,7 @@ import type {
 import {
   createExecutionDispatchId,
   createExecutionDispatchIdempotencyKey,
+  isRuntimeExecutionPolicyNoBroaderThan,
 } from '../../agent-operations-contracts/src/index.js';
 import { ExecutionPreflightService } from './execution-preflight-service.js';
 import { JobLifecycleService } from './job-lifecycle-service.js';
@@ -109,18 +110,39 @@ export class ManualDispatchService {
 
     let result: RuntimeDispatchResult;
     try {
+      if (!plan.requestedPolicy || !preflight.effectivePolicy) {
+        throw new Error('Policy-aware Dispatch requires requested and effective preflight policy');
+      }
       result = await this.execution.dispatch({
         dispatchId: submitting.id,
         idempotencyKey: submitting.idempotencyKey,
         runtimeAgentId: submitting.runtimeAgentId,
         executionPlanId: submitting.executionPlanId,
         input: { ...plan.input },
+        requestedPolicy: { ...plan.requestedPolicy },
       });
     } catch (error) {
       result = {
         status: 'uncertain',
         message: `Execution adapter threw after submission began: ${errorMessage(error)}`,
       };
+    }
+
+    if (result.status === 'accepted') {
+      if (!result.effectivePolicy) {
+        result = {
+          status: 'uncertain',
+          code: 'SUBMISSION_UNCERTAIN',
+          message: 'Runtime accepted execution without reporting its effective policy.',
+        };
+      } else if (!plan.requestedPolicy
+        || !isRuntimeExecutionPolicyNoBroaderThan(result.effectivePolicy, plan.requestedPolicy)) {
+        result = {
+          status: 'uncertain',
+          code: 'SUBMISSION_UNCERTAIN',
+          message: 'Runtime reported an effective policy broader than the immutable Plan.',
+        };
+      }
     }
 
     const terminal = this.terminalDispatch(submitting, result);
@@ -234,6 +256,9 @@ export class ManualDispatchService {
     const resolvedAt = this.now().toISOString();
     return this.transition(submitting, {
       status: result.status,
+      ...(result.status === 'accepted' && result.effectivePolicy
+        ? { effectivePolicy: { ...result.effectivePolicy } }
+        : {}),
       ...(cleanOptional(result.externalReference) ? { externalReference: cleanOptional(result.externalReference) } : {}),
       ...(cleanOptional(result.message) ? { message: cleanOptional(result.message) } : {}),
       ...(result.status === 'accepted' ? { acceptedAt: resolvedAt } : {}),

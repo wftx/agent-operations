@@ -81,7 +81,7 @@ function job(suffix: string): DurableJob {
   };
 }
 
-function plan(suffix: string): DurableExecutionPlan {
+function plan(suffix: string, withPolicy = true): DurableExecutionPlan {
   return {
     id: `plan:${suffix}`,
     attemptId: `attempt:${suffix}`,
@@ -92,6 +92,9 @@ function plan(suffix: string): DurableExecutionPlan {
     repositoryId: REPOSITORY_ID,
     checkoutBindingId: CHECKOUT_ID,
     input: { version: 1, instruction: `Dispatch ${suffix}.` },
+    ...(withPolicy
+      ? { requestedPolicy: { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const } }
+      : {}),
     jobRevisionAtPreparation: 1,
     attemptRevisionAtPreparation: 0,
     createdAt: TIME,
@@ -121,18 +124,26 @@ function submitting(dispatch: DurableExecutionDispatch): DurableExecutionDispatc
 function terminal(
   dispatch: DurableExecutionDispatch,
   status: 'accepted' | 'rejected' | 'uncertain',
+  withPolicy = true,
 ): DurableExecutionDispatch {
   return {
     ...dispatch,
     status,
     ...(status === 'accepted' ? { acceptedAt: TIME } : {}),
+    ...(status === 'accepted' && withPolicy
+      ? { effectivePolicy: { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const } }
+      : {}),
     resolvedAt: TIME,
     revision: 2,
     updatedAt: TIME,
   };
 }
 
-async function seedPlan(store: SqliteAgentOperationsStateStore, suffix: string): Promise<void> {
+async function seedPlan(
+  store: SqliteAgentOperationsStateStore,
+  suffix: string,
+  withPolicy = true,
+): Promise<void> {
   const draft = job(suffix);
   await store.createJob(draft);
   await store.saveJobTransition({ ...draft, status: 'ready', revision: 1 }, 0);
@@ -145,15 +156,52 @@ async function seedPlan(store: SqliteAgentOperationsStateStore, suffix: string):
     createdAt: TIME,
     updatedAt: TIME,
   });
-  await store.createExecutionPlan(plan(suffix));
+  await store.createExecutionPlan(plan(suffix, withPolicy));
 }
 
-async function seed(store: SqliteAgentOperationsStateStore, suffixes: readonly string[]): Promise<void> {
+async function seed(
+  store: SqliteAgentOperationsStateStore,
+  suffixes: readonly string[],
+  withPolicy = true,
+): Promise<void> {
   await store.applyProjectConfiguration(configuration());
-  for (const suffix of suffixes) await seedPlan(store, suffix);
+  for (const suffix of suffixes) await seedPlan(store, suffix, withPolicy);
 }
 
 describe('SQLite Execution Dispatch persistence', () => {
+  it('migrates populated v5 history to v6 without inventing requested or effective policy', async () => {
+    const path = databasePath();
+    const versionFive = open(path, 5);
+    await seed(versionFive, ['legacy-policy'], false);
+    const initial = prepared('legacy-policy');
+    await versionFive.createExecutionDispatch(initial);
+    const inFlight = submitting(initial);
+    await versionFive.saveExecutionDispatchTransition(inFlight, 0);
+    await versionFive.saveExecutionDispatchTransition(terminal(inFlight, 'accepted', false), 1);
+    await versionFive.close();
+
+    const upgraded = open(path);
+    expect(await upgraded.getExecutionPlan('plan:legacy-policy')).toEqual(plan('legacy-policy', false));
+    const legacyDispatch = await upgraded.getExecutionDispatch('dispatch:legacy-policy');
+    expect(legacyDispatch).toMatchObject({ status: 'accepted' });
+    expect(legacyDispatch?.effectivePolicy).toBeUndefined();
+    await upgraded.close();
+
+    const database = new Database(path, { readonly: true });
+    expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
+    expect(database.prepare(`
+      SELECT requested_policy_version, requested_filesystem, requested_network, requested_environment
+      FROM execution_plans WHERE id = 'plan:legacy-policy'
+    `).get()).toEqual({
+      requested_policy_version: null,
+      requested_filesystem: null,
+      requested_network: null,
+      requested_environment: null,
+    });
+    database.close();
+  });
+
   it('persists accepted and uncertain Dispatches across reopen with optimistic transitions', async () => {
     const path = databasePath();
     const store = open(path);
@@ -179,6 +227,25 @@ describe('SQLite Execution Dispatch persistence', () => {
     await reopened.close();
   });
 
+  it('rejects partially specified requested and effective policy tuples at the database boundary', async () => {
+    const path = databasePath();
+    const store = open(path);
+    await seed(store, ['complete-policy']);
+    await store.createExecutionDispatch(prepared('complete-policy'));
+    await store.close();
+
+    const database = new Database(path);
+    expect(() => database.prepare(`
+      UPDATE execution_plans SET requested_network = NULL
+      WHERE id = 'plan:complete-policy'
+    `).run()).toThrow('execution plan policy must be wholly null or wholly specified');
+    expect(() => database.prepare(`
+      UPDATE execution_dispatches SET effective_policy_version = 1
+      WHERE id = 'dispatch:complete-policy'
+    `).run()).toThrow('execution dispatch policy must be wholly null or wholly specified');
+    database.close();
+  });
+
   it('enforces unique Plan and idempotency identities', async () => {
     const store = open(databasePath());
     await seed(store, ['one', 'two']);
@@ -198,7 +265,7 @@ describe('SQLite Execution Dispatch persistence', () => {
   it('migrates a populated schema v3 to v4 and preserves the entire Plan chain', async () => {
     const path = databasePath();
     const versionThree = open(path, 3);
-    await seed(versionThree, ['migration']);
+    await seed(versionThree, ['migration'], false);
     await versionThree.close();
 
     let database = new Database(path, { readonly: true });
@@ -213,7 +280,7 @@ describe('SQLite Execution Dispatch persistence', () => {
     expect(await upgraded.getRepository(REPOSITORY_ID)).not.toBeNull();
     expect(await upgraded.getJob('job:migration')).toMatchObject({ status: 'ready' });
     expect(await upgraded.getAttempt('attempt:migration')).toMatchObject({ status: 'created' });
-    expect(await upgraded.getExecutionPlan('plan:migration')).toEqual(plan('migration'));
+    expect(await upgraded.getExecutionPlan('plan:migration')).toEqual(plan('migration', false));
     await upgraded.createExecutionDispatch(prepared('migration'));
     expect(await upgraded.getExecutionDispatch('dispatch:migration')).toEqual(prepared('migration'));
     await upgraded.close();
@@ -234,7 +301,7 @@ describe('SQLite Execution Dispatch persistence', () => {
     expect(() => SqliteAgentOperationsStateStore.open({
       databasePath: path,
       additionalMigrations: [{
-        version: 6,
+        version: 7,
         name: 'deliberate-dispatch-rollback',
         up: database => {
           database.exec('CREATE TABLE should_rollback_dispatch (id TEXT)');
@@ -249,7 +316,7 @@ describe('SQLite Execution Dispatch persistence', () => {
     expect(database.prepare('SELECT id FROM execution_dispatches').get())
       .toEqual({ id: 'dispatch:rollback' });
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
     database.close();
   });
 });

@@ -46,6 +46,7 @@ async function harness(fixtures: readonly RuntimeExecutionObservation[] = []) {
     projectId: PROJECT_ID,
     attemptId: attempt.id,
     instruction: 'Produce bounded completion evidence.',
+    requestedPolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
   });
   const prepared = {
     id: 'dispatch:observation',
@@ -73,6 +74,7 @@ async function harness(fixtures: readonly RuntimeExecutionObservation[] = []) {
     acceptedAt: TIME,
     resolvedAt: TIME,
     revision: 2,
+    effectivePolicy: plan.requestedPolicy,
   };
   await store.saveExecutionDispatchTransition(accepted, 1);
   await lifecycle.startAttempt(attempt.id);

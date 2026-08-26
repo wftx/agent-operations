@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { ExecutionInputEnvelope } from './execution.js';
+import type { ExecutionInputEnvelope, RuntimeExecutionPolicy } from './execution.js';
 
 export const DISPATCH_STATUSES = [
   'prepared',
@@ -20,6 +20,8 @@ export interface DurableExecutionDispatch {
   readonly runtimeAgentId: string;
   readonly idempotencyKey: string;
   readonly status: DispatchStatus;
+  /** Present after accepted policy-aware execution; absent for legacy history. */
+  readonly effectivePolicy?: RuntimeExecutionPolicy;
   readonly externalReference?: string;
   readonly message?: string;
   readonly revision: number;
@@ -36,10 +38,21 @@ export interface RuntimeDispatchRequest {
   readonly runtimeAgentId: string;
   readonly executionPlanId: string;
   readonly input: ExecutionInputEnvelope;
+  readonly requestedPolicy: RuntimeExecutionPolicy;
 }
+
+export type RuntimeDispatchResultCode =
+  | 'POLICY_UNSUPPORTED'
+  | 'POLICY_MISMATCH'
+  | 'RUNTIME_BUSY'
+  | 'SUBMISSION_UNCERTAIN'
+  | 'RUNTIME_REJECTED';
 
 export interface RuntimeDispatchResult {
   readonly status: 'accepted' | 'rejected' | 'uncertain';
+  readonly code?: RuntimeDispatchResultCode;
+  /** Required by AO before an accepted policy-aware result can be trusted. */
+  readonly effectivePolicy?: RuntimeExecutionPolicy;
   readonly externalReference?: string;
   readonly message?: string;
 }

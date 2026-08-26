@@ -21,7 +21,16 @@ export const RUNTIME_STATES = [
 export type RuntimeState = (typeof RUNTIME_STATES)[number];
 
 /** Capabilities proven by the current runtime adapters, not inferred tools. */
-export type RuntimeCapability = 'session-resume' | 'exact-turn-correlation';
+export type RuntimeCapability =
+  | 'session-resume'
+  | 'exact-turn-correlation'
+  | 'filesystem-none'
+  | 'filesystem-read-only'
+  | 'filesystem-workspace-write'
+  | 'network-denial'
+  | 'environment-empty'
+  | 'environment-minimal'
+  | 'environment-inherit';
 
 export interface AgentRuntimeIdentity {
   readonly id: string;

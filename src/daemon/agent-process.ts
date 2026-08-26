@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { join, sep } from 'path';
 import { homedir } from 'os';
-import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
+import type { AgentConfig, AgentStatus, CtxEnv, RuntimeExecutionPolicyEnvelope } from '../types/index.js';
 import { AgentPTY } from '../pty/agent-pty.js';
 import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
@@ -16,11 +16,18 @@ import { resolvePaths } from '../utils/paths.js';
 type LogFn = (msg: string) => void;
 
 export type CorrelatedInjectionResult =
-  | { ok: true; provider: 'codex'; sessionId: string; turnId: string }
+  | {
+      ok: true;
+      provider: 'codex';
+      sessionId: string;
+      turnId: string;
+      effectivePolicy?: RuntimeExecutionPolicyEnvelope;
+    }
   | {
       ok: false;
       code: 'NOT_RUNNING' | 'DEDUPED' | 'CORRELATION_UNSUPPORTED' | 'RUNTIME_BUSY'
-        | 'MARKER_WRITE_FAILED' | 'SUBMISSION_UNCERTAIN';
+        | 'POLICY_UNSUPPORTED' | 'POLICY_MISMATCH' | 'MARKER_WRITE_FAILED'
+        | 'SUBMISSION_UNCERTAIN';
       message: string;
     };
 
@@ -33,6 +40,11 @@ export type CorrelatedInjectionResult =
 // exited session from ever counting.
 const OPENCODE_CONTINUE_WEDGE_THRESHOLD = 3;
 const OPENCODE_CONTINUE_WEDGE_FAST_EXIT_MS = 60_000;
+
+function isCodexThreadOwnershipConflict(error: unknown): error is Error & { code: string } {
+  return error instanceof Error
+    && (error as Error & { code?: string }).code === 'CODEX_THREAD_OWNERSHIP_CONFLICT';
+}
 
 /**
  * Manages a single agent's lifecycle.
@@ -235,8 +247,17 @@ export class AgentProcess {
 
       this.notifyStatusChange();
     } catch (err) {
-      this.log(`Failed to start: ${err}`);
-      this.status = 'crashed';
+      if (isCodexThreadOwnershipConflict(err)) {
+        this.log(`Provider ownership conflict: ${err.message}`);
+        this.log('Automatic recovery suppressed until the competing Codex writer exits');
+        this.pty = null;
+        this.resolveExit?.();
+        this.resolveExit = null;
+        this.status = 'halted';
+      } else {
+        this.log(`Failed to start: ${err}`);
+        this.status = 'crashed';
+      }
       this.notifyStatusChange();
     }
   }
@@ -460,6 +481,7 @@ export class AgentProcess {
   async injectCorrelatedMessageDetailed(
     content: string,
     correlationId: string,
+    executionPolicy?: RuntimeExecutionPolicyEnvelope,
   ): Promise<CorrelatedInjectionResult> {
     if (!this.pty || this.status !== 'running') {
       return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
@@ -472,6 +494,15 @@ export class AgentProcess {
     }
     if (!this.pty.canStartCorrelationSafeTurn()) {
       return { ok: false, code: 'RUNTIME_BUSY', message: `agent "${this.name}" already has active or queued work` };
+    }
+    if (executionPolicy && (!('canEnforceExecutionPolicy' in this.pty)
+      || typeof this.pty.canEnforceExecutionPolicy !== 'function'
+      || !this.pty.canEnforceExecutionPolicy(executionPolicy))) {
+      return {
+        ok: false,
+        code: 'POLICY_UNSUPPORTED',
+        message: `agent "${this.name}" cannot enforce the requested execution policy`,
+      };
     }
     if (this.dedup.isDuplicate(content)) {
       this.log('Dedup: skipping duplicate correlated message');
@@ -487,11 +518,22 @@ export class AgentProcess {
       };
     }
     try {
-      const reference = await this.pty.startCorrelationSafeTurn(content, correlationId);
-      return { ok: true, ...reference };
+      const reference = await this.pty.startCorrelationSafeTurn(content, correlationId, executionPolicy);
+      return {
+        ok: true,
+        ...reference,
+        ...(executionPolicy ? { effectivePolicy: { ...executionPolicy } } : {}),
+      };
     } catch (error) {
       if (error instanceof Error && error.message === 'RUNTIME_BUSY') {
         return { ok: false, code: 'RUNTIME_BUSY', message: `agent "${this.name}" became busy before a new turn could be created` };
+      }
+      if (error instanceof Error && error.message.startsWith('POLICY_THREAD_SETUP_FAILED')) {
+        return {
+          ok: false,
+          code: 'POLICY_MISMATCH',
+          message: `agent "${this.name}" could not establish a policy-isolated Codex thread: ${error.message}`,
+        };
       }
       return {
         ok: false,

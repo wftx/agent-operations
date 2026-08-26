@@ -64,7 +64,11 @@ vi.mock('../../../src/bus/event.js', () => ({
   logEvent: logEventMock,
 }));
 
-const { CodexAppServerPTY } = await import('../../../src/pty/codex-app-server-pty.js');
+const {
+  CodexAppServerPTY,
+  CodexThreadOwnershipConflictError,
+  mapExecutionPolicyToCodex,
+} = await import('../../../src/pty/codex-app-server-pty.js');
 
 const mockEnv = {
   instanceId: 'test',
@@ -113,6 +117,29 @@ describe('CodexAppServerPTY socket path policy', () => {
       expect.stringContaining('"fallback": true'),
       'utf-8',
     );
+  });
+});
+
+describe('Codex execution policy mapping', () => {
+  it('keeps minimal environments detached while allowing only the core shell environment', () => {
+    expect(mapExecutionPolicyToCodex({
+      version: 1,
+      filesystem: 'workspace-write',
+      network: 'allow',
+      environment: 'minimal',
+    }, '/work/rehearsal')).toMatchObject({
+      threadSandbox: 'workspace-write',
+      sandboxPolicy: {
+        type: 'workspaceWrite',
+        writableRoots: ['/work/rehearsal'],
+        networkAccess: true,
+        excludeTmpdirEnvVar: true,
+        excludeSlashTmp: true,
+      },
+      environments: [],
+      shellEnvironmentInherit: 'core',
+      runtimeWorkspaceRoots: ['/work/rehearsal'],
+    });
   });
 });
 
@@ -681,6 +708,12 @@ describe('CodexAppServerPTY mid-turn steer', () => {
 });
 
 describe('CodexAppServerPTY correlation-safe turn creation', () => {
+  const restrictedPolicy = {
+    version: 1 as const,
+    filesystem: 'read-only' as const,
+    network: 'deny' as const,
+    environment: 'empty' as const,
+  };
   function makeReadyPty() {
     const pty = new CodexAppServerPTY(mockEnv, {});
     (pty as unknown as { _alive: boolean })._alive = true;
@@ -727,12 +760,144 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
     await flush();
   });
 
+  it('creates a dedicated restricted thread and maps the rehearsal policy without secret inheritance', async () => {
+    process.env.AO_TEST_SECRET_SENTINEL = 'fixture-secret-never-forward';
+    requestMock.mockImplementation(async (method: string) => {
+      if (method === 'config/read') {
+        return {
+          result: {
+            config: {
+              mcp_servers: {
+                remote_fixture: { url: 'https://must-not-be-contacted.invalid' },
+                local_fixture: { command: 'fixture-command' },
+              },
+            },
+          },
+        };
+      }
+      return method === 'thread/start'
+        ? { result: { thread: { id: 'thread-restricted' } } }
+        : { result: { turn: { id: 'turn-restricted', status: 'inProgress' } } };
+    });
+    const pty = makeReadyPty();
+
+    await expect(pty.startCorrelationSafeTurn(
+      'restricted plain-text turn',
+      'dispatch-plan:restricted',
+      restrictedPolicy,
+    )).resolves.toEqual({
+      provider: 'codex',
+      sessionId: 'thread-restricted',
+      turnId: 'turn-restricted',
+    });
+
+    expect(requestMock).toHaveBeenNthCalledWith(1, 'config/read', {
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      includeLayers: false,
+    });
+    expect(requestMock).toHaveBeenNthCalledWith(2, 'thread/start', {
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      runtimeWorkspaceRoots: [],
+      approvalPolicy: 'never',
+      sandbox: 'read-only',
+      environments: [],
+      dynamicTools: [],
+      selectedCapabilityRoots: [],
+      config: {
+        features: {
+          goals: false,
+          hooks: false,
+          memories: false,
+          multi_agent: false,
+        },
+        agents: { enabled: false },
+        allow_login_shell: false,
+        tools: { web_search: false, view_image: false },
+        shell_environment_policy: {
+          inherit: 'none',
+          experimental_use_profile: false,
+          set: {},
+        },
+        apps: {
+          _default: {
+            enabled: false,
+            approvals_reviewer: null,
+            destructive_enabled: false,
+            open_world_enabled: false,
+            default_tools_approval_mode: null,
+          },
+        },
+        mcp_servers: {
+          local_fixture: { enabled: false },
+          remote_fixture: { enabled: false },
+        },
+      },
+      sessionStartSource: 'startup',
+      experimentalRawEvents: false,
+      persistExtendedHistory: true,
+    });
+    expect(requestMock).toHaveBeenNthCalledWith(3, 'turn/start', {
+      threadId: 'thread-restricted',
+      clientUserMessageId: 'dispatch-plan:restricted',
+      input: [{ type: 'text', text: 'restricted plain-text turn', text_elements: [] }],
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      runtimeWorkspaceRoots: [],
+      approvalPolicy: 'never',
+      sandboxPolicy: { type: 'readOnly', networkAccess: false },
+      environments: [],
+    });
+    expect(JSON.stringify(requestMock.mock.calls)).not.toContain('AO_TEST_SECRET_SENTINEL');
+    expect(JSON.stringify(requestMock.mock.calls)).not.toContain('fixture-secret-never-forward');
+    expect(JSON.stringify(requestMock.mock.calls)).not.toContain('dangerFullAccess');
+
+    rpc(pty).handleRpcMessage({
+      method: 'turn/completed',
+      params: { threadId: 'thread-restricted', turn: { id: 'turn-restricted', status: 'completed' } },
+    });
+    await flush();
+    delete process.env.AO_TEST_SECRET_SENTINEL;
+  });
+
+  it('fails closed before thread or turn creation when MCP configuration cannot be inspected', async () => {
+    requestMock.mockRejectedValue(new Error('config unavailable'));
+    const pty = makeReadyPty();
+
+    await expect(pty.startCorrelationSafeTurn(
+      'must not start',
+      'dispatch-plan:mcp-discovery-failed',
+      restrictedPolicy,
+    )).rejects.toThrow('POLICY_THREAD_SETUP_FAILED');
+    expect(requestMock).toHaveBeenCalledTimes(1);
+    expect(requestMock).toHaveBeenCalledWith('config/read', {
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      includeLayers: false,
+    });
+    expect(requestMock.mock.calls.some(([method]) => method === 'thread/start')).toBe(false);
+    expect(requestMock.mock.calls.some(([method]) => method === 'turn/start')).toBe(false);
+  });
+
+  it('rejects unsupported no-filesystem policy before creating a thread or turn', async () => {
+    const pty = makeReadyPty();
+    const unsupported = { ...restrictedPolicy, filesystem: 'none' as const };
+    expect(pty.canEnforceExecutionPolicy(unsupported)).toBe(false);
+    await expect(pty.startCorrelationSafeTurn(
+      'must not start',
+      'dispatch-plan:unsupported',
+      unsupported,
+    )).rejects.toThrow('POLICY_UNSUPPORTED');
+    expect(requestMock).not.toHaveBeenCalled();
+  });
+
   it('rejects an active turn before sending or steering any text', async () => {
     const pty = makeReadyPty();
     (pty as unknown as { _executing: boolean; _activeTurnId: string })._executing = true;
     (pty as unknown as { _activeTurnId: string })._activeTurnId = 'turn-existing';
 
-    await expect(pty.startCorrelationSafeTurn('must not steer', 'dispatch-plan:plan-2'))
+    await expect(pty.startCorrelationSafeTurn(
+      'must not steer',
+      'dispatch-plan:plan-2',
+      restrictedPolicy,
+    ))
       .rejects.toThrow('RUNTIME_BUSY');
     expect(requestMock).not.toHaveBeenCalled();
   });
@@ -1151,6 +1316,29 @@ describe('CodexAppServerPTY thread lifecycle', () => {
       excludeTurns: true,
       persistExtendedHistory: true,
     });
+  });
+
+  it('fails closed on a provider-owned thread without falling back to another resume', async () => {
+    fsMocks.existsSync.mockReturnValue(true);
+    fsMocks.readFileSync.mockReturnValue(JSON.stringify({
+      threadId: 'owned-thread',
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      updatedAt: '2026-08-25T00:00:00Z',
+    }));
+    requestMock.mockRejectedValue(new Error(
+      'thread-store conflict: thread owned-thread already has an active writer',
+    ));
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await expect(
+      (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> })
+        .startOrResumeThread('continue'),
+    ).rejects.toBeInstanceOf(CodexThreadOwnershipConflictError);
+    expect(requestMock).toHaveBeenCalledTimes(1);
+    expect(requestMock).toHaveBeenCalledWith('thread/resume', expect.objectContaining({
+      threadId: 'owned-thread',
+    }));
   });
 
   it('starts a new thread in fresh mode even when persisted thread state exists', async () => {

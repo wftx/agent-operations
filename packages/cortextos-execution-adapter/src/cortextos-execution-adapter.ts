@@ -8,6 +8,7 @@ import {
   createCodexExecutionReference,
   resolveCortextOSSocketPath,
 } from '../../cortextos-adapter/src/index.js';
+import { isRuntimeExecutionPolicyNoBroaderThan } from '../../agent-operations-contracts/src/index.js';
 
 type RequestSender = (
   agentName: string,
@@ -56,6 +57,7 @@ export class CortextOSExecutionAdapter implements RuntimeExecutionAdapter {
         request.dispatchId,
         request.idempotencyKey,
         requireExactTurnCorrelation,
+        request.requestedPolicy,
       ));
   }
 
@@ -75,6 +77,13 @@ export class CortextOSExecutionAdapter implements RuntimeExecutionAdapter {
             || typeof execution.turnId !== 'string') {
             return { status: 'uncertain', message: 'CortextOS returned a malformed structured execution reference.' };
           }
+          const effectivePolicy = parseExecutionPolicy(execution.effectivePolicy);
+          if (!effectivePolicy) {
+            return { status: 'uncertain', code: 'SUBMISSION_UNCERTAIN', message: 'CortextOS omitted the effective execution policy.' };
+          }
+          if (!isRuntimeExecutionPolicyNoBroaderThan(effectivePolicy, request.requestedPolicy)) {
+            return { status: 'uncertain', code: 'SUBMISSION_UNCERTAIN', message: 'CortextOS reported broader execution authority than the Plan permits.' };
+          }
           try {
             const message = typeof data?.message === 'string'
               ? data.message
@@ -86,6 +95,7 @@ export class CortextOSExecutionAdapter implements RuntimeExecutionAdapter {
                 execution.turnId,
               ),
               message,
+              effectivePolicy,
             };
           } catch {
             return { status: 'uncertain', message: 'CortextOS returned invalid Codex turn identifiers.' };
@@ -107,6 +117,7 @@ export class CortextOSExecutionAdapter implements RuntimeExecutionAdapter {
       if (response.code === 'SUBMISSION_UNCERTAIN') {
         return {
           status: 'uncertain',
+          code: 'SUBMISSION_UNCERTAIN',
           message: typeof response.error === 'string'
             ? response.error
             : `CortextOS could not prove whether a turn started for ${agentName}.`,
@@ -114,6 +125,13 @@ export class CortextOSExecutionAdapter implements RuntimeExecutionAdapter {
       }
       return {
         status: 'rejected',
+        ...(response.code === 'POLICY_UNSUPPORTED'
+          ? { code: 'POLICY_UNSUPPORTED' as const }
+          : response.code === 'POLICY_MISMATCH'
+            ? { code: 'POLICY_MISMATCH' as const }
+            : response.code === 'RUNTIME_BUSY'
+              ? { code: 'RUNTIME_BUSY' as const }
+              : {}),
         message: typeof response.error === 'string'
           ? response.error
           : `CortextOS rejected injection for ${agentName}.`,
@@ -152,6 +170,7 @@ function sendInjectRequest(
   dispatchId: string,
   correlationId: string,
   requireExactTurnCorrelation: boolean,
+  requestedPolicy: RuntimeDispatchRequest['requestedPolicy'],
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const socket = createConnection(socketPath);
@@ -173,7 +192,11 @@ function sendInjectRequest(
         data: {
           text: instruction,
           ...(requireExactTurnCorrelation
-            ? { requireNewTurn: true, correlationId }
+            ? {
+                requireNewTurn: true,
+                correlationId,
+                executionPolicy: requestPolicy(requestedPolicy),
+              }
             : {}),
         },
         source: `agent-operations manual dispatch ${dispatchId}`,
@@ -204,6 +227,26 @@ function sendInjectRequest(
       ));
     });
   });
+}
+
+function requestPolicy(policy: RuntimeDispatchRequest['requestedPolicy']): RuntimeDispatchRequest['requestedPolicy'] {
+  return { ...policy };
+}
+
+function parseExecutionPolicy(value: unknown): RuntimeDispatchRequest['requestedPolicy'] | null {
+  if (!isRecord(value)) return null;
+  if (value.version !== 1
+    || (value.filesystem !== 'none' && value.filesystem !== 'read-only' && value.filesystem !== 'workspace-write')
+    || (value.network !== 'deny' && value.network !== 'allow')
+    || (value.environment !== 'empty' && value.environment !== 'minimal' && value.environment !== 'inherit')) {
+    return null;
+  }
+  return {
+    version: 1,
+    filesystem: value.filesystem,
+    network: value.network,
+    environment: value.environment,
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

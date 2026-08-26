@@ -5,6 +5,10 @@ import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 import { ensureDir } from '../utils/atomic.js';
+import {
+  claimDaemonInstance,
+  type DaemonInstanceOwnership,
+} from './instance-ownership.js';
 
 // Each fast-checker registers a process-level SIGUSR1 handler (see
 // fast-checker.ts:102). With >10 active agents the default Node listener cap
@@ -222,6 +226,7 @@ class Daemon {
   private ipcServer: IPCServer | null = null;
   private instanceId: string;
   private ctxRoot: string;
+  private ownership: DaemonInstanceOwnership | null = null;
 
   constructor() {
     this.instanceId = process.env.CTX_INSTANCE_ID || 'default';
@@ -245,6 +250,17 @@ class Daemon {
       console.error('[daemon] CTX_FRAMEWORK_ROOT not set');
       process.exit(1);
     }
+
+    // Instance ownership must be exclusive before PID, IPC, agent, cron, or
+    // provider startup. Without this atomic claim, a second daemon can unlink
+    // the first daemon's socket and launch a competing provider writer.
+    this.ownership = claimDaemonInstance(this.ctxRoot, this.instanceId);
+    console.log(`[daemon] Claimed instance ownership (pid: ${this.ownership.owner.pid})`);
+    // Covers startup failures before the later full lifecycle handlers exist.
+    process.once('exit', () => {
+      this.ownership?.release();
+      this.ownership = null;
+    });
 
     // Write PID file
     const pidFile = join(this.ctxRoot, 'daemon.pid');
@@ -281,11 +297,8 @@ class Daemon {
       if (this.ipcServer) {
         this.ipcServer.stop();
       }
-      // Clean up PID file
-      try {
-        const { unlinkSync } = require('fs');
-        unlinkSync(pidFile);
-      } catch { /* ignore */ }
+      this.ownership?.release();
+      this.ownership = null;
       process.exit(0);
     };
 
@@ -339,10 +352,8 @@ class Daemon {
       if (this.ipcServer) {
         this.ipcServer.stop();
       }
-      try {
-        const { unlinkSync } = require('fs');
-        unlinkSync(pidFile);
-      } catch { /* ignore */ }
+      this.ownership?.release();
+      this.ownership = null;
     });
   }
 }

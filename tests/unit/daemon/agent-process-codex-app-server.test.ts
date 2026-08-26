@@ -14,6 +14,7 @@ const mockCodexAppServerPty = {
   getOutputBuffer: vi.fn().mockReturnValue({ isBootstrapped: vi.fn().mockReturnValue(true) }),
   setTelegramHandle: vi.fn(),
   canStartCorrelationSafeTurn: vi.fn().mockReturnValue(true),
+  canEnforceExecutionPolicy: vi.fn().mockReturnValue(true),
   startCorrelationSafeTurn: vi.fn().mockResolvedValue({
     provider: 'codex',
     sessionId: 'thread-1',
@@ -110,6 +111,7 @@ beforeEach(() => {
   }
   mockCodexAppServerPty.setTelegramHandle.mockClear();
   mockCodexAppServerPty.canStartCorrelationSafeTurn.mockReset().mockReturnValue(true);
+  mockCodexAppServerPty.canEnforceExecutionPolicy.mockReset().mockReturnValue(true);
   mockCodexAppServerPty.startCorrelationSafeTurn.mockReset().mockResolvedValue({
     provider: 'codex',
     sessionId: 'thread-1',
@@ -130,6 +132,33 @@ describe('AgentProcess codex-app-server runtime', () => {
 
     expect(mockCodexAppServerPty.spawn).toHaveBeenCalledWith('fresh', expect.any(String));
     expect(ap.getStatus().pid).toBe(24680);
+  });
+
+  it('halts without recovery when Codex reports an externally owned thread', async () => {
+    vi.useFakeTimers();
+    try {
+      const ownershipError = Object.assign(
+        new Error('thread-store conflict: thread thread-1 already has an active writer'),
+        { code: 'CODEX_THREAD_OWNERSHIP_CONFLICT' },
+      );
+      mockCodexAppServerPty.spawn.mockImplementationOnce(async () => {
+        // Mirror the old failure shape: an exit callback can race ahead of the
+        // rejected spawn and schedule generic recovery. The typed catch must
+        // still move the lifecycle to halted before that timer can fire.
+        capturedOnExit?.(0, undefined);
+        throw ownershipError;
+      });
+      const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
+
+      await ap.start();
+      expect(ap.getStatus().status).toBe('halted');
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mockCodexAppServerPty.spawn).toHaveBeenCalledTimes(1);
+      expect(ap.getStatus().status).toBe('halted');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('wires Telegram handle to CodexAppServerPTY before start', async () => {
@@ -215,9 +244,16 @@ describe('AgentProcess codex-app-server runtime', () => {
     const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
     await ap.start();
     fsMocks.writeFileSync.mockClear();
+    const policy = { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const };
 
-    await expect(ap.injectCorrelatedMessageDetailed('bounded task', 'dispatch-plan:plan-1'))
-      .resolves.toEqual({ ok: true, provider: 'codex', sessionId: 'thread-1', turnId: 'turn-1' });
+    await expect(ap.injectCorrelatedMessageDetailed('bounded task', 'dispatch-plan:plan-1', policy))
+      .resolves.toEqual({
+        ok: true,
+        provider: 'codex',
+        sessionId: 'thread-1',
+        turnId: 'turn-1',
+        effectivePolicy: policy,
+      });
     expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
       '/tmp/test-ctx/state/codex-app-agent/last_message_injected.flag',
       expect.stringMatching(/^\d+$/),
@@ -225,6 +261,8 @@ describe('AgentProcess codex-app-server runtime', () => {
     );
     expect(fsMocks.writeFileSync.mock.invocationCallOrder.at(-1))
       .toBeLessThan(mockCodexAppServerPty.startCorrelationSafeTurn.mock.invocationCallOrder[0]);
+    expect(mockCodexAppServerPty.startCorrelationSafeTurn)
+      .toHaveBeenCalledWith('bounded task', 'dispatch-plan:plan-1', policy);
   });
 
   it('rejects a busy Codex runtime before marker or turn creation', async () => {
@@ -233,8 +271,26 @@ describe('AgentProcess codex-app-server runtime', () => {
     await ap.start();
     fsMocks.writeFileSync.mockClear();
 
-    await expect(ap.injectCorrelatedMessageDetailed('must not steer', 'dispatch-plan:plan-2'))
+    const policy = { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const };
+    await expect(ap.injectCorrelatedMessageDetailed('must not steer', 'dispatch-plan:plan-2', policy))
       .resolves.toMatchObject({ ok: false, code: 'RUNTIME_BUSY' });
+    expect(fsMocks.writeFileSync).not.toHaveBeenCalled();
+    expect(mockCodexAppServerPty.canEnforceExecutionPolicy).not.toHaveBeenCalled();
+    expect(mockCodexAppServerPty.startCorrelationSafeTurn).not.toHaveBeenCalled();
+  });
+
+  it('rejects unsupported policy before marker persistence or provider submission', async () => {
+    mockCodexAppServerPty.canEnforceExecutionPolicy.mockReturnValue(false);
+    const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
+    await ap.start();
+    fsMocks.writeFileSync.mockClear();
+    const policy = { version: 1 as const, filesystem: 'none' as const, network: 'deny' as const, environment: 'empty' as const };
+
+    await expect(ap.injectCorrelatedMessageDetailed(
+      'must not submit',
+      'dispatch-plan:policy-unsupported',
+      policy,
+    )).resolves.toMatchObject({ ok: false, code: 'POLICY_UNSUPPORTED' });
     expect(fsMocks.writeFileSync).not.toHaveBeenCalled();
     expect(mockCodexAppServerPty.startCorrelationSafeTurn).not.toHaveBeenCalled();
   });

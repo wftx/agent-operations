@@ -28,10 +28,16 @@ import type {
   RepositoryIdentityKind,
   RepositoryAvailability,
   RuntimeProvider,
+  RuntimeFilesystemPolicy,
+  RuntimeNetworkPolicy,
+  RuntimeEnvironmentPolicy,
   RuntimeState,
   WorkingTreeState,
 } from '../../agent-operations-contracts/src/index.js';
-import { createRepositoryCheckoutBindingId } from '../../agent-operations-contracts/src/index.js';
+import {
+  createRepositoryCheckoutBindingId,
+  isRuntimeExecutionPolicyNoBroaderThan,
+} from '../../agent-operations-contracts/src/index.js';
 import { applyStateMigrations, type SqliteStateMigration } from './migrations.js';
 import { resolveAgentOperationsStateLocation } from './state-location.js';
 
@@ -138,6 +144,10 @@ interface ExecutionPlanRow {
   checkout_binding_id: string | null;
   input_version: 1;
   instruction: string;
+  requested_policy_version?: 1 | null;
+  requested_filesystem?: RuntimeFilesystemPolicy | null;
+  requested_network?: RuntimeNetworkPolicy | null;
+  requested_environment?: RuntimeEnvironmentPolicy | null;
   job_revision: number;
   attempt_revision: number;
   created_at: string;
@@ -151,6 +161,10 @@ interface ExecutionDispatchRow {
   runtime_agent_id: string;
   idempotency_key: string;
   status: DispatchStatus;
+  effective_policy_version?: 1 | null;
+  effective_filesystem?: RuntimeFilesystemPolicy | null;
+  effective_network?: RuntimeNetworkPolicy | null;
+  effective_environment?: RuntimeEnvironmentPolicy | null;
   external_reference: string | null;
   message: string | null;
   revision: number;
@@ -307,6 +321,17 @@ function toExecutionPlan(row: ExecutionPlanRow): DurableExecutionPlan {
     ...(row.repository_id ? { repositoryId: row.repository_id } : {}),
     ...(row.checkout_binding_id ? { checkoutBindingId: row.checkout_binding_id } : {}),
     input: { version: row.input_version, instruction: row.instruction },
+    ...(row.requested_policy_version && row.requested_filesystem
+      && row.requested_network && row.requested_environment
+      ? {
+          requestedPolicy: {
+            version: row.requested_policy_version,
+            filesystem: row.requested_filesystem,
+            network: row.requested_network,
+            environment: row.requested_environment,
+          },
+        }
+      : {}),
     jobRevisionAtPreparation: row.job_revision,
     attemptRevisionAtPreparation: row.attempt_revision,
     createdAt: row.created_at,
@@ -322,6 +347,17 @@ function toExecutionDispatch(row: ExecutionDispatchRow): DurableExecutionDispatc
     runtimeAgentId: row.runtime_agent_id,
     idempotencyKey: row.idempotency_key,
     status: row.status,
+    ...(row.effective_policy_version && row.effective_filesystem
+      && row.effective_network && row.effective_environment
+      ? {
+          effectivePolicy: {
+            version: row.effective_policy_version,
+            filesystem: row.effective_filesystem,
+            network: row.effective_network,
+            environment: row.effective_environment,
+          },
+        }
+      : {}),
     ...(row.external_reference ? { externalReference: row.external_reference } : {}),
     ...(row.message ? { message: row.message } : {}),
     revision: row.revision,
@@ -376,10 +412,14 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
   readonly databasePath: string;
   private readonly database: Database.Database;
   private closed = false;
+  private readonly supportsRuntimePolicies: boolean;
 
   private constructor(databasePath: string, database: Database.Database) {
     this.databasePath = databasePath;
     this.database = database;
+    this.supportsRuntimePolicies = (database.prepare(
+      "SELECT 1 FROM pragma_table_info('execution_plans') WHERE name = 'requested_policy_version'",
+    ).get() as unknown) !== undefined;
   }
 
   static open(options: SqliteAgentOperationsStateStoreOptions = {}): SqliteAgentOperationsStateStore {
@@ -831,6 +871,12 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     requireNonEmpty(plan.input.instruction, 'Execution instruction');
     if (!plan.id.startsWith('plan:')) throw new Error(`Invalid Execution Plan ID: ${plan.id}`);
     if (plan.input.version !== 1) throw new Error(`Unsupported execution input version: ${plan.input.version}`);
+    if (this.supportsRuntimePolicies && !plan.requestedPolicy) {
+      throw new Error('New Execution Plans require an explicit runtime execution policy');
+    }
+    if (!this.supportsRuntimePolicies && plan.requestedPolicy) {
+      throw new Error('Runtime execution policy requires Agent Operations schema v6');
+    }
     if (plan.jobRevisionAtPreparation < 0 || plan.attemptRevisionAtPreparation < 0) {
       throw new Error('Execution Plan revisions must be non-negative');
     }
@@ -856,13 +902,7 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
       throw new Error(`Invalid Execution Plan durable associations: ${plan.id}`);
     }
     try {
-      this.database.prepare(`
-        INSERT INTO execution_plans
-          (id, attempt_id, job_id, project_id, installation_id, runtime_agent_id,
-           repository_id, checkout_binding_id, input_version, instruction,
-           job_revision, attempt_revision, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
+      const common = [
         plan.id,
         plan.attemptId,
         plan.jobId,
@@ -876,7 +916,31 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         plan.jobRevisionAtPreparation,
         plan.attemptRevisionAtPreparation,
         plan.createdAt,
-      );
+      ] as const;
+      if (this.supportsRuntimePolicies) {
+        this.database.prepare(`
+          INSERT INTO execution_plans
+            (id, attempt_id, job_id, project_id, installation_id, runtime_agent_id,
+             repository_id, checkout_binding_id, input_version, instruction,
+             job_revision, attempt_revision, created_at, requested_policy_version,
+             requested_filesystem, requested_network, requested_environment)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ...common,
+          plan.requestedPolicy!.version,
+          plan.requestedPolicy!.filesystem,
+          plan.requestedPolicy!.network,
+          plan.requestedPolicy!.environment,
+        );
+      } else {
+        this.database.prepare(`
+          INSERT INTO execution_plans
+            (id, attempt_id, job_id, project_id, installation_id, runtime_agent_id,
+             repository_id, checkout_binding_id, input_version, instruction,
+             job_revision, attempt_revision, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(...common);
+      }
     } catch (error) {
       throw new Error(`Could not create Execution Plan ${plan.id}: ${(error as Error).message}`);
     }
@@ -976,13 +1040,23 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     if (!isValidDispatchTransition(existing.status, dispatch.status)) {
       throw new Error(`Execution Dispatch cannot transition from ${existing.status} to ${dispatch.status}`);
     }
+    if (dispatch.status !== 'accepted' && dispatch.effectivePolicy) {
+      throw new Error(`Only an accepted Execution Dispatch may record effective policy: ${dispatch.id}`);
+    }
+    if (dispatch.status === 'accepted' && this.supportsRuntimePolicies) {
+      const planRow = this.database.prepare('SELECT * FROM execution_plans WHERE id = ?')
+        .get(dispatch.executionPlanId) as ExecutionPlanRow | undefined;
+      const requestedPolicy = planRow ? toExecutionPlan(planRow).requestedPolicy : undefined;
+      if (requestedPolicy && (!dispatch.effectivePolicy
+        || !isRuntimeExecutionPolicyNoBroaderThan(dispatch.effectivePolicy, requestedPolicy))) {
+        throw new Error(`Accepted Execution Dispatch must record a non-broader effective policy: ${dispatch.id}`);
+      }
+      if (!requestedPolicy && dispatch.effectivePolicy) {
+        throw new Error(`Legacy Execution Dispatch cannot invent effective policy: ${dispatch.id}`);
+      }
+    }
     try {
-      const result = this.database.prepare(`
-        UPDATE execution_dispatches SET
-          status = ?, external_reference = ?, message = ?, revision = ?, updated_at = ?,
-          submitted_at = ?, accepted_at = ?, resolved_at = ?
-        WHERE id = ? AND revision = ?
-      `).run(
+      const common = [
         dispatch.status,
         dispatch.externalReference ?? null,
         dispatch.message ?? null,
@@ -991,9 +1065,30 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         dispatch.submittedAt ?? null,
         dispatch.acceptedAt ?? null,
         dispatch.resolvedAt ?? null,
-        dispatch.id,
-        expectedRevision,
-      );
+      ] as const;
+      const result = this.supportsRuntimePolicies
+        ? this.database.prepare(`
+            UPDATE execution_dispatches SET
+              status = ?, external_reference = ?, message = ?, revision = ?, updated_at = ?,
+              submitted_at = ?, accepted_at = ?, resolved_at = ?,
+              effective_policy_version = ?, effective_filesystem = ?,
+              effective_network = ?, effective_environment = ?
+            WHERE id = ? AND revision = ?
+          `).run(
+            ...common,
+            dispatch.effectivePolicy?.version ?? null,
+            dispatch.effectivePolicy?.filesystem ?? null,
+            dispatch.effectivePolicy?.network ?? null,
+            dispatch.effectivePolicy?.environment ?? null,
+            dispatch.id,
+            expectedRevision,
+          )
+        : this.database.prepare(`
+            UPDATE execution_dispatches SET
+              status = ?, external_reference = ?, message = ?, revision = ?, updated_at = ?,
+              submitted_at = ?, accepted_at = ?, resolved_at = ?
+            WHERE id = ? AND revision = ?
+          `).run(...common, dispatch.id, expectedRevision);
       if (result.changes !== 1) throw new Error(`Stale Execution Dispatch revision for ${dispatch.id}`);
     } catch (error) {
       throw new Error(`Could not transition Execution Dispatch ${dispatch.id}: ${(error as Error).message}`);

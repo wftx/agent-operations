@@ -14,6 +14,7 @@ const INSTALLATION_ID = 'installation:planning';
 const PROJECT_ID = 'agent-operations';
 const REPOSITORY_ID = 'remote:github.com/wftx/agent-operations';
 const RUNTIME_ID = 'engineering/coder';
+const POLICY = { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' } as const;
 
 function binding(path: string, repositoryId = REPOSITORY_ID): RepositoryCheckoutBinding {
   return {
@@ -90,6 +91,7 @@ describe('ExecutionPlanningService', () => {
       projectId: PROJECT_ID,
       attemptId: attempt.id,
       instruction: '  Investigate the failing test.  ',
+      requestedPolicy: POLICY,
     });
     expect(plan).toEqual({
       id: 'plan:planning',
@@ -101,6 +103,7 @@ describe('ExecutionPlanningService', () => {
       repositoryId: REPOSITORY_ID,
       checkoutBindingId: binding('/repos/ao').id,
       input: { version: 1, instruction: 'Investigate the failing test.' },
+      requestedPolicy: POLICY,
       jobRevisionAtPreparation: 1,
       attemptRevisionAtPreparation: 0,
       createdAt: TIME,
@@ -118,6 +121,7 @@ describe('ExecutionPlanningService', () => {
       projectId: PROJECT_ID,
       attemptId: attempt.id,
       instruction: 'Analyze the durable model.',
+      requestedPolicy: POLICY,
     });
     expect(plan.repositoryId).toBeUndefined();
     expect(plan.checkoutBindingId).toBeUndefined();
@@ -132,12 +136,14 @@ describe('ExecutionPlanningService', () => {
       projectId: PROJECT_ID,
       attemptId: attempt.id,
       instruction: 'Inspect.',
+      requestedPolicy: POLICY,
     })).rejects.toThrow('multiple checkouts');
     const plan = await planning.prepareExecutionPlan({
       projectId: PROJECT_ID,
       attemptId: attempt.id,
       checkoutBindingId: second.id,
       instruction: 'Inspect.',
+      requestedPolicy: POLICY,
     });
     expect(plan.checkoutBindingId).toBe(second.id);
   });
@@ -149,6 +155,7 @@ describe('ExecutionPlanningService', () => {
       projectId: PROJECT_ID,
       attemptId: attempt.id,
       instruction: 'Inspect.',
+      requestedPolicy: POLICY,
     })).rejects.toThrow('has no checkout');
 
     const selected = await harness([binding('/repos/ao')]);
@@ -158,6 +165,7 @@ describe('ExecutionPlanningService', () => {
       attemptId: selectedAttempt.id,
       checkoutBindingId: 'checkout:not-configured',
       instruction: 'Inspect.',
+      requestedPolicy: POLICY,
     })).rejects.toThrow('is not configured');
   });
 
@@ -170,6 +178,7 @@ describe('ExecutionPlanningService', () => {
       projectId: PROJECT_ID,
       attemptId: notReadyAttempt.id,
       instruction: 'Inspect.',
+      requestedPolicy: POLICY,
     })).rejects.toThrow('must be ready');
 
     const { lifecycle, planning } = await harness();
@@ -178,6 +187,7 @@ describe('ExecutionPlanningService', () => {
       projectId: PROJECT_ID,
       attemptId: 'attempt:missing',
       instruction: 'Inspect.',
+      requestedPolicy: POLICY,
     })).rejects.toThrow('Attempt not found');
     await lifecycle.markJobReady(draft.id);
     const attempt = await lifecycle.createAttempt(draft.id);
@@ -185,12 +195,14 @@ describe('ExecutionPlanningService', () => {
       projectId: 'wrong-project',
       attemptId: attempt.id,
       instruction: 'Inspect.',
+      requestedPolicy: POLICY,
     })).rejects.toThrow('Project not found');
     await lifecycle.startAttempt(attempt.id);
     await expect(planning.prepareExecutionPlan({
       projectId: PROJECT_ID,
       attemptId: attempt.id,
       instruction: 'Inspect.',
+      requestedPolicy: POLICY,
     })).rejects.toThrow('must be created');
 
     const unassigned = await harness();
@@ -199,6 +211,7 @@ describe('ExecutionPlanningService', () => {
       projectId: PROJECT_ID,
       attemptId: unassignedAttempt.id,
       instruction: 'Inspect.',
+      requestedPolicy: POLICY,
     })).rejects.toThrow('requires an actual runtime assignment');
 
     const blank = await harness();
@@ -207,17 +220,24 @@ describe('ExecutionPlanningService', () => {
       projectId: PROJECT_ID,
       attemptId: blankAttempt.id,
       instruction: '   ',
+      requestedPolicy: POLICY,
     })).rejects.toThrow('Execution instruction is required');
   });
 
   it('rejects a second plan for one Attempt and exposes no update API', async () => {
     const { store, lifecycle, planning } = await harness();
     const attempt = await readyAttempt(lifecycle);
-    await planning.prepareExecutionPlan({ projectId: PROJECT_ID, attemptId: attempt.id, instruction: 'Inspect.' });
+    await planning.prepareExecutionPlan({
+      projectId: PROJECT_ID,
+      attemptId: attempt.id,
+      instruction: 'Inspect.',
+      requestedPolicy: POLICY,
+    });
     await expect(planning.prepareExecutionPlan({
       projectId: PROJECT_ID,
       attemptId: attempt.id,
       instruction: 'Try again.',
+      requestedPolicy: POLICY,
     })).rejects.toThrow('already has an Execution Plan');
     expect('updateExecutionPlan' in store).toBe(false);
     expect('saveExecutionPlanTransition' in store).toBe(false);

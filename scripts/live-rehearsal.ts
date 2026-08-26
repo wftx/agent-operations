@@ -126,6 +126,15 @@ function printPreview(preview: LiveRehearsalPreview): void {
   console.log(`\nWill contact real CortextOS runtime:\n  ${preview.willContactRealRuntime ? 'yes' : 'no'}`);
   console.log('\nWill mutate Git:\n  no');
   console.log('\nWill write files through the runtime:\n  instruction explicitly forbids it');
+  console.log('\nRequested runtime policy:');
+  console.log(`  filesystem: ${preview.requestedPolicy.filesystem}`);
+  console.log(`  network: ${preview.requestedPolicy.network}`);
+  console.log(`  environment: ${preview.requestedPolicy.environment}`);
+  console.log(`\nPolicy enforceable:\n  ${preview.policyEnforceable ? 'yes' : 'no'}`);
+  console.log('\nEffective runtime policy:');
+  console.log(preview.effectivePolicy
+    ? `  filesystem: ${preview.effectivePolicy.filesystem}\n  network: ${preview.effectivePolicy.network}\n  environment: ${preview.effectivePolicy.environment}`
+    : '  unavailable');
   console.log('\nWill automatically infer success:\n  no');
   console.log('\nOutcome authority:\n  human confirmation');
   console.log(`\nExecution authorized:\n  ${preview.executionAuthorized ? 'true' : 'false'}`);
@@ -141,6 +150,8 @@ function printRun(run: NonNullable<Awaited<ReturnType<typeof runLiveRehearsalExe
   console.log(`Plan: ${run.plan.id}`);
   console.log(`Dispatch: ${run.dispatch?.id ?? 'none'} (${run.dispatch?.status ?? 'not created'})`);
   console.log(`Preflight: ${run.preflight.status}`);
+  console.log(`Requested policy: ${formatPolicy(run.preflight.requestedPolicy)}`);
+  console.log(`Effective policy: ${formatPolicy(run.preflight.effectivePolicy)}`);
   console.log(`Real adapter invoked: ${run.dispatchOutcome.adapterInvoked ? 'yes' : 'no'}`);
   console.log('Automatic retries: 0');
   console.log('Git mutations: 0');
@@ -179,6 +190,12 @@ function parseArguments(values: readonly string[]): ParsedArguments {
 
 function indent(value: string): string {
   return value.split('\n').map(line => `  ${line}`).join('\n');
+}
+
+function formatPolicy(policy: LiveRehearsalPreview['effectivePolicy']): string {
+  return policy
+    ? `filesystem=${policy.filesystem}, network=${policy.network}, environment=${policy.environment}`
+    : 'unspecified/unavailable';
 }
 
 main().catch(error => {

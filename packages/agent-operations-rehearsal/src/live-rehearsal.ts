@@ -14,6 +14,11 @@ import type {
   RuntimeExecutionAdapter,
   RuntimeExecutionObservationAdapter,
   RuntimeInventoryHealth,
+  RuntimeExecutionPolicy,
+} from '../../agent-operations-contracts/src/index.js';
+import {
+  RESTRICTED_TEXT_EXECUTION_POLICY,
+  resolveRuntimeExecutionPolicy,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   ExecutionObservationService,
@@ -64,6 +69,9 @@ export interface LiveRehearsalPreview {
   readonly willContactRealRuntime: boolean;
   readonly willMutateGit: false;
   readonly runtimeFileWritesRequested: false;
+  readonly requestedPolicy: RuntimeExecutionPolicy;
+  readonly effectivePolicy: RuntimeExecutionPolicy | null;
+  readonly policyEnforceable: boolean;
   readonly automaticallyInferSuccess: false;
   readonly outcomeAuthority: 'human confirmation';
   readonly executionAuthorized: boolean;
@@ -344,6 +352,7 @@ export class LiveRehearsalOperations {
       projectId: LIVE_REHEARSAL_PROJECT_ID,
       attemptId: attempt.id,
       instruction: createLiveRehearsalInstruction(nonce),
+      requestedPolicy: RESTRICTED_TEXT_EXECUTION_POLICY,
     });
     return { projectId: LIVE_REHEARSAL_PROJECT_ID, job: ready, attempt, plan };
   }
@@ -394,6 +403,12 @@ export function createLiveRehearsalPreview(
   nonce: string,
   authorized: boolean,
 ): LiveRehearsalPreview {
+  const resolution = discovery.candidate
+    ? resolveRuntimeExecutionPolicy(
+        RESTRICTED_TEXT_EXECUTION_POLICY,
+        discovery.candidate.runtime.capabilities,
+      )
+    : null;
   return {
     title: 'LIVE AGENT OPERATIONS REHEARSAL',
     runtimeAgentId: discovery.candidate?.runtime.id ?? null,
@@ -404,6 +419,9 @@ export function createLiveRehearsalPreview(
     willContactRealRuntime: authorized && Boolean(discovery.candidate),
     willMutateGit: false,
     runtimeFileWritesRequested: false,
+    requestedPolicy: { ...RESTRICTED_TEXT_EXECUTION_POLICY },
+    effectivePolicy: resolution?.supported ? { ...resolution.effectivePolicy } : null,
+    policyEnforceable: resolution?.supported === true,
     automaticallyInferSuccess: false,
     outcomeAuthority: 'human confirmation',
     executionAuthorized: authorized,

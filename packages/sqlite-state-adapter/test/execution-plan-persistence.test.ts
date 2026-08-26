@@ -77,7 +77,7 @@ function job(): DurableJob {
   };
 }
 
-function plan(): DurableExecutionPlan {
+function plan(withPolicy = false): DurableExecutionPlan {
   return {
     id: 'plan:execution-persistence',
     attemptId: 'attempt:execution-persistence',
@@ -88,6 +88,9 @@ function plan(): DurableExecutionPlan {
     repositoryId: REPOSITORY_ID,
     checkoutBindingId: CHECKOUT_ID,
     input: { version: 1, instruction: 'Inspect the failing test.' },
+    ...(withPolicy
+      ? { requestedPolicy: { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const } }
+      : {}),
     jobRevisionAtPreparation: 1,
     attemptRevisionAtPreparation: 0,
     createdAt: TIME,
@@ -159,14 +162,14 @@ describe('SQLite Execution Plan persistence', () => {
     const databasePath = path();
     const store = open(databasePath);
     await seedPhaseSeven(store);
-    await store.createExecutionPlan(plan());
+    await store.createExecutionPlan(plan(true));
     await store.close();
 
     expect(() => SqliteAgentOperationsStateStore.open({
       databasePath,
       additionalMigrations: [{
-        version: 6,
-        name: 'deliberate-v6-failure',
+        version: 7,
+        name: 'deliberate-v7-failure',
         up: database => {
           database.exec('CREATE TABLE should_rollback_v5 (id TEXT)');
           throw new Error('deliberate migration failure');
@@ -178,7 +181,7 @@ describe('SQLite Execution Plan persistence', () => {
     expect(database.prepare("SELECT name FROM sqlite_master WHERE name='should_rollback_v5'").get())
       .toBeUndefined();
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
     expect(database.prepare('SELECT id FROM execution_plans').get()).toEqual({ id: plan().id });
     database.close();
   });

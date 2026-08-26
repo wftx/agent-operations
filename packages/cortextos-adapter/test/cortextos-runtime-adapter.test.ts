@@ -100,7 +100,16 @@ describe('CortextOSRuntimeAdapter', () => {
       health: { pid: 1001, lastHeartbeat: '2026-02-03T04:00:00.000Z' },
     });
     expect(agents.find(agent => agent.name === 'coder')?.capabilities)
-      .toEqual(['session-resume', 'exact-turn-correlation']);
+      .toEqual([
+        'session-resume',
+        'exact-turn-correlation',
+        'filesystem-read-only',
+        'filesystem-workspace-write',
+        'network-denial',
+        'environment-empty',
+        'environment-minimal',
+        'environment-inherit',
+      ]);
     expect(agents.find(agent => agent.name === 'forge')?.capabilities)
       .toEqual(['session-resume']);
     expect(agents.find(agent => agent.name === 'analyst')?.capabilities)

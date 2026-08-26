@@ -1,7 +1,13 @@
 import { createServer, Server, Socket } from 'net';
 import { existsSync, unlinkSync, chmodSync, readFileSync } from 'fs';
 import { join, resolve as pathResolve } from 'path';
-import type { IPCRequest, IPCResponse, CronSummaryRow, CronDefinition } from '../types/index.js';
+import type {
+  IPCRequest,
+  IPCResponse,
+  CronSummaryRow,
+  CronDefinition,
+  RuntimeExecutionPolicyEnvelope,
+} from '../types/index.js';
 import { AgentManager } from './agent-manager.js';
 import { getIpcPath } from '../utils/paths.js';
 import { readCrons, getExecutionLog, getExecutionLogPage, addCron, updateCron, removeCron, getCronByName } from '../bus/crons.js';
@@ -478,9 +484,12 @@ export class IPCServer {
   private server: Server | null = null;
   private socketPath: string;
   private agentManager: AgentManager;
+  private instanceId: string;
+  private ownsSocket = false;
 
   constructor(agentManager: AgentManager, instanceId: string = 'default') {
     this.agentManager = agentManager;
+    this.instanceId = instanceId;
     this.socketPath = getIpcPath(instanceId);
   }
 
@@ -518,17 +527,10 @@ export class IPCServer {
       });
 
       this.server.on('error', (err: NodeJS.ErrnoException) => {
-        if (err.code === 'EADDRINUSE') {
-          // Race: process was killed after unlink but before bind completed.
-          // Clean up the re-created socket and retry once.
-          try { unlinkSync(this.socketPath); } catch { /* ignore */ }
-          this.server!.listen(this.socketPath, () => {
-            console.log(`[ipc] Listening on ${this.socketPath} (recovered from stale socket)`);
-            resolve();
-          });
-        } else {
-          reject(err);
-        }
+        // Fail closed. Instance ownership is acquired before IPC startup, so
+        // EADDRINUSE must never be "recovered" by unlinking a possible live
+        // owner's socket.
+        reject(err);
       });
 
       this.server.listen(this.socketPath, () => {
@@ -539,6 +541,7 @@ export class IPCServer {
             /* Windows / no-op */
           }
         }
+        this.ownsSocket = true;
         console.log(`[ipc] Listening on ${this.socketPath}`);
         resolve();
       });
@@ -555,13 +558,14 @@ export class IPCServer {
     }
 
     // Clean up socket file
-    if (process.platform !== 'win32' && existsSync(this.socketPath)) {
+    if (this.ownsSocket && process.platform !== 'win32' && existsSync(this.socketPath)) {
       try {
         unlinkSync(this.socketPath);
       } catch {
         // Ignore
       }
     }
+    this.ownsSocket = false;
   }
 
   /**
@@ -582,6 +586,7 @@ export class IPCServer {
         case 'status':
           response = {
             success: true,
+            instanceId: this.instanceId,
             data: this.agentManager.getAllStatuses(),
           };
           break;
@@ -720,16 +725,21 @@ export class IPCServer {
           const textToInject = request.data?.text as string | undefined;
           const requireNewTurn = request.data?.requireNewTurn === true;
           const correlationId = request.data?.correlationId;
+          const executionPolicy = request.data?.executionPolicy;
           if (!agentToInject || !textToInject) {
             response = { success: false, error: 'inject-agent requires: agent, data.text', code: 'INVALID_INPUT' };
           } else if (requireNewTurn && (typeof correlationId !== 'string'
             || !correlationId.trim() || correlationId.length > 500)) {
             response = { success: false, error: 'correlation-safe inject-agent requires a correlationId of 1-500 characters', code: 'INVALID_INPUT' };
+          } else if (requireNewTurn && executionPolicy !== undefined
+            && !isRuntimeExecutionPolicyEnvelope(executionPolicy)) {
+            response = { success: false, error: 'invalid correlation-safe executionPolicy', code: 'INVALID_INPUT' };
           } else if (requireNewTurn) {
             const result = await this.agentManager.injectAgentCorrelatedDetailed(
               agentToInject,
               textToInject,
               correlationId as string,
+              executionPolicy as RuntimeExecutionPolicyEnvelope | undefined,
             );
             if (result.ok) {
               response = {
@@ -740,6 +750,9 @@ export class IPCServer {
                     provider: result.provider,
                     sessionId: result.sessionId,
                     turnId: result.turnId,
+                    ...(result.effectivePolicy
+                      ? { effectivePolicy: result.effectivePolicy }
+                      : {}),
                   },
                 },
               };
@@ -894,14 +907,29 @@ export class IPCServer {
   }
 }
 
+function isRuntimeExecutionPolicyEnvelope(value: unknown): value is RuntimeExecutionPolicyEnvelope {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const policy = value as Record<string, unknown>;
+  return policy.version === 1
+    && (policy.filesystem === 'none'
+      || policy.filesystem === 'read-only'
+      || policy.filesystem === 'workspace-write')
+    && (policy.network === 'deny' || policy.network === 'allow')
+    && (policy.environment === 'empty'
+      || policy.environment === 'minimal'
+      || policy.environment === 'inherit');
+}
+
 /**
  * IPC client for sending commands to the daemon.
  * Used by CLI commands.
  */
 export class IPCClient {
   private socketPath: string;
+  private instanceId: string;
 
   constructor(instanceId: string = 'default') {
+    this.instanceId = instanceId;
     this.socketPath = getIpcPath(instanceId);
   }
 
@@ -954,7 +982,7 @@ export class IPCClient {
   async isDaemonRunning(): Promise<boolean> {
     try {
       const response = await this.send({ type: 'status' });
-      return response.success;
+      return response.success && response.instanceId === this.instanceId;
     } catch {
       return false;
     }

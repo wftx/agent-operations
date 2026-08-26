@@ -60,6 +60,7 @@ async function main(): Promise<void> {
         projectId: PROJECT_ID,
         attemptId: attempt.id,
         instruction: `Demonstrate ${label} without a real runtime.`,
+        requestedPolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
       });
       await acceptAndStart(store, lifecycle, plan, now);
       attempts.push(attempt.id);

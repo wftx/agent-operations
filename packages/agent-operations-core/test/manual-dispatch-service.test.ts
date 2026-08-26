@@ -39,7 +39,7 @@ function runtime(state: 'running' | 'stopped' = 'running') {
     provider: 'codex',
     enabled: true,
     configured: true,
-    capabilities: [],
+    capabilities: ['filesystem-read-only', 'network-denial', 'environment-empty'],
     health: { state },
     observedAt: TIME,
   }]);
@@ -69,6 +69,7 @@ async function harness(
     projectId: PROJECT_ID,
     attemptId: attempt.id,
     instruction: 'Perform exactly one manual action.',
+    requestedPolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
   });
   const execution = new FakeRuntimeExecutionAdapter(result);
   const preflight = new ExecutionPreflightService(
@@ -129,6 +130,7 @@ describe('ManualDispatchService', () => {
         idempotencyKey: 'dispatch-plan:plan:manual',
         status: 'accepted',
         externalReference: 'external:one',
+        effectivePolicy: plan.requestedPolicy,
         revision: 2,
       },
     });
@@ -137,6 +139,7 @@ describe('ManualDispatchService', () => {
       runtimeAgentId: RUNTIME_ID,
       executionPlanId: plan.id,
       input: { version: 1, instruction: 'Perform exactly one manual action.' },
+      requestedPolicy: plan.requestedPolicy,
     });
     expect(await store.getAttempt(attempt.id)).toMatchObject({ status: 'running', revision: 1 });
 
@@ -155,6 +158,37 @@ describe('ManualDispatchService', () => {
     const repeated = await setup.service.dispatchExecutionPlan(setup.plan.id);
     expect(repeated).toMatchObject({ status: 'rejected', adapterInvoked: false });
     expect(setup.execution.callCount).toBe(1);
+  });
+
+  it('models unsupported policy, conflict, and stricter accepted enforcement without fake submission leakage', async () => {
+    const unsupported = await harness();
+    unsupported.execution.rejectUnsupportedPolicy();
+    let result = await unsupported.service.dispatchExecutionPlan(unsupported.plan.id);
+    expect(result).toMatchObject({ status: 'rejected', adapterInvoked: true, attemptRunning: false });
+    expect(unsupported.execution.submissionCount).toBe(0);
+    expect(await unsupported.store.getAttempt(unsupported.attempt.id)).toMatchObject({ status: 'created' });
+
+    const conflict = await harness();
+    conflict.execution.rejectPolicyConflict();
+    result = await conflict.service.dispatchExecutionPlan(conflict.plan.id);
+    expect(result).toMatchObject({ status: 'rejected', adapterInvoked: true, attemptRunning: false });
+    expect(conflict.execution.submissionCount).toBe(0);
+
+    const stricter = await harness();
+    stricter.execution.acceptWithEffectivePolicy({
+      version: 1,
+      filesystem: 'none',
+      network: 'deny',
+      environment: 'empty',
+    });
+    result = await stricter.service.dispatchExecutionPlan(stricter.plan.id);
+    expect(result).toMatchObject({
+      status: 'accepted',
+      dispatch: {
+        effectivePolicy: { version: 1, filesystem: 'none', network: 'deny', environment: 'empty' },
+      },
+    });
+    expect(stricter.execution.submissionCount).toBe(1);
   });
 
   it('persists uncertain results and thrown ambiguity without starting or resubmitting', async () => {
@@ -210,6 +244,7 @@ describe('ManualDispatchService', () => {
       acceptedAt: TIME,
       resolvedAt: TIME,
       revision: 2,
+      effectivePolicy: setup.plan.requestedPolicy,
     };
     await setup.store.saveExecutionDispatchTransition(accepted, 1);
 

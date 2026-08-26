@@ -44,7 +44,13 @@ function runtime() {
     provider: 'codex',
     enabled: true,
     configured: true,
-    capabilities: ['session-resume', 'exact-turn-correlation'],
+    capabilities: [
+      'session-resume',
+      'exact-turn-correlation',
+      'filesystem-read-only',
+      'network-denial',
+      'environment-empty',
+    ],
     health: { state: 'running' },
     observedAt: TIME,
   }]);
@@ -84,6 +90,7 @@ async function prepare(store: SqliteAgentOperationsStateStore) {
     projectId: PROJECT_ID,
     attemptId: attempt.id,
     instruction: 'Return one deterministic fixture result.',
+    requestedPolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
   });
   return { job, attempt, plan };
 }
@@ -114,7 +121,12 @@ describe('exact Codex correlation across the durable AO boundary', () => {
     const sender = vi.fn().mockResolvedValue({
       success: true,
       data: {
-        execution: { provider: 'codex', sessionId: THREAD_ID, turnId: TURN_ID },
+        execution: {
+          provider: 'codex',
+          sessionId: THREAD_ID,
+          turnId: TURN_ID,
+          effectivePolicy: plan.requestedPolicy,
+        },
       },
     });
     const dispatch = await new ManualDispatchService(

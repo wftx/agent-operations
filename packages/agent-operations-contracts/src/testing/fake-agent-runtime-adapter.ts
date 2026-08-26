@@ -30,7 +30,15 @@ export function createRuntimeInventoryFixtures(): readonly AgentRuntimeDetail[] 
       provider: 'claude',
       enabled: true,
       configured: true,
-      capabilities: ['session-resume'],
+      capabilities: [
+        'session-resume',
+        'filesystem-read-only',
+        'filesystem-workspace-write',
+        'network-denial',
+        'environment-empty',
+        'environment-minimal',
+        'environment-inherit',
+      ],
       health: {
         state: 'running',
         lastHeartbeat: FIXTURE_TIME,

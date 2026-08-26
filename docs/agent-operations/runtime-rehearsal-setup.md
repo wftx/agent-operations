@@ -53,13 +53,21 @@ Expected pre-start state is one configured and enabled `rehearsal` agent, a vali
 
 ## Start and verify
 
-Use the direct foreground development mode; do not install PM2 for this setup:
+Use the direct foreground development mode as the canonical Agent Operations
+development startup; do not install PM2 for this setup:
 
 ```bash
 node dist/cli.js start --foreground --instance default
 ```
 
-The daemon discovers and starts the single explicitly enabled agent. In a second terminal, verify:
+Do not invoke another foreground or background start while this command is
+initializing. The daemon must atomically claim
+`~/.cortextos/default/daemon.owner` before it writes `daemon.pid`, binds
+`daemon.sock`, discovers agents, starts crons, or launches Codex. A competing
+daemon exits before agent/provider startup and reports the live owner's PID.
+
+The foreground command is ready only after it prints `[daemon] Running`. In a
+second terminal, perform a bounded health check within 60 seconds:
 
 ```bash
 node dist/cli.js status --instance default
@@ -67,16 +75,56 @@ npm run demo:runtime-inventory
 npm run dev:live-rehearsal
 ```
 
-The inventory should be available with exactly one running `agent-operations/rehearsal` Codex runtime. The rehearsal command must be run without `--execute`; it should find the safe candidate, show `repository: none`, and report `Execution authorized: false`. Do not use the execution flags during environment setup.
+Successful readiness means all of the following are true:
+
+- `daemon.owner/owner.json` and `daemon.pid` identify the same live PID
+- exactly one `daemon.sock` exists and accepts IPC
+- the IPC response identifies the `default` instance
+- `status` shows exactly one running `rehearsal` lifecycle and provider PID
+- there is exactly one rehearsal `codex app-server` process
+
+If the condition is not met within 60 seconds, stop the foreground command and
+investigate; do not issue another startup command against the same instance.
+When running health checks from a sandboxed development tool, grant the check
+the same local Unix-socket access as the startup. A sandbox-denied socket
+connection can otherwise look identical to a stopped daemon even while its PID
+is alive.
+
+The inventory should be available with exactly one running `agent-operations/rehearsal` Codex runtime. The rehearsal command must be run without `--execute`; it should find the safe candidate, show `repository: none`, report the requested/effective `read-only` + `deny` + `empty` runtime policy, and report `Execution authorized: false`. Do not use the execution flags during environment setup.
+
+For future policy-aware Dispatches, CortextOS creates a new dedicated Codex thread rather than reusing the agent's legacy `danger-full-access` thread. The restricted thread uses read-only filesystem writes, denies tool-runtime network, disables Codex environment attachment, prevents shell subprocesses from inheriting the app-server environment, and disables configured MCP servers, apps, hooks, goals/automatic continuation, memories, multi-agent tools, login shells, web search, and host dynamic tools. Codex still exposes non-login shell invocation and read access beyond the rehearsal directory; those residual capabilities are documented in ADR 0012 and must not be described as “no tools” or “no filesystem access.”
 
 Fresh-agent admission requires a running runtime, a recent `last_idle.flag`, empty inbox and inflight queues, and either no prior injection flag or an idle timestamp at least as new as the last injection. Do not inject a ping merely to manufacture readiness evidence.
 
 ## Shutdown and restart
 
-Press Ctrl+C in the foreground daemon terminal for a clean shutdown. Restart with:
+Press Ctrl+C in the foreground daemon terminal for a clean shutdown. Wait for
+`[daemon] Shutting down`, the rehearsal stop, and process exit. Confirm that
+`daemon.pid`, `daemon.sock`, and `daemon.owner` are gone before restarting with:
 
 ```bash
 node dist/cli.js start --foreground --instance default
 ```
+
+Do not mix foreground and background starts. Non-foreground `cortextos start`
+intentionally spawns a detached daemon when PM2 is absent; the CLI parent exits
+and the child may be adopted by PID 1. That is supported general CortextOS
+behavior but is not the canonical AO development lifecycle because it has no
+supervisor or dedicated daemon-stop command. Never infer that such a daemon is
+dead from parent exit alone.
+
+Stale-state rules:
+
+1. prove the recorded PID and any Codex child are dead;
+2. confirm no process owns `daemon.sock` or the provider's thread-writer lock;
+3. let the next supported startup reclaim a dead `daemon.owner`, overwrite a
+   dead `daemon.pid`, and remove a stale socket;
+4. do not delete `codex-app-server-thread.json`, Codex thread-writer lock files,
+   AO durable state, rehearsal history, or agent configuration.
+
+An incomplete ownership directory is treated as an in-progress startup for a
+five-second grace period, then is eligible for conservative stale recovery.
+Provider active-writer conflicts halt the agent without automatic recovery;
+they are not ordinary provider crashes.
 
 The daemon and agent are intentionally not configured for boot persistence.

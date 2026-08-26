@@ -2,7 +2,7 @@ import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } f
 import { join } from 'path';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
-import type { AgentConfig, CtxEnv } from '../types/index.js';
+import type { AgentConfig, CtxEnv, RuntimeExecutionPolicyEnvelope } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir, atomicWriteSync } from '../utils/atomic.js';
@@ -81,6 +81,22 @@ export interface CorrelationSafeTurnReference {
   readonly turnId: string;
 }
 
+export interface CodexExecutionPolicyMapping {
+  readonly threadSandbox: 'read-only' | 'workspace-write';
+  readonly sandboxPolicy:
+    | { readonly type: 'readOnly'; readonly networkAccess: boolean }
+    | {
+        readonly type: 'workspaceWrite';
+        readonly writableRoots: readonly string[];
+        readonly networkAccess: boolean;
+        readonly excludeTmpdirEnvVar: true;
+        readonly excludeSlashTmp: true;
+      };
+  readonly environments: readonly [] | undefined;
+  readonly shellEnvironmentInherit: 'none' | 'core' | 'all';
+  readonly runtimeWorkspaceRoots: readonly string[];
+}
+
 interface SkillsListResponse {
   data?: Array<{
     cwd: string;
@@ -100,6 +116,10 @@ interface GoalResponse {
   } | null;
 }
 
+interface ConfigReadResponse {
+  config: Record<string, unknown>;
+}
+
 const THREAD_PERMISSION_OVERRIDES = {
   approvalPolicy: 'never',
   sandbox: 'danger-full-access',
@@ -113,6 +133,24 @@ const TURN_PERMISSION_OVERRIDES = {
 const SOCKET_BASENAME = 'codex.sock';
 const SOCKET_PATH_WARN_BYTES = 100;
 const BOOTSTRAP_PATTERN = '[codex-app-server] ready';
+
+const CODEX_ACTIVE_WRITER_PATTERN = 'already has an active writer';
+
+export class CodexThreadOwnershipConflictError extends Error {
+  readonly code = 'CODEX_THREAD_OWNERSHIP_CONFLICT';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'CodexThreadOwnershipConflictError';
+  }
+}
+
+function normalizeThreadOwnershipError(error: unknown): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes(CODEX_ACTIVE_WRITER_PATTERN)
+    ? new CodexThreadOwnershipConflictError(message)
+    : error instanceof Error ? error : new Error(message);
+}
 
 const SLASH_REWRITE_RE = /^\/([a-z][a-z0-9_-]*)(?:\s+([\s\S]*))?$/i;
 const LOCAL_SLASH_COMMANDS = new Set(['goal']);
@@ -131,6 +169,7 @@ export class CodexAppServerPTY {
   private _executing = false;
   private _activeTurnId: string | null = null;
   private _protectedTurnId: string | null = null;
+  private _protectedThreadId: string | null = null;
   private _correlationStartPending = false;
   private _writeBuffer = '';
   private _turnQueue: unknown[][] = [];
@@ -190,10 +229,14 @@ export class CodexAppServerPTY {
         this.queueTurn([{ type: 'text', text: prompt, text_elements: [] }]);
       }
     } catch (err) {
+      const normalized = normalizeThreadOwnershipError(err);
       this._alive = false;
-      this._outputBuffer.push(`[codex-app-server] degraded: ${err}\n`);
-      this.kill();
-      throw err;
+      this._outputBuffer.push(`[codex-app-server] degraded: ${normalized}\n`);
+      // A provider writer conflict is an ownership verdict, not a child crash.
+      // Clean up this failed app-server without notifying AgentProcess's generic
+      // exit/recovery path; AgentProcess will surface the typed halt instead.
+      this.kill(!(normalized instanceof CodexThreadOwnershipConflictError));
+      throw normalized;
     }
   }
 
@@ -216,10 +259,11 @@ export class CodexAppServerPTY {
     }
   }
 
-  kill(): void {
+  kill(notifyExit = true): void {
     this._alive = false;
     this._activeTurnId = null;
     this._protectedTurnId = null;
+    this._protectedThreadId = null;
     this._correlationStartPending = false;
     this._turnQueue = [];
     this.rejectTurnCompletion(new Error('Codex app-server stopped'));
@@ -236,7 +280,7 @@ export class CodexAppServerPTY {
       this._appServerPty = null;
     }
     this.removeSocket();
-    this._onExitHandler?.(0, undefined);
+    if (notifyExit) this._onExitHandler?.(0, undefined);
     this._onExitHandler = null;
   }
 
@@ -273,6 +317,7 @@ export class CodexAppServerPTY {
   async startCorrelationSafeTurn(
     content: string,
     correlationId: string,
+    executionPolicy?: RuntimeExecutionPolicyEnvelope,
   ): Promise<CorrelationSafeTurnReference> {
     if (!this.canStartCorrelationSafeTurn() || !this._threadId) {
       throw new Error('RUNTIME_BUSY');
@@ -282,9 +327,23 @@ export class CodexAppServerPTY {
       throw new Error('INVALID_CORRELATION_ID');
     }
 
-    const threadId = this._threadId;
+    const policyMapping = executionPolicy
+      ? mapExecutionPolicyToCodex(executionPolicy, this._cwd)
+      : null;
     this._executing = true;
     this._correlationStartPending = true;
+    let threadId: string;
+    try {
+      threadId = policyMapping
+        ? await this.startPolicyIsolatedThread(policyMapping)
+        : this._threadId;
+    } catch (error) {
+      this._executing = false;
+      this._correlationStartPending = false;
+      if (this._alive && this._turnQueue.length > 0) void this.drainQueue();
+      throw new Error(`POLICY_THREAD_SETUP_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    this._protectedThreadId = threadId;
     const completion = this.createTurnCompletion();
     const settled = completion.then(
       () => this.finishCorrelationSafeTurn(),
@@ -297,7 +356,15 @@ export class CodexAppServerPTY {
         threadId,
         clientUserMessageId: cleanCorrelationId,
         input: [{ type: 'text', text: content, text_elements: [] }],
-        ...TURN_PERMISSION_OVERRIDES,
+        ...(policyMapping
+          ? {
+              cwd: this._cwd,
+              runtimeWorkspaceRoots: policyMapping.runtimeWorkspaceRoots,
+              approvalPolicy: 'never',
+              sandboxPolicy: policyMapping.sandboxPolicy,
+              ...(policyMapping.environments ? { environments: policyMapping.environments } : {}),
+            }
+          : TURN_PERMISSION_OVERRIDES),
       });
       const turn = response.result?.turn;
       if (!turn || !validCodexId(turn.id)) {
@@ -311,6 +378,7 @@ export class CodexAppServerPTY {
       if (this._executing) {
         this._activeTurnId = turn.id;
         this._protectedTurnId = turn.id;
+        this._protectedThreadId = threadId;
       }
       if (!this.writeCorrelatedTurnRecord(threadId, turn, cleanCorrelationId)) {
         throw new Error('Codex turn started but correlated state could not be persisted');
@@ -328,6 +396,79 @@ export class CodexAppServerPTY {
       void settled;
       throw error;
     }
+  }
+
+  canEnforceExecutionPolicy(policy: RuntimeExecutionPolicyEnvelope): boolean {
+    try {
+      mapExecutionPolicyToCodex(policy, this._cwd);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async startPolicyIsolatedThread(mapping: CodexExecutionPolicyMapping): Promise<string> {
+    const mcpServers = await this.readRestrictedMcpServerOverrides();
+    const response = await this.request<ThreadResponse>('thread/start', {
+      cwd: this._cwd,
+      runtimeWorkspaceRoots: mapping.runtimeWorkspaceRoots,
+      approvalPolicy: 'never',
+      sandbox: mapping.threadSandbox,
+      ...(mapping.environments ? { environments: mapping.environments } : {}),
+      dynamicTools: [],
+      selectedCapabilityRoots: [],
+      config: {
+        features: {
+          goals: false,
+          hooks: false,
+          memories: false,
+          multi_agent: false,
+        },
+        agents: { enabled: false },
+        allow_login_shell: false,
+        tools: { web_search: false, view_image: false },
+        shell_environment_policy: {
+          inherit: mapping.shellEnvironmentInherit,
+          experimental_use_profile: false,
+          set: {},
+        },
+        apps: {
+          _default: {
+            enabled: false,
+            approvals_reviewer: null,
+            destructive_enabled: false,
+            open_world_enabled: false,
+            default_tools_approval_mode: null,
+          },
+        },
+        mcp_servers: mcpServers,
+      },
+      sessionStartSource: 'startup',
+      experimentalRawEvents: false,
+      persistExtendedHistory: true,
+    });
+    const threadId = response.result?.thread.id;
+    if (!threadId || !validCodexId(threadId)) {
+      throw new Error('Codex thread/start returned no valid policy-isolated thread identity');
+    }
+    return threadId;
+  }
+
+  private async readRestrictedMcpServerOverrides(): Promise<Record<string, { enabled: false }>> {
+    const response = await this.request<ConfigReadResponse>('config/read', {
+      cwd: this._cwd,
+      includeLayers: false,
+    });
+    const configured = response.result?.config?.mcp_servers;
+    if (configured === undefined || configured === null) return {};
+    if (typeof configured !== 'object' || Array.isArray(configured)) {
+      throw new Error('Codex config/read returned an invalid mcp_servers value');
+    }
+    return Object.fromEntries(
+      Object.keys(configured as Record<string, unknown>)
+        .sort()
+        .map(name => [name, { enabled: false }]),
+    );
   }
 
   setTelegramHandle(api: TelegramAPI, chatId: string): void {
@@ -606,6 +747,8 @@ export class CodexAppServerPTY {
           this.setThreadId(resumed.result?.thread.id || persisted.threadId);
           return;
         } catch (err) {
+          const normalized = normalizeThreadOwnershipError(err);
+          if (normalized instanceof CodexThreadOwnershipConflictError) throw normalized;
           this._outputBuffer.push(`[codex-app-server] persisted resume failed: ${err}\n`);
         }
       }
@@ -810,7 +953,8 @@ export class CodexAppServerPTY {
         this._outputBuffer.push(`[codex-app-server] status ${JSON.stringify(params.status)}\n`);
         if (isRecord(params.status) && params.status.type === 'idle') {
           this.writeIdleFlag();
-          if (this._correlationStartPending || this._protectedTurnId) {
+          if ((this._correlationStartPending || this._protectedTurnId)
+            && (!this._protectedThreadId || params.threadId === this._protectedThreadId)) {
             this.rejectTurnCompletion(new Error(
               'Codex became idle without a matching correlated terminal event',
             ));
@@ -821,13 +965,17 @@ export class CodexAppServerPTY {
         break;
       case 'turn/started':
         if (isRecord(params.turn) && typeof params.turn.id === 'string') {
-          if (this._protectedTurnId && this._protectedTurnId !== params.turn.id) {
+          if ((this._protectedThreadId && params.threadId !== this._protectedThreadId)
+            || (this._protectedTurnId && this._protectedTurnId !== params.turn.id)) {
             this._outputBuffer.push(
               `[codex-app-server] ignored unrelated turn/started ${params.turn.id} while protecting ${this._protectedTurnId}\n`,
             );
           } else {
             this._activeTurnId = params.turn.id;
-            if (this._correlationStartPending) this._protectedTurnId = params.turn.id;
+            if (this._correlationStartPending) {
+              this._protectedTurnId = params.turn.id;
+              if (typeof params.threadId === 'string') this._protectedThreadId = params.threadId;
+            }
           }
         }
         this.maybeFireTyping();
@@ -845,6 +993,7 @@ export class CodexAppServerPTY {
             : null;
           const completionMatches = this._protectedTurnId
             ? completedTurnId === this._protectedTurnId
+              && (!this._protectedThreadId || params.threadId === this._protectedThreadId)
             : (!completedTurnId || !this._activeTurnId || this._activeTurnId === completedTurnId);
           if (completionMatches) {
             this._activeTurnId = null;
@@ -955,6 +1104,7 @@ export class CodexAppServerPTY {
   private finishCorrelationSafeTurn(): void {
     this._activeTurnId = null;
     this._protectedTurnId = null;
+    this._protectedThreadId = null;
     this._correlationStartPending = false;
     this._executing = false;
     if (this._alive && this._turnQueue.length > 0) {
@@ -1276,6 +1426,37 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function validCodexId(value: string): boolean {
   return /^[A-Za-z0-9_-]{1,200}$/.test(value);
+}
+
+export function mapExecutionPolicyToCodex(
+  policy: RuntimeExecutionPolicyEnvelope,
+  workingDirectory: string,
+): CodexExecutionPolicyMapping {
+  if (policy.version !== 1) throw new Error('POLICY_UNSUPPORTED');
+  if (policy.filesystem === 'none') {
+    throw new Error('POLICY_UNSUPPORTED: Codex cannot deny all filesystem reads');
+  }
+  const networkAccess = policy.network === 'allow';
+  const runtimeWorkspaceRoots = policy.filesystem === 'workspace-write'
+    ? [workingDirectory]
+    : [];
+  return {
+    threadSandbox: policy.filesystem === 'workspace-write' ? 'workspace-write' : 'read-only',
+    sandboxPolicy: policy.filesystem === 'workspace-write'
+      ? {
+          type: 'workspaceWrite',
+          writableRoots: [workingDirectory],
+          networkAccess,
+          excludeTmpdirEnvVar: true,
+          excludeSlashTmp: true,
+        }
+      : { type: 'readOnly', networkAccess },
+    environments: policy.environment === 'inherit' ? undefined : [],
+    shellEnvironmentInherit: policy.environment === 'empty'
+      ? 'none'
+      : policy.environment === 'minimal' ? 'core' : 'all',
+    runtimeWorkspaceRoots,
+  };
 }
 
 function normalizeTurnStatus(value: unknown): CorrelatedTurnRecord['status'] {

@@ -67,7 +67,10 @@ function configuration(): DurableProjectConfiguration {
   };
 }
 
-async function seedAcceptedDispatch(store: SqliteAgentOperationsStateStore): Promise<void> {
+async function seedAcceptedDispatch(
+  store: SqliteAgentOperationsStateStore,
+  withPolicy = true,
+): Promise<void> {
   await store.applyProjectConfiguration(configuration());
   const draft = {
     id: 'job:observation',
@@ -101,6 +104,9 @@ async function seedAcceptedDispatch(store: SqliteAgentOperationsStateStore): Pro
     repositoryId: REPOSITORY_ID,
     checkoutBindingId: CHECKOUT_ID,
     input: { version: 1 as const, instruction: 'Observe this accepted Dispatch.' },
+    ...(withPolicy
+      ? { requestedPolicy: { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const } }
+      : {}),
     jobRevisionAtPreparation: 1,
     attemptRevisionAtPreparation: 0,
     createdAt: TIME,
@@ -124,6 +130,7 @@ async function seedAcceptedDispatch(store: SqliteAgentOperationsStateStore): Pro
   await store.saveExecutionDispatchTransition({
     ...submitting,
     status: 'accepted',
+    ...(withPolicy ? { effectivePolicy: plan.requestedPolicy } : {}),
     acceptedAt: TIME,
     resolvedAt: TIME,
     revision: 2,
@@ -172,7 +179,7 @@ describe('SQLite execution observation persistence', () => {
   it('migrates a populated v4 chain to v5 and preserves every existing record', async () => {
     const databasePath = path();
     const versionFour = open(databasePath, 4);
-    await seedAcceptedDispatch(versionFour);
+    await seedAcceptedDispatch(versionFour, false);
     await versionFour.close();
 
     let database = new Database(databasePath, { readonly: true });
@@ -182,7 +189,7 @@ describe('SQLite execution observation persistence', () => {
       .toBeUndefined();
     database.close();
 
-    const upgraded = open(databasePath);
+    const upgraded = open(databasePath, 5);
     expect(await upgraded.getProject(PROJECT_ID)).not.toBeNull();
     expect(await upgraded.getRepository(REPOSITORY_ID)).not.toBeNull();
     expect(await upgraded.getJob('job:observation')).toMatchObject({ status: 'ready' });
@@ -245,7 +252,7 @@ describe('SQLite execution observation persistence', () => {
     expect(() => SqliteAgentOperationsStateStore.open({
       databasePath,
       additionalMigrations: [{
-        version: 6,
+        version: 7,
         name: 'deliberate-observation-rollback',
         up: database => {
           database.exec('CREATE TABLE should_rollback_observation (id TEXT)');
@@ -260,7 +267,7 @@ describe('SQLite execution observation persistence', () => {
     expect(database.prepare('SELECT id FROM execution_observations').get())
       .toEqual({ id: observation().id });
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
     database.close();
   });
 });

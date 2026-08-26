@@ -63,7 +63,7 @@ function runtime(
     provider,
     enabled: true,
     configured: true,
-    capabilities: ['session-resume'],
+    capabilities: ['session-resume', 'filesystem-read-only', 'network-denial', 'environment-empty'],
     health: { state },
     observedAt: TIME,
     ...(workingDirectory ? { workingDirectory } : {}),
@@ -113,6 +113,7 @@ async function prepared() {
     projectId: PROJECT_ID,
     attemptId: attempt.id,
     instruction: 'Inspect the failing test.',
+    requestedPolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
   });
   return { store, lifecycle, job, attempt, plan };
 }
@@ -160,6 +161,63 @@ describe('ExecutionPreflightService', () => {
     ).preflight(plan.id);
     expect(result).toMatchObject({ status: 'warning', dispatchable: true });
     expect(codes(result)).toEqual(expect.arrayContaining(['working-tree-dirty', 'detached-head']));
+  });
+
+  it('shows requested and effective policy, including a safe stricter provider result', async () => {
+    const { store, plan } = await prepared();
+    const widerPlan = {
+      ...plan,
+      requestedPolicy: {
+        version: 1 as const,
+        filesystem: 'workspace-write' as const,
+        network: 'allow' as const,
+        environment: 'minimal' as const,
+      },
+    };
+    const result = await new ExecutionPreflightService(
+      withOverrides(store, { getExecutionPlan: async () => widerPlan }),
+      runtime(),
+      repository(),
+      () => new Date(TIME),
+    ).preflight(plan.id);
+    expect(result).toMatchObject({
+      dispatchable: true,
+      requestedPolicy: widerPlan.requestedPolicy,
+      effectivePolicy: { version: 1, filesystem: 'read-only', network: 'allow', environment: 'empty' },
+    });
+    expect(codes(result)).toContain('runtime-policy-supported');
+  });
+
+  it('blocks legacy unspecified and unsupported policy without dispatch', async () => {
+    const legacy = await prepared();
+    const { requestedPolicy: _ignored, ...legacyPlan } = legacy.plan;
+    let result = await new ExecutionPreflightService(
+      withOverrides(legacy.store, { getExecutionPlan: async () => legacyPlan }),
+      runtime(),
+      repository(),
+    ).preflight(legacy.plan.id);
+    expect(result.dispatchable).toBe(false);
+    expect(codes(result)).toContain('runtime-policy-unspecified');
+
+    const unsupported = await prepared();
+    result = await new ExecutionPreflightService(
+      unsupported.store,
+      new FakeAgentRuntimeAdapter([{
+        id: RUNTIME_ID,
+        name: 'coder',
+        organization: 'engineering',
+        provider: 'codex',
+        enabled: true,
+        configured: true,
+        capabilities: ['session-resume'],
+        health: { state: 'running' },
+        observedAt: TIME,
+        workingDirectory: PATH,
+      }]),
+      repository(),
+    ).preflight(unsupported.plan.id);
+    expect(result.dispatchable).toBe(false);
+    expect(codes(result)).toContain('runtime-policy-unsupported');
   });
 
   it('blocks repository work when runtime checkout compatibility cannot be proven', async () => {

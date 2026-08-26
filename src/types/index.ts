@@ -641,6 +641,14 @@ export interface BusPaths {
 
 // IPC Types
 
+/** Provider-neutral execution ceiling accepted by correlation-safe injection. */
+export interface RuntimeExecutionPolicyEnvelope {
+  readonly version: 1;
+  readonly filesystem: 'none' | 'read-only' | 'workspace-write';
+  readonly network: 'deny' | 'allow';
+  readonly environment: 'empty' | 'minimal' | 'inherit';
+}
+
 export type IPCCommandType =
   | 'status'
   | 'start-agent'
@@ -793,6 +801,8 @@ export interface WorkerStatus {
 
 export interface IPCResponse {
   success: boolean;
+  /** Instance identity returned by a live daemon over its instance socket. */
+  instanceId?: string;
   data?: unknown;
   error?: string;
   /**
@@ -802,7 +812,7 @@ export interface IPCResponse {
    */
   code?: 'NOT_FOUND' | 'DEDUPED' | 'INVALID_INPUT' | 'NOT_RUNNING'
     | 'CORRELATION_UNSUPPORTED' | 'RUNTIME_BUSY' | 'MARKER_WRITE_FAILED'
-    | 'SUBMISSION_UNCERTAIN';
+    | 'POLICY_UNSUPPORTED' | 'POLICY_MISMATCH' | 'SUBMISSION_UNCERTAIN';
 }
 
 // Agent Discovery Types

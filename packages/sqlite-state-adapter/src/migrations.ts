@@ -11,7 +11,8 @@ export const JOB_SCHEMA_VERSION = 2;
 export const EXECUTION_PLAN_SCHEMA_VERSION = 3;
 export const DISPATCH_SCHEMA_VERSION = 4;
 export const OBSERVATION_SCHEMA_VERSION = 5;
-export const CURRENT_SCHEMA_VERSION = OBSERVATION_SCHEMA_VERSION;
+export const RUNTIME_POLICY_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = RUNTIME_POLICY_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -262,6 +263,64 @@ const EXECUTION_OBSERVATION_SCHEMA_SQL = `
   );
 `;
 
+const RUNTIME_POLICY_SCHEMA_SQL = `
+  ALTER TABLE execution_plans ADD COLUMN requested_policy_version INTEGER
+    CHECK (requested_policy_version IS NULL OR requested_policy_version = 1);
+  ALTER TABLE execution_plans ADD COLUMN requested_filesystem TEXT
+    CHECK (requested_filesystem IS NULL OR requested_filesystem IN ('none', 'read-only', 'workspace-write'));
+  ALTER TABLE execution_plans ADD COLUMN requested_network TEXT
+    CHECK (requested_network IS NULL OR requested_network IN ('deny', 'allow'));
+  ALTER TABLE execution_plans ADD COLUMN requested_environment TEXT
+    CHECK (requested_environment IS NULL OR requested_environment IN ('empty', 'minimal', 'inherit'));
+
+  ALTER TABLE execution_dispatches ADD COLUMN effective_policy_version INTEGER
+    CHECK (effective_policy_version IS NULL OR effective_policy_version = 1);
+  ALTER TABLE execution_dispatches ADD COLUMN effective_filesystem TEXT
+    CHECK (effective_filesystem IS NULL OR effective_filesystem IN ('none', 'read-only', 'workspace-write'));
+  ALTER TABLE execution_dispatches ADD COLUMN effective_network TEXT
+    CHECK (effective_network IS NULL OR effective_network IN ('deny', 'allow'));
+  ALTER TABLE execution_dispatches ADD COLUMN effective_environment TEXT
+    CHECK (effective_environment IS NULL OR effective_environment IN ('empty', 'minimal', 'inherit'));
+
+  CREATE TRIGGER execution_plans_policy_complete_insert
+  BEFORE INSERT ON execution_plans
+  WHEN (NEW.requested_policy_version IS NULL) != (NEW.requested_filesystem IS NULL)
+    OR (NEW.requested_policy_version IS NULL) != (NEW.requested_network IS NULL)
+    OR (NEW.requested_policy_version IS NULL) != (NEW.requested_environment IS NULL)
+  BEGIN
+    SELECT RAISE(ABORT, 'execution plan policy must be wholly null or wholly specified');
+  END;
+
+  CREATE TRIGGER execution_plans_policy_complete_update
+  BEFORE UPDATE OF requested_policy_version, requested_filesystem, requested_network, requested_environment
+  ON execution_plans
+  WHEN (NEW.requested_policy_version IS NULL) != (NEW.requested_filesystem IS NULL)
+    OR (NEW.requested_policy_version IS NULL) != (NEW.requested_network IS NULL)
+    OR (NEW.requested_policy_version IS NULL) != (NEW.requested_environment IS NULL)
+  BEGIN
+    SELECT RAISE(ABORT, 'execution plan policy must be wholly null or wholly specified');
+  END;
+
+  CREATE TRIGGER execution_dispatches_policy_complete_insert
+  BEFORE INSERT ON execution_dispatches
+  WHEN (NEW.effective_policy_version IS NULL) != (NEW.effective_filesystem IS NULL)
+    OR (NEW.effective_policy_version IS NULL) != (NEW.effective_network IS NULL)
+    OR (NEW.effective_policy_version IS NULL) != (NEW.effective_environment IS NULL)
+  BEGIN
+    SELECT RAISE(ABORT, 'execution dispatch policy must be wholly null or wholly specified');
+  END;
+
+  CREATE TRIGGER execution_dispatches_policy_complete_update
+  BEFORE UPDATE OF effective_policy_version, effective_filesystem, effective_network, effective_environment
+  ON execution_dispatches
+  WHEN (NEW.effective_policy_version IS NULL) != (NEW.effective_filesystem IS NULL)
+    OR (NEW.effective_policy_version IS NULL) != (NEW.effective_network IS NULL)
+    OR (NEW.effective_policy_version IS NULL) != (NEW.effective_environment IS NULL)
+  BEGIN
+    SELECT RAISE(ABORT, 'execution dispatch policy must be wholly null or wholly specified');
+  END;
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -287,6 +346,11 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: OBSERVATION_SCHEMA_VERSION,
     name: 'execution-observations-and-outcomes',
     up: database => database.exec(EXECUTION_OBSERVATION_SCHEMA_SQL),
+  },
+  {
+    version: RUNTIME_POLICY_SCHEMA_VERSION,
+    name: 'runtime-capability-policy',
+    up: database => database.exec(RUNTIME_POLICY_SCHEMA_SQL),
   },
 ];
 

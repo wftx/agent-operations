@@ -11,6 +11,7 @@ const REQUEST: RuntimeDispatchRequest = {
   runtimeAgentId: 'engineering/coder',
   executionPlanId: 'plan:test',
   input: { version: 1, instruction: 'Investigate the failing test.' },
+  requestedPolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
 };
 
 describe('CortextOSExecutionAdapter', () => {
@@ -23,7 +24,12 @@ describe('CortextOSExecutionAdapter', () => {
           success: true,
           data: {
             message: 'Started a new correlated turn for agent coder',
-            execution: { provider: 'codex', sessionId: 'thread-1', turnId: 'turn-1' },
+            execution: {
+              provider: 'codex',
+              sessionId: 'thread-1',
+              turnId: 'turn-1',
+              effectivePolicy: REQUEST.requestedPolicy,
+            },
           },
         };
       },
@@ -32,6 +38,7 @@ describe('CortextOSExecutionAdapter', () => {
       status: 'accepted',
       externalReference: 'cortextos:codex-turn:v1:thread-1:turn-1',
       message: 'Started a new correlated turn for agent coder',
+      effectivePolicy: REQUEST.requestedPolicy,
     });
     expect(captured).toEqual([{
       agentName: 'coder',
@@ -75,6 +82,7 @@ describe('CortextOSExecutionAdapter', () => {
       });
       await expect(adapter.dispatch(REQUEST)).resolves.toEqual({
         status: 'rejected',
+        ...(code === 'RUNTIME_BUSY' ? { code: 'RUNTIME_BUSY' } : {}),
         message: `Rejected: ${code}`,
       });
     },
@@ -90,6 +98,7 @@ describe('CortextOSExecutionAdapter', () => {
     });
     await expect(adapter.dispatch(REQUEST)).resolves.toEqual({
       status: 'uncertain',
+      code: 'SUBMISSION_UNCERTAIN',
       message: 'turn may have started before acknowledgement was lost',
     });
   });

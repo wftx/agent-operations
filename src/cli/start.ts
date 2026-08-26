@@ -148,7 +148,7 @@ export const startCommand = new Command('start')
 
         if (running) {
           console.log('Daemon started successfully (background process).');
-          console.log('Note: daemon will stop if you close this terminal session.');
+          console.log('Note: this detached daemon is not supervised and must be stopped explicitly.');
           console.log('Install PM2 for persistence: npm install -g pm2');
         } else {
           console.error(`Daemon failed to start after ${MAX_SPAWN_ATTEMPTS} attempts.`);

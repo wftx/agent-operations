@@ -3,6 +3,8 @@ import type { IPCRequest } from '../../../src/types/index.js';
 import { IPCServer } from '../../../src/daemon/ipc-server.js';
 import { CortextOSExecutionAdapter } from '../../../packages/cortextos-execution-adapter/src/index.js';
 
+const POLICY = { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const };
+
 function socketCapture() {
   let body = '';
   return {
@@ -21,6 +23,7 @@ function manager(overrides: Record<string, unknown> = {}) {
       provider: 'codex',
       sessionId: 'thread-1',
       turnId: 'turn-1',
+      effectivePolicy: POLICY,
     }),
     injectAgentDetailed: vi.fn().mockReturnValue({ ok: true }),
     ...overrides,
@@ -49,6 +52,7 @@ describe('inject-agent correlation-safe IPC mode', () => {
         runtimeAgentId: 'rehearsal/coder',
         executionPlanId: 'plan:socket-roundtrip',
         input: { version: 1, instruction: 'One isolated fixture instruction.' },
+        requestedPolicy: POLICY,
       })).resolves.toMatchObject({
         status: 'accepted',
         externalReference: 'cortextos:codex-turn:v1:thread-1:turn-1',
@@ -57,6 +61,7 @@ describe('inject-agent correlation-safe IPC mode', () => {
         'coder',
         'One isolated fixture instruction.',
         'dispatch-plan:socket-roundtrip',
+        POLICY,
       );
     } finally {
       server.stop();
@@ -73,24 +78,37 @@ describe('inject-agent correlation-safe IPC mode', () => {
         text: 'One bounded action.',
         requireNewTurn: true,
         correlationId: 'dispatch-plan:plan-1',
+        executionPolicy: POLICY,
       },
       source: 'test fixture',
     })).resolves.toEqual({
       success: true,
       data: {
         message: 'Started a new correlated turn for agent coder',
-        execution: { provider: 'codex', sessionId: 'thread-1', turnId: 'turn-1' },
+        execution: {
+          provider: 'codex',
+          sessionId: 'thread-1',
+          turnId: 'turn-1',
+          effectivePolicy: POLICY,
+        },
       },
     });
     expect(fake.injectAgentCorrelatedDetailed).toHaveBeenCalledWith(
       'coder',
       'One bounded action.',
       'dispatch-plan:plan-1',
+      POLICY,
     );
     expect(fake.injectAgentDetailed).not.toHaveBeenCalled();
   });
 
-  it.each(['RUNTIME_BUSY', 'MARKER_WRITE_FAILED', 'SUBMISSION_UNCERTAIN'])(
+  it.each([
+    'RUNTIME_BUSY',
+    'POLICY_UNSUPPORTED',
+    'POLICY_MISMATCH',
+    'MARKER_WRITE_FAILED',
+    'SUBMISSION_UNCERTAIN',
+  ])(
     'preserves the structured %s failure boundary',
     async code => {
       const fake = manager({
@@ -123,6 +141,22 @@ describe('inject-agent correlation-safe IPC mode', () => {
     })).resolves.toMatchObject({ success: false, code: 'INVALID_INPUT' });
     expect(fake.injectAgentCorrelatedDetailed).not.toHaveBeenCalled();
     expect(fake.injectAgentDetailed).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed policy envelope before injection', async () => {
+    const fake = manager();
+    const server = new IPCServer(fake as never, process.env.CTX_INSTANCE_ID);
+    await expect(request(server, {
+      type: 'inject-agent',
+      agent: 'coder',
+      data: {
+        text: 'One bounded action.',
+        requireNewTurn: true,
+        correlationId: 'dispatch-plan:invalid-policy',
+        executionPolicy: { version: 1, filesystem: 'danger-full-access' },
+      },
+    })).resolves.toMatchObject({ success: false, code: 'INVALID_INPUT' });
+    expect(fake.injectAgentCorrelatedDetailed).not.toHaveBeenCalled();
   });
 
   it('keeps legacy inject-agent behavior unchanged when opt-in fields are absent', async () => {

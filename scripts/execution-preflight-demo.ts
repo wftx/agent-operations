@@ -72,6 +72,7 @@ async function main(): Promise<void> {
       projectId: PROJECT_ID,
       attemptId: attempt.id,
       instruction: 'Investigate the failing test and identify the root cause.',
+      requestedPolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
     });
 
     const observedRepository: RepositorySummary = {
@@ -127,7 +128,7 @@ function runtimeFixture(
     provider: 'codex',
     enabled: true,
     configured: true,
-    capabilities: ['session-resume'],
+    capabilities: ['session-resume', 'filesystem-read-only', 'network-denial', 'environment-empty'],
     health: { state },
     workingDirectory,
     observedAt,
