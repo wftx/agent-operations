@@ -6,6 +6,7 @@ import {
   LIVE_REHEARSAL_CONFIRMATION,
   LiveRehearsalOperations,
   runLiveRehearsalExecution,
+  type LiveRehearsalPreparation,
   type LiveRehearsalPreview,
 } from '../packages/agent-operations-rehearsal/src/index.js';
 import { GitRepositoryAdapter } from '../packages/git-adapter/src/index.js';
@@ -13,7 +14,9 @@ import { SqliteAgentOperationsStateStore } from '../packages/sqlite-state-adapte
 
 interface ParsedArguments {
   execute: boolean;
+  prepare: boolean;
   confirmation?: string;
+  nonce?: string;
   confirmSuccessAttemptId?: string;
   confirmFailureAttemptId?: string;
   failureReason?: string;
@@ -32,11 +35,17 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (args.prepare) {
+    await runPreparation(args, runtime, safety);
+    return;
+  }
+
   let store: SqliteAgentOperationsStateStore | undefined;
   try {
     const result = await runLiveRehearsalExecution({
       execute: args.execute,
       confirmation: args.confirmation,
+      ...(args.nonce ? { nonceFactory: () => args.nonce! } : {}),
       runtimes: runtime,
       safetyInspector: safety,
       operationsFactory: async () => {
@@ -58,6 +67,38 @@ async function main(): Promise<void> {
     printRun(result.run);
   } finally {
     if (store) await store.close().catch(() => undefined);
+  }
+}
+
+async function runPreparation(
+  args: ParsedArguments,
+  runtime: CortextOSRuntimeAdapter,
+  safety: CortextOSRehearsalSafetyInspector,
+): Promise<void> {
+  const previewResult = await runLiveRehearsalExecution({
+    execute: false,
+    runtimes: runtime,
+    safetyInspector: safety,
+    operationsFactory: async () => { throw new Error('Preparation preview must not create operations'); },
+    ...(args.nonce ? { nonceFactory: () => args.nonce! } : {}),
+  });
+  printPreview(previewResult.preview);
+  if (args.confirmation !== LIVE_REHEARSAL_CONFIRMATION) {
+    throw new Error(`Durable preparation requires --confirm ${LIVE_REHEARSAL_CONFIRMATION}`);
+  }
+  if (!previewResult.discovery.candidate || !previewResult.preview.safetyConditionsSatisfied) {
+    console.log('\nREHEARSAL PREPARATION BLOCKED\nNo durable work or Dispatch was created.');
+    return;
+  }
+  const store = SqliteAgentOperationsStateStore.open();
+  try {
+    const prepared = await createOperations(store, runtime).prepare(
+      previewResult.discovery.candidate,
+      previewResult.preview.nonce,
+    );
+    printPreparation(prepared);
+  } finally {
+    await store.close();
   }
 }
 
@@ -131,6 +172,7 @@ function printPreview(preview: LiveRehearsalPreview): void {
   console.log(`  network: ${preview.requestedPolicy.network}`);
   console.log(`  environment: ${preview.requestedPolicy.environment}`);
   console.log(`\nPolicy enforceable:\n  ${preview.policyEnforceable ? 'yes' : 'no'}`);
+  console.log(`\nExact turn correlation:\n  ${preview.exactTurnCorrelationSupported ? 'available' : 'unavailable'}`);
   console.log('\nEffective runtime policy:');
   console.log(preview.effectivePolicy
     ? `  filesystem: ${preview.effectivePolicy.filesystem}\n  network: ${preview.effectivePolicy.network}\n  environment: ${preview.effectivePolicy.environment}`
@@ -148,8 +190,13 @@ function printRun(run: NonNullable<Awaited<ReturnType<typeof runLiveRehearsalExe
   console.log(`Job: ${run.job.id} (${run.job.status})`);
   console.log(`Attempt: ${run.attempt.id} (${run.attempt.status})`);
   console.log(`Plan: ${run.plan.id}`);
+  console.log(`Installation: ${run.plan.installationId}`);
   console.log(`Dispatch: ${run.dispatch?.id ?? 'none'} (${run.dispatch?.status ?? 'not created'})`);
+  console.log(`External reference: ${run.dispatch?.externalReference ?? 'none'}`);
   console.log(`Preflight: ${run.preflight.status}`);
+  console.log(`Dispatchable: ${run.preflight.dispatchable ? 'yes' : 'no'}`);
+  console.log(`Preflight findings: ${run.preflight.checks
+    .map(item => `${item.code}/${item.severity}`).join(', ')}`);
   console.log(`Requested policy: ${formatPolicy(run.preflight.requestedPolicy)}`);
   console.log(`Effective policy: ${formatPolicy(run.preflight.effectivePolicy)}`);
   console.log(`Real adapter invoked: ${run.dispatchOutcome.adapterInvoked ? 'yes' : 'no'}`);
@@ -160,12 +207,31 @@ function printRun(run: NonNullable<Awaited<ReturnType<typeof runLiveRehearsalExe
       .map(item => `${item.kind}/${item.correlation}`).join(', ') || 'none'}`);
   }
   if (run.dispatchOutcome.status === 'accepted' && run.attempt.status === 'running') {
-    console.log(`\nAttempt is still running in AO.\nExpected response:\n  AGENT_OPERATIONS_REHEARSAL_OK ${run.nonce}`);
+    console.log(`\nAttempt is still running in AO.\nExpected response:\n  AGENT_OPERATIONS_RESTRICTED_OK ${run.nonce}`);
     console.log('\nAfter human verification, confirm success with:');
     console.log(`npm run dev:live-rehearsal -- --confirm-success ${run.attempt.id} --confirm ${LIVE_REHEARSAL_CONFIRMATION}`);
     console.log('\nThen complete the Job separately with:');
     console.log(`npm run dev:live-rehearsal -- --complete-job ${run.job.id} --confirm ${LIVE_REHEARSAL_CONFIRMATION}`);
   }
+}
+
+function printPreparation(prepared: LiveRehearsalPreparation): void {
+  console.log('\nDURABLE REHEARSAL PREPARED');
+  console.log(`Project: ${prepared.projectId}`);
+  console.log(`Job: ${prepared.job.id} (${prepared.job.status})`);
+  console.log(`Attempt: ${prepared.attempt.id} (${prepared.attempt.status})`);
+  console.log(`Plan: ${prepared.plan.id}`);
+  console.log(`Installation: ${prepared.plan.installationId}`);
+  console.log('Repository: none');
+  console.log(`Nonce: ${prepared.nonce}`);
+  console.log(`Preflight: ${prepared.preflight.status}`);
+  console.log(`Dispatchable: ${prepared.preflight.dispatchable ? 'yes' : 'no'}`);
+  console.log(`Requested policy: ${formatPolicy(prepared.preflight.requestedPolicy)}`);
+  console.log(`Effective policy: ${formatPolicy(prepared.preflight.effectivePolicy)}`);
+  console.log(`Preflight findings: ${prepared.preflight.checks
+    .map(item => `${item.code}/${item.severity}`).join(', ')}`);
+  console.log('Dispatch: none');
+  console.log('Real external submissions: 0');
 }
 
 function parseArguments(values: readonly string[]): ParsedArguments {
@@ -175,7 +241,9 @@ function parseArguments(values: readonly string[]): ParsedArguments {
   };
   return {
     execute: values.includes('--execute'),
+    prepare: values.includes('--prepare'),
     ...(valueAfter('--confirm') ? { confirmation: valueAfter('--confirm') } : {}),
+    ...(valueAfter('--nonce') ? { nonce: valueAfter('--nonce') } : {}),
     ...(valueAfter('--confirm-success')
       ? { confirmSuccessAttemptId: valueAfter('--confirm-success') }
       : {}),

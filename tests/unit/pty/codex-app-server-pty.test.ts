@@ -821,10 +821,8 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
         apps: {
           _default: {
             enabled: false,
-            approvals_reviewer: null,
             destructive_enabled: false,
             open_world_enabled: false,
-            default_tools_approval_mode: null,
           },
         },
         mcp_servers: {
@@ -849,6 +847,8 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
     expect(JSON.stringify(requestMock.mock.calls)).not.toContain('AO_TEST_SECRET_SENTINEL');
     expect(JSON.stringify(requestMock.mock.calls)).not.toContain('fixture-secret-never-forward');
     expect(JSON.stringify(requestMock.mock.calls)).not.toContain('dangerFullAccess');
+    expect(JSON.stringify(requestMock.mock.calls)).not.toContain('approvals_reviewer');
+    expect(JSON.stringify(requestMock.mock.calls)).not.toContain('default_tools_approval_mode');
 
     rpc(pty).handleRpcMessage({
       method: 'turn/completed',

@@ -40,10 +40,16 @@ function runtime(state: 'running' | 'stopped' | 'degraded' = 'running'): AgentRu
     id: RUNTIME_ID,
     name: 'safe-agent',
     organization: 'rehearsal',
-    provider: 'claude',
+    provider: 'codex',
     enabled: true,
     configured: true,
-    capabilities: ['session-resume', 'filesystem-read-only', 'network-denial', 'environment-empty'],
+    capabilities: [
+      'session-resume',
+      'exact-turn-correlation',
+      'filesystem-read-only',
+      'network-denial',
+      'environment-empty',
+    ],
     health: { state },
     observedAt: TIME,
   };
@@ -149,6 +155,7 @@ describe('live rehearsal execution gates', () => {
         environment: 'empty',
       },
       policyEnforceable: true,
+      exactTurnCorrelationSupported: true,
     });
     expect(factoryCalls).toBe(0);
   });
@@ -276,6 +283,31 @@ describe('CortextOS rehearsal candidate safety', () => {
 });
 
 describe('live rehearsal durable orchestration', () => {
+  it('prepares durable work and current preflight without invoking a Dispatch', async () => {
+    const store = new InMemoryAgentOperationsStateStore();
+    const execution = new FakeRuntimeExecutionAdapter({ status: 'accepted' });
+    const built = operations(store, execution);
+    const prepared = await built.value.prepare(candidate(), NONCE);
+    expect(prepared).toMatchObject({
+      projectId: LIVE_REHEARSAL_PROJECT_ID,
+      job: { status: 'ready' },
+      attempt: { status: 'created' },
+      preflight: {
+        status: 'ready',
+        dispatchable: true,
+      },
+      nonce: NONCE,
+    });
+    expect(prepared.preflight.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        code: 'runtime-exact-turn-correlation-supported',
+        severity: 'pass',
+      }),
+    ]));
+    expect(execution.callCount).toBe(0);
+    expect(await store.getExecutionDispatchForPlan(prepared.plan.id)).toBeNull();
+  });
+
   it('lets current preflight block without creating or invoking a Dispatch', async () => {
     const setup = await run(
       { status: 'accepted' },

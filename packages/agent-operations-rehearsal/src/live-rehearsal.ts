@@ -32,7 +32,7 @@ import {
 } from '../../agent-operations-core/src/index.js';
 
 export const LIVE_REHEARSAL_CONFIRMATION = 'LIVE_REHEARSAL';
-export const LIVE_REHEARSAL_PROJECT_ID = 'ao-live-rehearsal';
+export const LIVE_REHEARSAL_PROJECT_ID = 'ao-restricted-live-rehearsal';
 
 export interface RuntimeCandidateSafety {
   readonly safe: boolean;
@@ -72,6 +72,7 @@ export interface LiveRehearsalPreview {
   readonly requestedPolicy: RuntimeExecutionPolicy;
   readonly effectivePolicy: RuntimeExecutionPolicy | null;
   readonly policyEnforceable: boolean;
+  readonly exactTurnCorrelationSupported: boolean;
   readonly automaticallyInferSuccess: false;
   readonly outcomeAuthority: 'human confirmation';
   readonly executionAuthorized: boolean;
@@ -88,6 +89,15 @@ export interface LiveRehearsalRun {
   readonly preflight: ExecutionPreflightResult;
   readonly dispatchOutcome: ManualDispatchOutcome;
   readonly executionDetail: AttemptExecutionDetail | null;
+  readonly nonce: string;
+}
+
+export interface LiveRehearsalPreparation {
+  readonly projectId: string;
+  readonly job: DurableJob;
+  readonly attempt: DurableJobAttempt;
+  readonly plan: DurableExecutionPlan;
+  readonly preflight: ExecutionPreflightResult;
   readonly nonce: string;
 }
 
@@ -144,6 +154,7 @@ export async function discoverLiveRehearsalCandidate(
   const eligible = summaries.filter(item => item.configured
     && item.enabled === true
     && item.provider !== 'unknown'
+    && item.capabilities.includes('exact-turn-correlation')
     && item.health.state === 'running');
   const inspected: LiveRehearsalCandidate[] = [];
   for (const summary of eligible) {
@@ -159,7 +170,7 @@ export async function discoverLiveRehearsalCandidate(
   if (!safe.length) {
     const explanation = inspected.length
       ? inspected.map(item => `${item.runtime.id}: ${item.safety.reason}`).join('; ')
-      : 'No configured, explicitly enabled, known-provider runtime is currently running.';
+      : 'No configured, explicitly enabled, running runtime with exact turn correlation is available.';
     return {
       health,
       configuredAgentIds,
@@ -190,7 +201,9 @@ export async function runLiveRehearsalExecution(
   const authorized = options.execute && options.confirmation === LIVE_REHEARSAL_CONFIRMATION;
   const preview = createLiveRehearsalPreview(discovery, nonce, authorized);
   if (!authorized) return { preview, discovery, status: 'preview', operationsCreated: false };
-  if (!discovery.candidate) return { preview, discovery, status: 'blocked', operationsCreated: false };
+  if (!discovery.candidate || !preview.safetyConditionsSatisfied) {
+    return { preview, discovery, status: 'blocked', operationsCreated: false };
+  }
 
   const operations = await options.operationsFactory();
   const run = await operations.execute(discovery.candidate, nonce);
@@ -225,7 +238,13 @@ export class LiveRehearsalOperations {
       now: this.now,
       ...(options.planIdFactory ? { planIdFactory: options.planIdFactory } : {}),
     });
-    this.preflight = new ExecutionPreflightService(store, runtimes, repositories, this.now);
+    this.preflight = new ExecutionPreflightService(
+      store,
+      runtimes,
+      repositories,
+      this.now,
+      { requireExactTurnCorrelation: true },
+    );
     this.dispatch = new ManualDispatchService(store, this.preflight, execution, {
       now: this.now,
       ...(options.dispatchIdFactory ? { dispatchIdFactory: options.dispatchIdFactory } : {}),
@@ -240,11 +259,9 @@ export class LiveRehearsalOperations {
   }
 
   async execute(candidate: LiveRehearsalCandidate, requestedNonce: string): Promise<LiveRehearsalRun> {
-    if (!candidate.safety.safe) throw new Error(`Runtime candidate is not safe: ${candidate.safety.reason}`);
-    const nonce = normalizeNonce(requestedNonce);
-    const chain = await this.ensureDurableChain(candidate.runtime, nonce);
+    const prepared = await this.prepare(candidate, requestedNonce);
+    const { nonce, preflight, ...chain } = prepared;
     const existingDispatch = await this.store.getExecutionDispatchForPlan(chain.plan.id);
-    const preflight = await this.preflight.preflight(chain.plan.id);
     if (!preflight.dispatchable && !existingDispatch) {
       return {
         ...chain,
@@ -286,6 +303,20 @@ export class LiveRehearsalOperations {
     };
   }
 
+  async prepare(
+    candidate: LiveRehearsalCandidate,
+    requestedNonce: string,
+  ): Promise<LiveRehearsalPreparation> {
+    if (!candidate.safety.safe) throw new Error(`Runtime candidate is not safe: ${candidate.safety.reason}`);
+    const requested = normalizeNonce(requestedNonce);
+    const chain = await this.ensureDurableChain(candidate.runtime, requested);
+    return {
+      ...chain,
+      preflight: await this.preflight.preflight(chain.plan.id),
+      nonce: extractNonce(chain.plan.input.instruction) ?? requested,
+    };
+  }
+
   async confirmSuccess(attemptId: string): Promise<AttemptExecutionDetail> {
     return this.outcomes.confirmAttemptSucceeded(attemptId, {
       summary: 'Human verified the expected harmless Agent Operations live rehearsal response.',
@@ -320,7 +351,7 @@ export class LiveRehearsalOperations {
       await this.store.applyProjectConfiguration({
         project: {
           id: LIVE_REHEARSAL_PROJECT_ID,
-          name: 'Agent Operations Live Rehearsal',
+          name: 'Agent Operations Restricted Live Rehearsal',
           createdAt: timestamp,
           updatedAt: timestamp,
         },
@@ -342,7 +373,7 @@ export class LiveRehearsalOperations {
 
     const job = await this.lifecycle.createJob({
       projectId: LIVE_REHEARSAL_PROJECT_ID,
-      title: `Controlled live rehearsal ${nonce}`,
+      title: `Controlled restricted live rehearsal ${nonce}`,
       description: `Repository-free, no-tool rehearsal. Expected nonce response: ${expectedResponse(nonce)}`,
       preferredRuntimeAgentId: runtime.id,
     });
@@ -409,6 +440,8 @@ export function createLiveRehearsalPreview(
         discovery.candidate.runtime.capabilities,
       )
     : null;
+  const exactTurnCorrelationSupported = discovery.candidate?.runtime.capabilities
+    .includes('exact-turn-correlation') === true;
   return {
     title: 'LIVE AGENT OPERATIONS REHEARSAL',
     runtimeAgentId: discovery.candidate?.runtime.id ?? null,
@@ -422,10 +455,13 @@ export function createLiveRehearsalPreview(
     requestedPolicy: { ...RESTRICTED_TEXT_EXECUTION_POLICY },
     effectivePolicy: resolution?.supported ? { ...resolution.effectivePolicy } : null,
     policyEnforceable: resolution?.supported === true,
+    exactTurnCorrelationSupported,
     automaticallyInferSuccess: false,
     outcomeAuthority: 'human confirmation',
     executionAuthorized: authorized,
-    safetyConditionsSatisfied: Boolean(discovery.candidate),
+    safetyConditionsSatisfied: Boolean(
+      discovery.candidate && resolution?.supported && exactTurnCorrelationSupported,
+    ),
     discoveryReason: discovery.reason,
   };
 }
@@ -433,7 +469,7 @@ export function createLiveRehearsalPreview(
 export function createLiveRehearsalInstruction(nonce: string): string {
   const clean = normalizeNonce(nonce);
   return [
-    'This is a controlled Agent Operations execution rehearsal.',
+    'This is a controlled Agent Operations restricted execution rehearsal.',
     '',
     'Do not use tools.',
     'Do not modify or create files.',
@@ -451,11 +487,11 @@ export function createLiveRehearsalNonce(): string {
 }
 
 export function expectedResponse(nonce: string): string {
-  return `AGENT_OPERATIONS_REHEARSAL_OK ${normalizeNonce(nonce)}`;
+  return `AGENT_OPERATIONS_RESTRICTED_OK ${normalizeNonce(nonce)}`;
 }
 
 function extractNonce(instruction: string): string | undefined {
-  return instruction.match(/AGENT_OPERATIONS_REHEARSAL_OK ([A-Z0-9_-]+)/)?.[1];
+  return instruction.match(/AGENT_OPERATIONS_RESTRICTED_OK ([A-Z0-9_-]+)/)?.[1];
 }
 
 function normalizeNonce(value: string): string {

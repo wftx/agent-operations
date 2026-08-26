@@ -165,6 +165,8 @@ export type ExecutionPreflightFindingCode =
   | 'runtime-adapter-unavailable'
   | 'runtime-missing'
   | 'runtime-provider-unknown'
+  | 'runtime-exact-turn-correlation-supported'
+  | 'runtime-exact-turn-correlation-unsupported'
   | 'runtime-not-configured'
   | 'runtime-disabled'
   | 'runtime-running'

@@ -13,6 +13,10 @@ import type {
 } from '../../agent-operations-contracts/src/index.js';
 import { resolveRuntimeExecutionPolicy } from '../../agent-operations-contracts/src/index.js';
 
+export interface ExecutionPreflightServiceOptions {
+  readonly requireExactTurnCorrelation?: boolean;
+}
+
 /** Current, read-only validation. It neither stores observations nor changes lifecycle state. */
 export class ExecutionPreflightService {
   constructor(
@@ -20,6 +24,7 @@ export class ExecutionPreflightService {
     private readonly runtimes: AgentRuntimeAdapter,
     private readonly repositories: RepositoryInventoryAdapter,
     private readonly now: () => Date = () => new Date(),
+    private readonly options: ExecutionPreflightServiceOptions = {},
   ) {}
 
   async preflight(planId: string): Promise<ExecutionPreflightResult> {
@@ -184,6 +189,19 @@ export class ExecutionPreflightService {
       }
       if (runtime.provider === 'unknown') {
         add(checks, 'runtime-provider-unknown', 'blocking', `Runtime ${runtime.id} has an unknown provider.`);
+      }
+      if (this.options.requireExactTurnCorrelation) {
+        const exactTurnCorrelation = runtime.capabilities.includes('exact-turn-correlation');
+        add(
+          checks,
+          exactTurnCorrelation
+            ? 'runtime-exact-turn-correlation-supported'
+            : 'runtime-exact-turn-correlation-unsupported',
+          exactTurnCorrelation ? 'pass' : 'blocking',
+          exactTurnCorrelation
+            ? `Runtime ${runtime.id} supports exact turn correlation.`
+            : `Runtime ${runtime.id} cannot provide the exact turn correlation required for Dispatch.`,
+        );
       }
       if (!runtime.configured) {
         add(checks, 'runtime-not-configured', 'blocking', `Runtime ${runtime.id} is not configured.`);

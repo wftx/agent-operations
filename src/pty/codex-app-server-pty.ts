@@ -435,10 +435,8 @@ export class CodexAppServerPTY {
         apps: {
           _default: {
             enabled: false,
-            approvals_reviewer: null,
             destructive_enabled: false,
             open_world_enabled: false,
-            default_tools_approval_mode: null,
           },
         },
         mcp_servers: mcpServers,

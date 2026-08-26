@@ -63,7 +63,13 @@ function runtime(
     provider,
     enabled: true,
     configured: true,
-    capabilities: ['session-resume', 'filesystem-read-only', 'network-denial', 'environment-empty'],
+    capabilities: [
+      'session-resume',
+      'exact-turn-correlation',
+      'filesystem-read-only',
+      'network-denial',
+      'environment-empty',
+    ],
     health: { state },
     observedAt: TIME,
     ...(workingDirectory ? { workingDirectory } : {}),
@@ -149,6 +155,41 @@ describe('ExecutionPreflightService', () => {
       'checkout-available',
       'repository-identity-valid',
     ]));
+  });
+
+  it('can require exact turn correlation for a correlation-safe Dispatch boundary', async () => {
+    const supported = await prepared();
+    let result = await new ExecutionPreflightService(
+      supported.store,
+      runtime(),
+      repository(),
+      () => new Date(TIME),
+      { requireExactTurnCorrelation: true },
+    ).preflight(supported.plan.id);
+    expect(result.dispatchable).toBe(true);
+    expect(codes(result)).toContain('runtime-exact-turn-correlation-supported');
+
+    const unsupported = await prepared();
+    result = await new ExecutionPreflightService(
+      unsupported.store,
+      new FakeAgentRuntimeAdapter([{
+        id: RUNTIME_ID,
+        name: 'coder',
+        organization: 'engineering',
+        provider: 'codex',
+        enabled: true,
+        configured: true,
+        capabilities: ['session-resume', 'filesystem-read-only', 'network-denial', 'environment-empty'],
+        health: { state: 'running' },
+        observedAt: TIME,
+        workingDirectory: PATH,
+      }]),
+      repository(),
+      () => new Date(TIME),
+      { requireExactTurnCorrelation: true },
+    ).preflight(unsupported.plan.id);
+    expect(result.dispatchable).toBe(false);
+    expect(codes(result)).toContain('runtime-exact-turn-correlation-unsupported');
   });
 
   it('warns without blocking for dirty and detached checkouts', async () => {
