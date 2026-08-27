@@ -100,6 +100,11 @@ After build and deterministic validation, preview repository preparation without
 npm run dev:repository-rehearsal -- --prepare --confirm REPOSITORY_REHEARSAL
 ```
 
+Run that command from the Agent Operations repository root. If an operator must
+launch it from elsewhere, set `AGENT_OPERATIONS_REPOSITORY_CHECKOUT` to the
+absolute checkout path; the repository identity and root are still validated
+before any durable work is prepared.
+
 The preview must show repository `remote:github.com/wftx/agent-operations`, the canonical checkout and reader root, `read-only / deny / empty`, repository read enabled, arbitrary shell disabled, writes unavailable, exact correlation available, and `Execution authorized: false`. It may prepare a fresh Attempt and immutable Plan after a prior Attempt is terminal, but it must create no Dispatch and send no runtime instruction.
 
 Fresh-agent admission requires a running runtime, a recent `last_idle.flag`, empty inbox and inflight queues, and either no prior injection flag or an idle timestamp at least as new as the last injection. Do not inject a ping merely to manufacture readiness evidence.

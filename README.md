@@ -4,6 +4,10 @@
 
 **Persistent 24/7 Claude Code agents you control from Telegram or your phone.**
 
+This repository is the [Agent Operations fork](https://github.com/wftx/agent-operations)
+of David's upstream [cortextOS project](https://github.com/grandamenium/cortextos).
+The upstream README is retained below as the baseline project documentation.
+
 ---
 
 ```

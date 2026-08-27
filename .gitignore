@@ -42,10 +42,20 @@ templates/*/.env
 .cortextos-env
 
 # Agent runtime data
+.cortextos/
+.agent-operations/
+.codex/
 orgs/*/agents/*/memory/
 agents/*/local/
 agents/*/telegram-images/
 agents/*/memory/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sock
+*.pid
 
 # macOS metadata
 .DS_Store

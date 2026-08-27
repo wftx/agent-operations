@@ -1,4 +1,4 @@
-import { basename } from 'node:path';
+import { basename, resolve } from 'node:path';
 import type {
   AgentOperationsStateStore,
   AgentRuntimeDetail,
@@ -25,7 +25,9 @@ import {
 export const REPOSITORY_REHEARSAL_CONFIRMATION = 'REPOSITORY_REHEARSAL';
 export const REPOSITORY_REHEARSAL_PROJECT_ID = 'ao-repository-read-only-rehearsal';
 export const REPOSITORY_REHEARSAL_ID = 'remote:github.com/wftx/agent-operations';
-export const REPOSITORY_REHEARSAL_CHECKOUT = '/Users/westhompson/Desktop/agent-operations';
+export const REPOSITORY_REHEARSAL_CHECKOUT = resolve(
+  process.env['AGENT_OPERATIONS_REPOSITORY_CHECKOUT'] ?? process.cwd(),
+);
 
 export const REPOSITORY_REHEARSAL_POLICY: RuntimeExecutionPolicy = {
   ...RESTRICTED_TEXT_EXECUTION_POLICY,
