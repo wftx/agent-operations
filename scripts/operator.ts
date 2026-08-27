@@ -12,14 +12,15 @@ import { SqliteAgentOperationsStateStore } from '../packages/sqlite-state-adapte
 async function main(): Promise<void> {
   const store = SqliteAgentOperationsStateStore.open();
   try {
+    const runtime = new CortextOSRuntimeAdapter();
     const orchestration = new OrchestrationService(
       store,
-      new CortextOSRuntimeAdapter(),
+      runtime,
       new GitRepositoryAdapter(),
       new CortextOSExecutionAdapter(),
       new CortextOSExecutionObserver(),
     );
-    const application = new OperatorApplicationService(store, orchestration);
+    const application = new OperatorApplicationService(store, orchestration, { runtime });
     const [command = 'help', ...args] = process.argv.slice(2);
     if (command === 'projects') {
       const projects = await application.listProjects();
@@ -29,14 +30,16 @@ async function main(): Promise<void> {
       }
       return;
     }
-    if (command === 'jobs') {
-      const filter = optionalFlag(args, '--filter') ?? 'all';
+    if (['jobs', 'running', 'needs-me', 'done'].includes(command)) {
+      const filter = command === 'jobs' ? optionalFlag(args, '--filter') ?? 'all'
+        : command === 'running' ? 'running'
+        : command === 'needs-me' ? 'needs-human' : 'done';
       if (!['all', 'running', 'needs-human', 'done'].includes(filter)) {
         throw new Error('--filter must be all, running, needs-human, or done');
       }
       const jobs = await application.listJobs(filter as OperatorJobList);
       for (const job of jobs) {
-        console.log(`${job.orchestrationState.padEnd(16)} ${job.job.title} — ${job.projectName}/${job.repositoryName}`);
+        console.log(`${job.currentStage.padEnd(24)} ${job.job.title} — ${job.projectName}/${job.repositoryName}`);
       }
       return;
     }
@@ -83,9 +86,35 @@ async function main(): Promise<void> {
         throw new Error('Live execution requires --execute --confirm ORCHESTRATE');
       }
       const session = await application.runOperatorJob(input);
-      console.log(`Job started: ${session.jobId}`);
+      console.log(`Job accepted: ${session.jobId}`);
+      console.log('The local runner is continuing through durable Agent Operations state.');
       const completed = await application.waitForRun(session.jobId);
       console.log(`Result: ${completed.status}${completed.message ? ` — ${completed.message}` : ''}`);
+      return;
+    }
+    if (command === 'guide') {
+      const escalationId = args[0];
+      const instruction = optionalFlag(args.slice(1), '--instruction');
+      if (!escalationId || !instruction) {
+        throw new Error('Usage: npm run ao -- guide <escalation-id> --instruction <text>');
+      }
+      const session = await application.provideGuidanceAndContinue(escalationId, instruction);
+      console.log(`Guidance persisted; fresh continuation accepted for Job ${session.jobId}`);
+      const completed = await application.waitForRun(session.jobId);
+      console.log(`Result: ${completed.status}${completed.message ? ` — ${completed.message}` : ''}`);
+      return;
+    }
+    if (command === 'cancel') {
+      const escalationId = args[0];
+      if (!escalationId || args.length !== 1) {
+        throw new Error('Usage: npm run ao -- cancel <escalation-id>');
+      }
+      const session = await application.cancelEscalatedJob(escalationId);
+      console.log(`Cancelled Job ${session.jobId}`);
+      return;
+    }
+    if (command === 'runtime') {
+      console.log(JSON.stringify(await application.getRuntimeStatus(), null, 2));
       return;
     }
     printHelp();
@@ -142,8 +171,14 @@ function printHelp(): void {
 
   npm run ao -- projects
   npm run ao -- jobs [--filter all|running|needs-human|done]
+  npm run ao -- running
+  npm run ao -- needs-me
+  npm run ao -- done
   npm run ao -- show <job-id>
+  npm run ao -- runtime
   npm run ao -- run [--project <id>] [--repository <id>] --task <text> --acceptance <text>
+  npm run ao -- guide <escalation-id> --instruction <text>
+  npm run ao -- cancel <escalation-id>
 
 Run is preview-only by default. Live execution additionally requires:
   --execute --confirm ORCHESTRATE`);

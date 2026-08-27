@@ -1,43 +1,37 @@
-import { createServer } from 'node:http';
 import { CortextOSRuntimeAdapter } from '../../../packages/cortextos-adapter/src/index.js';
 import { CortextOSExecutionAdapter } from '../../../packages/cortextos-execution-adapter/src/index.js';
 import { CortextOSExecutionObserver } from '../../../packages/cortextos-execution-observer/src/index.js';
 import { GitRepositoryAdapter } from '../../../packages/git-adapter/src/index.js';
 import { OrchestrationService } from '../../../packages/agent-operations-core/src/index.js';
 import { OperatorApplicationService } from '../../../packages/agent-operations-application/src/index.js';
+import { NoopOperatorNotifier } from '../../../packages/agent-operations-application/src/index.js';
 import { SqliteAgentOperationsStateStore } from '../../../packages/sqlite-state-adapter/src/index.js';
+import {
+  TelegramOperatorNotifier,
+  loadTelegramOperatorNotificationConfig,
+} from '../../../packages/telegram-notification-adapter/src/index.js';
 import { OperatorWebApplication } from './app.js';
+import { createOperatorHttpServer } from './http-server.js';
 
 const host = '127.0.0.1';
 const port = parsePort(process.env['AO_WEB_PORT'] ?? '4310');
 const store = SqliteAgentOperationsStateStore.open();
+const runtime = new CortextOSRuntimeAdapter();
 const orchestration = new OrchestrationService(
   store,
-  new CortextOSRuntimeAdapter(),
+  runtime,
   new GitRepositoryAdapter(),
   new CortextOSExecutionAdapter(),
   new CortextOSExecutionObserver(),
 );
-const app = new OperatorWebApplication(new OperatorApplicationService(store, orchestration));
-
-const server = createServer(async (request, response) => {
-  try {
-    const body = request.method === 'GET' || request.method === 'HEAD'
-      ? undefined
-      : await readBody(request);
-    const webRequest = new Request(`http://${host}:${port}${request.url ?? '/'}`, {
-      method: request.method,
-      headers: requestHeaders(request.headers),
-      ...(body ? { body } : {}),
-    });
-    const webResponse = await app.handle(webRequest);
-    response.writeHead(webResponse.status, Object.fromEntries(webResponse.headers));
-    response.end(Buffer.from(await webResponse.arrayBuffer()));
-  } catch (error) {
-    response.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
-    response.end(error instanceof Error ? error.message : String(error));
-  }
+const application = new OperatorApplicationService(store, orchestration, {
+  runtime,
+  notifier: loadNotifier(),
 });
+application.startRunner();
+const app = new OperatorWebApplication(application);
+
+const server = createOperatorHttpServer(app, { host, port });
 
 server.listen(port, host, () => {
   console.log(`Agent Operations is available at http://${host}:${port}`);
@@ -60,21 +54,12 @@ function parsePort(value: string): number {
   return parsed;
 }
 
-async function readBody(request: import('node:http').IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of request) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    size += buffer.length;
-    if (size > 64 * 1024) throw new Error('Operator request body exceeds 64 KiB');
-    chunks.push(buffer);
+function loadNotifier() {
+  try {
+    const config = loadTelegramOperatorNotificationConfig();
+    return config ? new TelegramOperatorNotifier(config) : new NoopOperatorNotifier();
+  } catch (error) {
+    console.warn(`Agent Operations Telegram notifications disabled: ${error instanceof Error ? error.message : String(error)}`);
+    return new NoopOperatorNotifier();
   }
-  return Buffer.concat(chunks);
-}
-
-function requestHeaders(headers: import('node:http').IncomingHttpHeaders): Record<string, string> {
-  return Object.fromEntries(Object.entries(headers).flatMap(([name, value]) => {
-    if (value === undefined) return [];
-    return [[name, Array.isArray(value) ? value.join(', ') : value]];
-  }));
 }

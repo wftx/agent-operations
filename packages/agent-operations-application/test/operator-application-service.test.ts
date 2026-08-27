@@ -11,6 +11,8 @@ import {
 import {
   OPERATOR_READ_ONLY_DEFAULTS,
   OperatorApplicationService,
+  type OperatorNotificationEvent,
+  type OperatorNotifier,
   type OperatorOrchestrationPort,
   type OperatorTaskInput,
 } from '../src/index.js';
@@ -32,7 +34,7 @@ class FakeOrchestration implements OperatorOrchestrationPort {
 
   constructor(
     private readonly store: InMemoryAgentOperationsStateStore,
-    private readonly result: 'PASS' | 'ESCALATED' = 'PASS',
+    private readonly result: 'PASS' | 'ESCALATED' | readonly ('PASS' | 'ESCALATED')[] = 'PASS',
     private readonly gate?: Promise<void>,
   ) {}
 
@@ -58,26 +60,29 @@ class FakeOrchestration implements OperatorOrchestrationPort {
 
   async runJob(jobId: string): Promise<OrchestrationReadModel> {
     this.runCalls += 1;
+    const selected = Array.isArray(this.result)
+      ? this.result[Math.min(this.runCalls - 1, this.result.length - 1)]
+      : this.result;
     if (this.gate) await this.gate;
     const lifecycle = new JobLifecycleService(this.store, { now: () => new Date(TIME) });
     const workerCreated = await lifecycle.createAttempt(jobId, { executionRole: 'worker' });
     const workerRunning = await lifecycle.startAttempt(workerCreated.id);
-    const worker = await lifecycle.completeAttempt(workerRunning.id, 'Bounded Worker result recorded.');
+    const worker = await lifecycle.completeAttempt(workerRunning.id, `Bounded Worker result ${this.runCalls} recorded.`);
     const reviewerCreated = await lifecycle.createAttempt(jobId, { executionRole: 'reviewer' });
     const reviewerRunning = await lifecycle.startAttempt(reviewerCreated.id);
-    const reviewer = await lifecycle.completeAttempt(reviewerRunning.id, `Reviewer decision: ${this.result}.`);
+    const reviewer = await lifecycle.completeAttempt(reviewerRunning.id, `Reviewer decision: ${selected}.`);
     const review = {
-      id: `review:${jobId}`,
+      id: `review:${jobId}:${this.runCalls}`,
       jobId,
       workerAttemptId: worker.id,
       reviewerAttemptId: reviewer.id,
       reviewerRuntimeAgentId: RUNTIME_ID,
-      decision: this.result === 'PASS' ? 'PASS' as const : 'ESCALATE' as const,
-      summary: this.result === 'PASS' ? 'Acceptance criteria satisfied.' : 'Human judgment is required.',
+      decision: selected === 'PASS' ? 'PASS' as const : 'ESCALATE' as const,
+      summary: selected === 'PASS' ? 'Acceptance criteria satisfied.' : 'Human judgment is required.',
       createdAt: TIME,
     };
     await this.store.createAttemptReview(review);
-    if (this.result === 'ESCALATED') {
+    if (selected === 'ESCALATED') {
       await this.store.createEscalation({
         id: `escalation:${jobId}`,
         jobId,
@@ -88,7 +93,7 @@ class FakeOrchestration implements OperatorOrchestrationPort {
         createdAt: TIME,
       });
     }
-    const job = this.result === 'PASS'
+    const job = selected === 'PASS'
       ? await lifecycle.completeJob(jobId)
       : (await this.store.getJob(jobId))!;
     return {
@@ -97,9 +102,20 @@ class FakeOrchestration implements OperatorOrchestrationPort {
       reviewerAttempts: [reviewer],
       reviews: [review],
       escalations: await this.store.listEscalations(jobId),
-      needsHuman: this.result === 'ESCALATED',
-      finalDecision: this.result,
+      needsHuman: selected === 'ESCALATED',
+      finalDecision: selected,
     };
+  }
+}
+
+class RecordingNotifier implements OperatorNotifier {
+  readonly events: OperatorNotificationEvent[] = [];
+  constructor(private readonly failure?: string) {}
+
+  async notify(event: OperatorNotificationEvent) {
+    this.events.push(event);
+    if (this.failure) throw new Error(this.failure);
+    return { status: 'sent' as const };
   }
 }
 
@@ -160,10 +176,10 @@ describe('OperatorApplicationService', () => {
       automaticReadOnlyCompletion: true,
       status: 'completed',
     });
-    expect(orchestration.previewCalls).toBe(1);
+    expect(orchestration.previewCalls).toBe(0);
     expect(orchestration.runCalls).toBe(1);
     expect((await application.listJobs('done'))[0]).toMatchObject({
-      orchestrationState: 'Done',
+      orchestrationState: 'Completed',
       workerAttemptCount: 1,
       latestReviewDecision: 'PASS',
       needsHuman: false,
@@ -201,16 +217,16 @@ describe('OperatorApplicationService', () => {
     await lifecycle.startAttempt(workerAttempt.id);
     const application = new OperatorApplicationService(store, orchestration);
 
-    expect((await application.listJobs()).find(item => item.job.id === draft.id)?.orchestrationState).toBe('New');
+    expect((await application.listJobs()).find(item => item.job.id === draft.id)?.orchestrationState).toBe('Accepted');
     const running = await application.listJobs('running');
     expect(running.find(item => item.job.id === ready.id)).toMatchObject({
       job: { id: ready.id },
       currentRole: 'reviewer',
-      orchestrationState: 'Reviewer running',
+      orchestrationState: 'Preparing Reviewer',
     });
     expect(running.find(item => item.job.id === workerReady.id)).toMatchObject({
       currentRole: 'worker',
-      orchestrationState: 'Worker running',
+      orchestrationState: 'Preparing Worker',
     });
     expect(orchestration.previewCalls).toBe(0);
     expect(orchestration.runCalls).toBe(0);
@@ -227,11 +243,127 @@ describe('OperatorApplicationService', () => {
     );
 
     const first = await application.runOperatorJob(INPUT);
+    expect(first.status).toBe('pending');
     await expect(application.runOperatorJob({ ...INPUT, task: 'A second Job' }))
       .rejects.toThrow('already running');
     release();
     expect((await application.waitForRun(first.jobId)).status).toBe('done');
     expect(await store.listJobs()).toHaveLength(1);
+  });
+
+  it('persists guidance, resolves Needs Me, and continues only through a fresh Worker Attempt', async () => {
+    const store = await configuredStore();
+    const notifier = new RecordingNotifier();
+    const orchestration = new FakeOrchestration(store, ['ESCALATED', 'PASS']);
+    const application = new OperatorApplicationService(store, orchestration, {
+      now: () => new Date(TIME), notifier,
+    });
+    const started = await application.runOperatorJob(INPUT);
+    expect((await application.waitForRun(started.jobId)).status).toBe('needs-human');
+    const escalation = (await store.listEscalations(started.jobId, true))[0];
+
+    const continued = await application.provideGuidanceAndContinue(
+      escalation.id,
+      'Use the documented persistence contract as authoritative.',
+    );
+    expect(continued.status).toBe('pending');
+    expect((await application.waitForRun(started.jobId)).status).toBe('done');
+
+    const attempts = await store.listAttemptsForJob(started.jobId);
+    expect(attempts.filter(attempt => attempt.executionRole === 'worker')).toHaveLength(2);
+    expect(await store.getEscalation(escalation.id)).toMatchObject({ resolvedAt: TIME });
+    expect(await store.listHumanGuidance(started.jobId)).toEqual([
+      expect.objectContaining({
+        escalationId: escalation.id,
+        instruction: 'Use the documented persistence contract as authoritative.',
+      }),
+    ]);
+    expect(notifier.events.map(event => event.kind)).toEqual(['needs_human', 'job_completed']);
+    application.startRunner();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(notifier.events.map(event => event.kind)).toEqual(['needs_human', 'job_completed']);
+  });
+
+  it('cancels an eligible Needs Me Job while preserving resolved escalation history', async () => {
+    const store = await configuredStore();
+    const application = new OperatorApplicationService(
+      store,
+      new FakeOrchestration(store, 'ESCALATED'),
+      { now: () => new Date(TIME) },
+    );
+    const started = await application.runOperatorJob(INPUT);
+    expect((await application.waitForRun(started.jobId)).status).toBe('needs-human');
+    const escalation = (await store.listEscalations(started.jobId, true))[0];
+
+    const cancelled = await application.cancelEscalatedJob(escalation.id);
+
+    expect(cancelled.status).toBe('cancelled');
+    expect(await store.getJob(started.jobId)).toMatchObject({ status: 'cancelled' });
+    expect(await store.getEscalation(escalation.id)).toMatchObject({ resolvedAt: TIME });
+    expect(await application.listJobs('needs-human')).toEqual([]);
+    expect((await application.getJobDetail(started.jobId)).escalationActions[escalation.id]).toEqual([]);
+    await expect(application.provideGuidanceAndContinue(escalation.id, 'Too late.'))
+      .rejects.toThrow('already resolved');
+  });
+
+  it('records notification failure without changing successful Job truth', async () => {
+    const store = await configuredStore();
+    const notifier = new RecordingNotifier('Telegram offline');
+    const application = new OperatorApplicationService(store, new FakeOrchestration(store), {
+      now: () => new Date(TIME), notifier,
+    });
+    const started = await application.runOperatorJob(INPUT);
+    expect((await application.waitForRun(started.jobId)).status).toBe('done');
+    expect(await store.getJob(started.jobId)).toMatchObject({ status: 'completed' });
+    expect(await store.listOperatorNotificationDeliveries(started.jobId)).toEqual([
+      expect.objectContaining({ status: 'failed', message: 'Telegram offline' }),
+    ]);
+  });
+
+  it('records Needs Me notification failure without resolving or changing the escalation', async () => {
+    const store = await configuredStore();
+    const application = new OperatorApplicationService(
+      store,
+      new FakeOrchestration(store, 'ESCALATED'),
+      { now: () => new Date(TIME), notifier: new RecordingNotifier('Telegram offline') },
+    );
+    const started = await application.runOperatorJob(INPUT);
+    expect((await application.waitForRun(started.jobId)).status).toBe('needs-human');
+
+    expect(await store.getJob(started.jobId)).toMatchObject({ status: 'ready' });
+    expect(await store.listEscalations(started.jobId, true)).toHaveLength(1);
+    expect(await store.listOperatorNotificationDeliveries(started.jobId)).toEqual([
+      expect.objectContaining({ kind: 'needs_human', status: 'failed', message: 'Telegram offline' }),
+    ]);
+  });
+
+  it('resumes a durably accepted pending Operator Run when a new application instance starts', async () => {
+    const store = await configuredStore();
+    const lifecycle = new JobLifecycleService(store, {
+      now: () => new Date(TIME),
+      jobIdFactory: () => 'job:restart',
+    });
+    const draft = await lifecycle.createJob({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      preferredRuntimeAgentId: RUNTIME_ID,
+      title: 'Resume after restart',
+      description: 'Resume from durable Operator state.',
+      acceptanceCriteria: 'Complete through Reviewer PASS.',
+      automaticReadOnlyCompletion: true,
+    });
+    const job = await lifecycle.markJobReady(draft.id);
+    await store.createOperatorRun({
+      id: 'operator-run:restart', jobId: job.id, status: 'pending', revision: 0,
+      createdAt: TIME, updatedAt: TIME,
+    });
+
+    const orchestration = new FakeOrchestration(store);
+    const restarted = new OperatorApplicationService(store, orchestration, { now: () => new Date(TIME) });
+    restarted.startRunner();
+    expect((await restarted.waitForRun(job.id)).status).toBe('done');
+    expect(orchestration.runCalls).toBe(1);
+    expect(await store.getJob(job.id)).toMatchObject({ status: 'completed' });
   });
 });
 

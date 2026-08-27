@@ -155,140 +155,175 @@ export class OrchestrationService {
   }
 
   async runJob(jobId: string): Promise<OrchestrationReadModel> {
-    const preview = await this.preview(jobId);
-    if (!preview.eligible || !preview.workerRuntimeAgentId || !preview.reviewerRuntimeAgentId) {
+    const initialJob = await this.requireJob(jobId);
+    if (initialJob.status === 'completed') return this.readModel(initialJob.id, 'PASS');
+    if ((await this.store.listEscalations(initialJob.id, true)).length > 0) {
+      return this.readModel(initialJob.id, 'ESCALATED');
+    }
+    const workerRuntimeAgentId = this.workerRuntimeAgentId ?? initialJob.preferredRuntimeAgentId ?? null;
+    const reviewerRuntimeAgentId = this.reviewerRuntimeAgentId ?? initialJob.preferredRuntimeAgentId ?? null;
+    const findings = await this.continuationEligibilityFindings(
+      initialJob,
+      workerRuntimeAgentId,
+      reviewerRuntimeAgentId,
+    );
+    if (findings.length || !workerRuntimeAgentId || !reviewerRuntimeAgentId) {
       await this.escalate(
-        preview.job.id,
+        initialJob.id,
         'policy_blocked',
-        `Job is not eligible for autonomous read-only orchestration: ${preview.findings.join('; ')}`,
+        `Job is not eligible for autonomous read-only orchestration: ${findings.join('; ')}`,
       );
-      return this.readModel(preview.job.id, 'ESCALATED');
+      return this.readModel(initialJob.id, 'ESCALATED');
     }
 
-    let previousResult: string | undefined;
-    let reviewerFeedback: string | undefined;
     for (;;) {
-      const existingWorkerAttempts = (await this.store.listAttemptsForJob(preview.job.id))
-        .filter(attempt => attempt.executionRole === 'worker');
-      if (existingWorkerAttempts.length >= MVP_MAX_WORKER_ATTEMPTS) {
+      const job = await this.requireJob(initialJob.id);
+      if (job.status === 'completed') return this.readModel(job.id, 'PASS');
+      if ((await this.store.listEscalations(job.id, true)).length > 0) {
+        return this.readModel(job.id, 'ESCALATED');
+      }
+      const attempts = await this.store.listAttemptsForJob(job.id);
+      const active = attempts.filter(attempt => attempt.status === 'created' || attempt.status === 'running');
+      if (active.length > 1) {
+        await this.escalate(job.id, 'runtime_failure', 'Multiple active Attempts require human reconciliation.');
+        return this.readModel(job.id, 'ESCALATED');
+      }
+      if (active[0]) {
+        const run = await this.resumeActiveAttempt(job, active[0]);
+        if (run.status === 'escalate') {
+          await this.escalate(job.id, run.reason, run.summary, active[0].id);
+          return this.readModel(job.id, 'ESCALATED');
+        }
+        continue;
+      }
+
+      const workers = attempts.filter(attempt => attempt.executionRole === 'worker');
+      const reviewers = attempts.filter(attempt => attempt.executionRole === 'reviewer');
+      const latestWorker = workers.at(-1);
+      if (!latestWorker) {
+        await this.lifecycle.createAttempt(job.id, {
+          runtimeAgentId: workerRuntimeAgentId,
+          executionRole: 'worker',
+        });
+        continue;
+      }
+      if (latestWorker.status !== 'completed') {
         await this.escalate(
-          preview.job.id,
-          'review_failed_after_budget',
-          `Worker Attempt budget of ${MVP_MAX_WORKER_ATTEMPTS} is exhausted.`,
-          existingWorkerAttempts.at(-1)?.id,
+          job.id,
+          'runtime_failure',
+          `Worker Attempt ${latestWorker.roleSequence} ended ${latestWorker.status} without a resumable result.`,
+          latestWorker.id,
         );
-        return this.readModel(preview.job.id, 'ESCALATED');
+        return this.readModel(job.id, 'ESCALATED');
       }
 
-      const worker = await this.lifecycle.createAttempt(preview.job.id, {
-        runtimeAgentId: preview.workerRuntimeAgentId,
-        executionRole: 'worker',
-      });
-      const workerRun = await this.executeAttempt(
-        worker,
-        buildWorkerInstruction(preview.job, worker.roleSequence, previousResult, reviewerFeedback),
-      );
-      if (workerRun.status === 'escalate') {
-        await this.escalate(preview.job.id, workerRun.reason, workerRun.summary, worker.id);
-        return this.readModel(preview.job.id, 'ESCALATED');
-      }
-      await this.resolveAttempt(
-        worker,
-        workerRun.execution.evidence,
-        'completed',
-        'Worker execution completed with a bounded exact result. Semantic acceptance remains with review.',
-      );
+      const reviews = await this.store.listAttemptReviewsForJob(job.id);
+      const review = reviews.find(candidate => candidate.workerAttemptId === latestWorker.id);
+      if (review) {
+        const reviewer = reviewers.find(candidate => candidate.id === review.reviewerAttemptId);
+        if (!reviewer || reviewer.status !== 'completed') {
+          await this.escalate(job.id, 'runtime_failure', 'Persisted Review has no completed Reviewer Attempt.', latestWorker.id, review.id);
+          return this.readModel(job.id, 'ESCALATED');
+        }
+        if (review.decision === 'PASS') {
+          const workerExecution = await this.exactExecutionForAttempt(latestWorker.id);
+          const reviewerExecution = await this.exactExecutionForAttempt(reviewer.id);
+          if (!workerExecution || !reviewerExecution
+            || !this.safeAutoCompletionEligible(job, workerExecution, reviewerExecution)) {
+            await this.escalate(
+              job.id,
+              'policy_blocked',
+              'Reviewer passed the result, but the narrow read-only auto-completion invariants were not satisfied.',
+              latestWorker.id,
+              review.id,
+            );
+            return this.readModel(job.id, 'ESCALATED');
+          }
+          await this.lifecycle.completeJob(job.id);
+          return this.readModel(job.id, 'PASS');
+        }
 
-      const reviewer = await this.lifecycle.createAttempt(preview.job.id, {
-        runtimeAgentId: preview.reviewerRuntimeAgentId,
-        executionRole: 'reviewer',
-      });
-      const reviewerRun = await this.executeAttempt(
-        reviewer,
-        buildReviewerInstruction(preview.job, worker.roleSequence, workerRun.execution.resultText),
-      );
-      if (reviewerRun.status === 'escalate') {
-        await this.escalate(preview.job.id, reviewerRun.reason, reviewerRun.summary, reviewer.id);
-        return this.readModel(preview.job.id, 'ESCALATED');
+        const guidance = await this.guidanceFor(job.id, latestWorker.id, review.id);
+        if (review.decision === 'ESCALATE' && !guidance) {
+          await this.escalate(
+            job.id,
+            'human_judgment_required',
+            review.feedback ?? review.summary,
+            latestWorker.id,
+            review.id,
+          );
+          return this.readModel(job.id, 'ESCALATED');
+        }
+        if (workers.length >= MVP_MAX_WORKER_ATTEMPTS) {
+          await this.escalate(
+            job.id,
+            'review_failed_after_budget',
+            `Worker Attempt budget of ${MVP_MAX_WORKER_ATTEMPTS} is exhausted.`,
+            latestWorker.id,
+            review.id,
+          );
+          return this.readModel(job.id, 'ESCALATED');
+        }
+        await this.lifecycle.createAttempt(job.id, {
+          runtimeAgentId: workerRuntimeAgentId,
+          executionRole: 'worker',
+        });
+        continue;
       }
 
-      let reviewerResult: ParsedReviewerResult;
+      const reviewer = reviewers.find(candidate => candidate.roleSequence === latestWorker.roleSequence);
+      if (!reviewer) {
+        await this.lifecycle.createAttempt(job.id, {
+          runtimeAgentId: reviewerRuntimeAgentId,
+          executionRole: 'reviewer',
+        });
+        continue;
+      }
+      if (reviewer.status !== 'completed') {
+        const guidance = await this.guidanceFor(job.id, reviewer.id);
+        if (guidance && workers.length < MVP_MAX_WORKER_ATTEMPTS) {
+          await this.lifecycle.createAttempt(job.id, {
+            runtimeAgentId: workerRuntimeAgentId,
+            executionRole: 'worker',
+          });
+          continue;
+        }
+        await this.escalate(
+          job.id,
+          'reviewer_uncertain',
+          `Reviewer Attempt ${reviewer.roleSequence} ended ${reviewer.status} without a valid Review.`,
+          reviewer.id,
+        );
+        return this.readModel(job.id, 'ESCALATED');
+      }
+      const reviewerExecution = await this.exactExecutionForAttempt(reviewer.id);
+      if (!reviewerExecution) {
+        await this.escalate(job.id, 'exact_correlation_missing', 'Completed Reviewer Attempt has no bounded exact result.', reviewer.id);
+        return this.readModel(job.id, 'ESCALATED');
+      }
+      let parsed: ParsedReviewerResult;
       try {
-        reviewerResult = parseReviewerResult(reviewerRun.execution.resultText);
+        parsed = parseReviewerResult(reviewerExecution.resultText);
       } catch (error) {
-        await this.resolveAttempt(
-          reviewer,
-          reviewerRun.execution.evidence,
-          'failed',
-          undefined,
-          `Reviewer returned malformed structured output: ${message(error)}`,
-        );
         await this.escalate(
-          preview.job.id,
+          job.id,
           'reviewer_uncertain',
           `Reviewer output was not a valid decision contract: ${message(error)}`,
           reviewer.id,
         );
-        return this.readModel(preview.job.id, 'ESCALATED');
+        return this.readModel(job.id, 'ESCALATED');
       }
-
-      const review: DurableAttemptReview = {
+      await this.store.createAttemptReview({
         id: this.attemptReviewIdFactory(),
-        jobId: preview.job.id,
-        workerAttemptId: worker.id,
+        jobId: job.id,
+        workerAttemptId: latestWorker.id,
         reviewerAttemptId: reviewer.id,
         reviewerRuntimeAgentId: reviewer.runtimeAgentId!,
-        decision: reviewerResult.decision,
-        summary: reviewerResult.summary,
-        ...(reviewerResult.feedback ? { feedback: reviewerResult.feedback } : {}),
+        decision: parsed.decision,
+        summary: parsed.summary,
+        ...(parsed.feedback ? { feedback: parsed.feedback } : {}),
         createdAt: this.now().toISOString(),
-      };
-      await this.store.createAttemptReview(review);
-      await this.resolveAttempt(
-        reviewer,
-        reviewerRun.execution.evidence,
-        'completed',
-        `Reviewer decision: ${review.decision}. ${review.summary}`,
-      );
-
-      if (review.decision === 'PASS') {
-        if (!this.safeAutoCompletionEligible(preview.job, workerRun.execution, reviewerRun.execution)) {
-          await this.escalate(
-            preview.job.id,
-            'policy_blocked',
-            'Reviewer passed the result, but the narrow read-only auto-completion invariants were not satisfied.',
-            worker.id,
-            review.id,
-          );
-          return this.readModel(preview.job.id, 'ESCALATED');
-        }
-        await this.lifecycle.completeJob(preview.job.id);
-        return this.readModel(preview.job.id, 'PASS');
-      }
-
-      if (review.decision === 'ESCALATE') {
-        await this.escalate(
-          preview.job.id,
-          'human_judgment_required',
-          review.feedback ?? review.summary,
-          worker.id,
-          review.id,
-        );
-        return this.readModel(preview.job.id, 'ESCALATED');
-      }
-
-      if (worker.roleSequence >= MVP_MAX_WORKER_ATTEMPTS) {
-        await this.escalate(
-          preview.job.id,
-          'review_failed_after_budget',
-          `Reviewer requested another revision after Worker Attempt ${worker.roleSequence}: ${review.feedback}`,
-          worker.id,
-          review.id,
-        );
-        return this.readModel(preview.job.id, 'ESCALATED');
-      }
-      previousResult = workerRun.execution.resultText;
-      reviewerFeedback = review.feedback;
+      });
     }
   }
 
@@ -319,18 +354,45 @@ export class OrchestrationService {
     return items;
   }
 
-  private async executeAttempt(
+  private async resumeActiveAttempt(
+    job: DurableJob,
     attempt: DurableJobAttempt,
-    instruction: string,
   ): Promise<ObservationResolution> {
-    const job = await this.requireJob(attempt.jobId);
-    const plan = await this.planning.prepareExecutionPlan({
-      projectId: job.projectId,
-      attemptId: attempt.id,
-      instruction,
-      requestedPolicy: RESTRICTED_TEXT_EXECUTION_POLICY,
-      requestedCapabilities: REPOSITORY_READ_EXECUTION_CAPABILITIES,
-    });
+    const attempts = await this.store.listAttemptsForJob(job.id);
+    const workers = attempts.filter(candidate => candidate.executionRole === 'worker');
+    const latestWorker = workers.at(-1);
+    const reviews = await this.store.listAttemptReviewsForJob(job.id);
+    const latestReview = reviews.at(-1);
+    const guidance = (await this.store.listHumanGuidance(job.id)).at(-1)?.instruction;
+    const priorWorker = attempt.executionRole === 'worker'
+      ? workers.find(candidate => candidate.roleSequence === attempt.roleSequence - 1)
+      : latestWorker;
+    const previousResult = priorWorker
+      ? await this.resultForAttempt(priorWorker.id)
+      : undefined;
+    const instruction = attempt.executionRole === 'worker'
+      ? buildWorkerInstruction(
+        job,
+        attempt.roleSequence,
+        previousResult,
+        latestReview?.feedback ?? (latestReview?.decision === 'ESCALATE' ? latestReview.summary : undefined),
+        guidance,
+      )
+      : buildReviewerInstruction(
+        job,
+        latestWorker?.roleSequence ?? attempt.roleSequence,
+        previousResult ?? '',
+      );
+    let plan = await this.store.getExecutionPlanForAttempt(attempt.id);
+    if (!plan) {
+      plan = await this.planning.prepareExecutionPlan({
+        projectId: job.projectId,
+        attemptId: attempt.id,
+        instruction,
+        requestedPolicy: RESTRICTED_TEXT_EXECUTION_POLICY,
+        requestedCapabilities: REPOSITORY_READ_EXECUTION_CAPABILITIES,
+      });
+    }
     const dispatch = await this.dispatch.dispatchExecutionPlan(plan.id);
     const dispatchFailure = await this.resolveDispatchFailure(attempt, dispatch);
     if (dispatchFailure) return dispatchFailure;
@@ -352,7 +414,66 @@ export class OrchestrationService {
         };
       }
     }
-    return this.observeBounded(attempt.id);
+    const existing = await this.exactExecutionForAttempt(attempt.id);
+    if (existing) {
+      if (attempt.executionRole === 'reviewer') {
+        try {
+          parseReviewerResult(existing.resultText);
+        } catch (error) {
+          await this.resolveAttempt(
+            attempt,
+            existing.evidence,
+            'failed',
+            undefined,
+            `Reviewer returned malformed structured output: ${message(error)}`,
+          );
+          return {
+            status: 'escalate',
+            reason: 'reviewer_uncertain',
+            summary: `Reviewer output was not a valid decision contract: ${message(error)}`,
+          };
+        }
+      }
+      await this.resolveAttempt(
+        attempt,
+        existing.evidence,
+        'completed',
+        attempt.executionRole === 'worker'
+          ? 'Worker execution completed with a bounded exact result. Semantic acceptance remains with review.'
+          : 'Reviewer execution completed with a bounded exact result.',
+      );
+      return { status: 'completed', execution: existing };
+    }
+    const observed = await this.observeBounded(attempt.id);
+    if (observed.status === 'completed') {
+      if (attempt.executionRole === 'reviewer') {
+        try {
+          parseReviewerResult(observed.execution.resultText);
+        } catch (error) {
+          await this.resolveAttempt(
+            attempt,
+            observed.execution.evidence,
+            'failed',
+            undefined,
+            `Reviewer returned malformed structured output: ${message(error)}`,
+          );
+          return {
+            status: 'escalate',
+            reason: 'reviewer_uncertain',
+            summary: `Reviewer output was not a valid decision contract: ${message(error)}`,
+          };
+        }
+      }
+      await this.resolveAttempt(
+        attempt,
+        observed.execution.evidence,
+        'completed',
+        attempt.executionRole === 'worker'
+          ? 'Worker execution completed with a bounded exact result. Semantic acceptance remains with review.'
+          : 'Reviewer execution completed with a bounded exact result.',
+      );
+    }
+    return observed;
   }
 
   private async resolveDispatchFailure(
@@ -467,20 +588,79 @@ export class OrchestrationService {
     reason?: string,
   ): Promise<void> {
     const dispatch = await this.requireAcceptedDispatch(attempt.id);
-    await this.store.createAttemptOutcomeDecision({
-      id: this.outcomeDecisionIdFactory(),
-      attemptId: attempt.id,
-      dispatchId: dispatch.id,
-      outcome,
-      source: 'runtime-evidence',
-      ...(outcome === 'completed' ? { summary: required(summary, 'Outcome summary') }
-        : { reason: required(reason, 'Outcome reason') }),
-      evidenceObservationId: evidence.id,
-      overrideWithoutExactCompletionEvidence: false,
-      createdAt: this.now().toISOString(),
-    });
-    if (outcome === 'completed') await this.lifecycle.completeAttempt(attempt.id, summary);
-    else await this.lifecycle.failAttempt(attempt.id, reason!);
+    const existing = await this.store.getAttemptOutcomeDecision(attempt.id);
+    if (existing) {
+      if (existing.outcome !== outcome || existing.dispatchId !== dispatch.id
+        || existing.evidenceObservationId !== evidence.id) {
+        throw new Error(`Attempt ${attempt.id} already has a conflicting Outcome Decision`);
+      }
+    } else {
+      await this.store.createAttemptOutcomeDecision({
+        id: this.outcomeDecisionIdFactory(),
+        attemptId: attempt.id,
+        dispatchId: dispatch.id,
+        outcome,
+        source: 'runtime-evidence',
+        ...(outcome === 'completed' ? { summary: required(summary, 'Outcome summary') }
+          : { reason: required(reason, 'Outcome reason') }),
+        evidenceObservationId: evidence.id,
+        overrideWithoutExactCompletionEvidence: false,
+        createdAt: this.now().toISOString(),
+      });
+    }
+    const current = await this.store.getAttempt(attempt.id);
+    if (!current) throw new Error(`Attempt not found: ${attempt.id}`);
+    if (current.status === 'running') {
+      if (outcome === 'completed') await this.lifecycle.completeAttempt(attempt.id, summary);
+      else await this.lifecycle.failAttempt(attempt.id, reason!);
+      return;
+    }
+    if (current.status !== outcome) {
+      throw new Error(`Attempt ${attempt.id} is ${current.status}, conflicting with ${outcome} outcome`);
+    }
+  }
+
+  private async exactExecutionForAttempt(attemptId: string): Promise<ExactExecutionResult | null> {
+    const plan = await this.store.getExecutionPlanForAttempt(attemptId);
+    if (!plan) return null;
+    const dispatch = await this.store.getExecutionDispatchForPlan(plan.id);
+    if (!dispatch || dispatch.status !== 'accepted') return null;
+    const observations = await this.store.listExecutionObservationsForDispatch(dispatch.id);
+    const evidence = observations.find(isExactCompletionObservation);
+    if (!evidence?.resultText) return null;
+    const attempt = await this.store.getAttempt(attemptId);
+    const job = attempt ? await this.store.getJob(attempt.jobId) : null;
+    if (!attempt || !job) return null;
+    const outcomeDecision = await this.store.getAttemptOutcomeDecision(attempt.id);
+    return {
+      detail: {
+        job,
+        attempt,
+        plan,
+        dispatch,
+        observations,
+        outcomeDecision,
+        state: outcomeDecision ? 'resolved' : 'completion-evidence',
+        exactCompletionEvidence: true,
+        outcome: outcomeDecision?.outcome ?? 'awaiting-confirmation',
+      },
+      evidence,
+      resultText: evidence.resultText,
+    };
+  }
+
+  private async guidanceFor(
+    jobId: string,
+    attemptId: string,
+    reviewId?: string,
+  ): Promise<string | undefined> {
+    const escalations = await this.store.listEscalations(jobId);
+    const guidance = await this.store.listHumanGuidance(jobId);
+    return [...guidance].reverse().find(item => {
+      const escalation = escalations.find(candidate => candidate.id === item.escalationId);
+      return escalation?.attemptId === attemptId
+        && (!reviewId || escalation.reviewId === reviewId);
+    })?.instruction;
   }
 
   private async escalate(
@@ -529,6 +709,26 @@ export class OrchestrationService {
     }
     if ((await this.store.listEscalations(job.id, true)).length > 0) {
       findings.push('Job already has an unresolved Escalation');
+    }
+    return findings;
+  }
+
+  private async continuationEligibilityFindings(
+    job: DurableJob,
+    workerRuntimeAgentId: string | null,
+    reviewerRuntimeAgentId: string | null,
+  ): Promise<string[]> {
+    const findings: string[] = [];
+    if (job.status !== 'ready') findings.push(`Job status is ${job.status}, not ready`);
+    if (!job.repositoryId) findings.push('Job is not repository-bound');
+    if (!job.acceptanceCriteria?.trim()) findings.push('Acceptance criteria are missing');
+    if (job.automaticReadOnlyCompletion !== true) findings.push('Automatic read-only completion is not enabled');
+    const runtimeIds = await this.store.listProjectRuntimeAgentIds(job.projectId);
+    if (!workerRuntimeAgentId || !runtimeIds.includes(workerRuntimeAgentId)) {
+      findings.push('Worker runtime is not configured for the Project');
+    }
+    if (!reviewerRuntimeAgentId || !runtimeIds.includes(reviewerRuntimeAgentId)) {
+      findings.push('Reviewer runtime is not configured for the Project');
     }
     return findings;
   }
@@ -615,11 +815,15 @@ function buildWorkerInstruction(
   workerAttemptNumber: number,
   previousResult?: string,
   reviewerFeedback?: string,
+  humanGuidance?: string,
 ): string {
   const revision = previousResult && reviewerFeedback
     ? `\nThis is Worker Attempt ${workerAttemptNumber}. Correct the previous result using the concrete Reviewer feedback.\n<previous_worker_result>\n${previousResult}\n</previous_worker_result>\n<reviewer_feedback>\n${reviewerFeedback}\n</reviewer_feedback>`
     : `\nThis is Worker Attempt ${workerAttemptNumber}.`;
-  return `Perform this repository-bound read-only Job using only repository.list, repository.read, and repository.search. Do not use shell, Git, network, apps, plugins, skills, MCP, or write tools.\n\nJob title: ${job.title}\nJob description: ${job.description ?? job.title}\nAcceptance criteria:\n${job.acceptanceCriteria}\nRepository: ${job.repositoryId}${revision}\n\nReturn only the bounded final answer for review.`;
+  const guidance = humanGuidance
+    ? `\nApply this bounded operator guidance in this new Attempt only:\n<human_guidance>\n${humanGuidance}\n</human_guidance>`
+    : '';
+  return `Perform this repository-bound read-only Job using only repository.list, repository.read, and repository.search. Do not use shell, Git, network, apps, plugins, skills, MCP, or write tools.\n\nJob title: ${job.title}\nJob description: ${job.description ?? job.title}\nAcceptance criteria:\n${job.acceptanceCriteria}\nRepository: ${job.repositoryId}${revision}${guidance}\n\nReturn only the bounded final answer for review.`;
 }
 
 function buildReviewerInstruction(

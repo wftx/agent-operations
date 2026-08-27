@@ -23,6 +23,11 @@ import type {
 } from '../observation.js';
 import { isBoundedExecutionResult } from '../observation.js';
 import type { DurableAttemptReview, DurableEscalation } from '../orchestration.js';
+import type {
+  DurableHumanGuidance,
+  DurableOperatorNotificationDelivery,
+  DurableOperatorRun,
+} from '../operator.js';
 
 export type InMemoryStateStoreOperation =
   | 'get-installation'
@@ -38,6 +43,9 @@ export type InMemoryStateStoreOperation =
   | 'write-attempt-outcome'
   | 'write-attempt-review'
   | 'write-escalation'
+  | 'write-operator-run'
+  | 'write-human-guidance'
+  | 'write-operator-notification'
   | 'close';
 
 export interface InMemoryAgentOperationsStateStoreOptions {
@@ -116,6 +124,20 @@ function copyEscalation(value: DurableEscalation): DurableEscalation {
   return { ...value };
 }
 
+function copyOperatorRun(value: DurableOperatorRun): DurableOperatorRun {
+  return { ...value };
+}
+
+function copyHumanGuidance(value: DurableHumanGuidance): DurableHumanGuidance {
+  return { ...value };
+}
+
+function copyOperatorNotificationDelivery(
+  value: DurableOperatorNotificationDelivery,
+): DurableOperatorNotificationDelivery {
+  return { ...value };
+}
+
 function isValidDispatchTransition(from: string, to: string): boolean {
   return from === 'prepared' && to === 'submitting'
     || from === 'submitting' && (to === 'accepted' || to === 'rejected' || to === 'uncertain');
@@ -173,6 +195,9 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   private readonly attemptOutcomeDecisions = new Map<string, DurableAttemptOutcomeDecision>();
   private readonly attemptReviews = new Map<string, DurableAttemptReview>();
   private readonly escalations = new Map<string, DurableEscalation>();
+  private readonly operatorRuns = new Map<string, DurableOperatorRun>();
+  private readonly humanGuidance = new Map<string, DurableHumanGuidance>();
+  private readonly operatorNotificationDeliveries = new Map<string, DurableOperatorNotificationDelivery>();
   private closed = false;
 
   constructor(options: InMemoryAgentOperationsStateStoreOptions = {}) {
@@ -760,6 +785,164 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
       .map(copyEscalation);
   }
 
+  async resolveEscalation(id: string, resolvedAt: string): Promise<DurableEscalation> {
+    this.assertAvailable('write-escalation');
+    const escalation = this.escalations.get(id);
+    if (!escalation) throw new Error(`Escalation not found: ${id}`);
+    if (!resolvedAt.trim()) throw new Error('Escalation resolution timestamp is required');
+    if (escalation.resolvedAt && escalation.resolvedAt !== resolvedAt) {
+      throw new Error(`Escalation ${id} is already resolved`);
+    }
+    const resolved = { ...escalation, resolvedAt };
+    this.escalations.set(id, resolved);
+    return copyEscalation(resolved);
+  }
+
+  async createOperatorRun(run: DurableOperatorRun): Promise<void> {
+    this.assertAvailable('write-operator-run');
+    requireNonEmpty(run.id, 'Operator Run ID');
+    if (!run.id.startsWith('operator-run:') || !this.jobs.has(run.jobId)) {
+      throw new Error(`Invalid Operator Run: ${run.id}`);
+    }
+    if (run.revision !== 0 || run.status !== 'pending') {
+      throw new Error('New Operator Run must be pending at revision 0');
+    }
+    if (this.operatorRuns.has(run.id)
+      || [...this.operatorRuns.values()].some(candidate => candidate.jobId === run.jobId)) {
+      throw new Error(`Duplicate Operator Run: ${run.id}`);
+    }
+    this.operatorRuns.set(run.id, copyOperatorRun(run));
+  }
+
+  async getOperatorRun(id: string): Promise<DurableOperatorRun | null> {
+    this.assertAvailable('read');
+    const value = this.operatorRuns.get(id);
+    return value ? copyOperatorRun(value) : null;
+  }
+
+  async getOperatorRunForJob(jobId: string): Promise<DurableOperatorRun | null> {
+    this.assertAvailable('read');
+    const value = [...this.operatorRuns.values()].find(run => run.jobId === jobId);
+    return value ? copyOperatorRun(value) : null;
+  }
+
+  async listOperatorRuns(): Promise<readonly DurableOperatorRun[]> {
+    this.assertAvailable('read');
+    return [...this.operatorRuns.values()]
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map(copyOperatorRun);
+  }
+
+  async saveOperatorRunTransition(run: DurableOperatorRun, expectedRevision: number): Promise<void> {
+    this.assertAvailable('write-operator-run');
+    const existing = this.operatorRuns.get(run.id);
+    if (!existing || existing.revision !== expectedRevision || run.revision !== expectedRevision + 1) {
+      throw new Error(`Operator Run transition conflict: ${run.id}`);
+    }
+    if (existing.jobId !== run.jobId || !isValidOperatorRunTransition(existing.status, run.status)) {
+      throw new Error(`Invalid Operator Run transition: ${existing.status} -> ${run.status}`);
+    }
+    this.operatorRuns.set(run.id, copyOperatorRun(run));
+  }
+
+  async createHumanGuidanceAndResolveEscalation(
+    guidance: DurableHumanGuidance,
+    resolvedAt: string,
+  ): Promise<void> {
+    this.assertAvailable('write-human-guidance');
+    const escalation = this.escalations.get(guidance.escalationId);
+    requireNonEmpty(guidance.instruction, 'Human Guidance instruction');
+    if (!guidance.id.startsWith('guidance:') || !escalation
+      || escalation.jobId !== guidance.jobId || escalation.resolvedAt) {
+      throw new Error(`Invalid Human Guidance association: ${guidance.id}`);
+    }
+    if ([...this.humanGuidance.values()].some(value => value.escalationId === guidance.escalationId)) {
+      throw new Error(`Escalation already has Human Guidance: ${guidance.escalationId}`);
+    }
+    this.humanGuidance.set(guidance.id, copyHumanGuidance(guidance));
+    this.escalations.set(escalation.id, { ...escalation, resolvedAt });
+  }
+
+  async createHumanGuidanceAndResumeOperatorRun(
+    guidance: DurableHumanGuidance,
+    resolvedAt: string,
+    run: DurableOperatorRun,
+    expectedRunRevision: number,
+  ): Promise<void> {
+    this.assertAvailable('write-human-guidance');
+    const escalation = this.escalations.get(guidance.escalationId);
+    const existingRun = this.operatorRuns.get(run.id);
+    requireNonEmpty(guidance.instruction, 'Human Guidance instruction');
+    if (!guidance.id.startsWith('guidance:') || !escalation
+      || escalation.jobId !== guidance.jobId || escalation.resolvedAt
+      || [...this.humanGuidance.values()].some(value => value.escalationId === guidance.escalationId)) {
+      throw new Error(`Invalid Human Guidance association: ${guidance.id}`);
+    }
+    if (!existingRun || existingRun.jobId !== guidance.jobId
+      || existingRun.revision !== expectedRunRevision || run.revision !== expectedRunRevision + 1
+      || !isValidOperatorRunTransition(existingRun.status, run.status)) {
+      throw new Error(`Operator Run transition conflict: ${run.id}`);
+    }
+    this.humanGuidance.set(guidance.id, copyHumanGuidance(guidance));
+    this.escalations.set(escalation.id, { ...escalation, resolvedAt });
+    this.operatorRuns.set(run.id, copyOperatorRun(run));
+  }
+
+  async listHumanGuidance(jobId: string): Promise<readonly DurableHumanGuidance[]> {
+    this.assertAvailable('read');
+    return [...this.humanGuidance.values()]
+      .filter(value => value.jobId === jobId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map(copyHumanGuidance);
+  }
+
+  async createOperatorNotificationDelivery(
+    delivery: DurableOperatorNotificationDelivery,
+  ): Promise<boolean> {
+    this.assertAvailable('write-operator-notification');
+    if (!delivery.id.startsWith('notification-delivery:') || !this.jobs.has(delivery.jobId)
+      || delivery.status !== 'pending' || delivery.revision !== 0) {
+      throw new Error(`Invalid Operator Notification Delivery: ${delivery.id}`);
+    }
+    if ([...this.operatorNotificationDeliveries.values()]
+      .some(value => value.eventKey === delivery.eventKey)) return false;
+    this.operatorNotificationDeliveries.set(delivery.id, copyOperatorNotificationDelivery(delivery));
+    return true;
+  }
+
+  async getOperatorNotificationDeliveryByEventKey(
+    eventKey: string,
+  ): Promise<DurableOperatorNotificationDelivery | null> {
+    this.assertAvailable('read');
+    const value = [...this.operatorNotificationDeliveries.values()]
+      .find(delivery => delivery.eventKey === eventKey);
+    return value ? copyOperatorNotificationDelivery(value) : null;
+  }
+
+  async listOperatorNotificationDeliveries(
+    jobId?: string,
+  ): Promise<readonly DurableOperatorNotificationDelivery[]> {
+    this.assertAvailable('read');
+    return [...this.operatorNotificationDeliveries.values()]
+      .filter(value => !jobId || value.jobId === jobId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map(copyOperatorNotificationDelivery);
+  }
+
+  async saveOperatorNotificationDeliveryTransition(
+    delivery: DurableOperatorNotificationDelivery,
+    expectedRevision: number,
+  ): Promise<void> {
+    this.assertAvailable('write-operator-notification');
+    const existing = this.operatorNotificationDeliveries.get(delivery.id);
+    if (!existing || existing.revision !== expectedRevision || delivery.revision !== expectedRevision + 1
+      || existing.status !== 'pending' || delivery.status === 'pending'
+      || existing.eventKey !== delivery.eventKey) {
+      throw new Error(`Operator Notification transition conflict: ${delivery.id}`);
+    }
+    this.operatorNotificationDeliveries.set(delivery.id, copyOperatorNotificationDelivery(delivery));
+  }
+
   async close(): Promise<void> {
     this.assertAvailable('close');
     this.closed = true;
@@ -769,4 +952,10 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     if (this.closed) throw new Error('Agent Operations state store is closed');
     if (this.failOperations.has(operation)) throw new Error(`Simulated persistence failure: ${operation}`);
   }
+}
+
+function isValidOperatorRunTransition(from: string, to: string): boolean {
+  return from === 'pending' && (to === 'running' || to === 'failed')
+    || from === 'running' && ['completed', 'needs_human', 'failed'].includes(to)
+    || from === 'needs_human' && (to === 'pending' || to === 'cancelled');
 }

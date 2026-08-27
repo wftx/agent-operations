@@ -2,8 +2,11 @@ import type {
   AttemptReviewDecision,
   DurableAttemptReview,
   DurableEscalation,
+  DurableHumanGuidance,
   DurableJob,
   DurableJobAttempt,
+  DurableOperatorNotificationDelivery,
+  DurableOperatorRun,
   DurableProject,
   DurableRepository,
   ExecutionRole,
@@ -44,7 +47,7 @@ export interface OperatorTaskPreview {
   readonly executionAuthorized: false;
 }
 
-export type OperatorRunStatus = 'running' | 'done' | 'needs-human' | 'failed';
+export type OperatorRunStatus = 'pending' | 'running' | 'done' | 'needs-human' | 'failed' | 'cancelled';
 
 export interface OperatorRunSession {
   readonly jobId: string;
@@ -64,7 +67,34 @@ export interface OperatorJobSummary {
   readonly workerAttemptCount: number;
   readonly latestReviewDecision: AttemptReviewDecision | null;
   readonly needsHuman: boolean;
+  readonly operatorRun: DurableOperatorRun | null;
+  readonly currentStage: OperatorExecutionStage;
+  readonly startedAt?: string;
+  readonly finishedAt?: string;
+  readonly durationMs?: number;
 }
+
+export type OperatorExecutionStage =
+  | 'Accepted'
+  | 'Preparing Worker'
+  | 'Executing Worker'
+  | 'Capturing Worker Result'
+  | 'Preparing Reviewer'
+  | 'Executing Reviewer'
+  | 'Capturing Review'
+  | 'Preparing Revision'
+  | 'Needs Me'
+  | 'Completed'
+  | 'Cancelled'
+  | 'Failed';
+
+export interface OperatorRuntimeStatus {
+  readonly state: 'ready' | 'offline' | 'degraded';
+  readonly label: string;
+  readonly reason?: string;
+}
+
+export type OperatorEscalationAction = 'provide-guidance' | 'cancel-job';
 
 export interface OperatorAttemptStory {
   readonly attempt: DurableJobAttempt;
@@ -82,6 +112,9 @@ export interface OperatorJobDetail {
   readonly reviewerAttempts: readonly OperatorAttemptStory[];
   readonly reviews: readonly DurableAttemptReview[];
   readonly escalations: readonly DurableEscalation[];
+  readonly guidance: readonly DurableHumanGuidance[];
+  readonly notificationDeliveries: readonly DurableOperatorNotificationDelivery[];
+  readonly escalationActions: Readonly<Record<string, readonly OperatorEscalationAction[]>>;
   readonly finalWorkerResult?: string;
   readonly finalReview?: DurableAttemptReview;
   readonly completedAt?: string;
@@ -90,10 +123,14 @@ export interface OperatorJobDetail {
 export type OperatorJobList = 'all' | 'running' | 'needs-human' | 'done';
 
 export interface OperatorApplication {
+  startRunner(): void;
   listProjects(): Promise<readonly OperatorProjectOption[]>;
+  getRuntimeStatus(): Promise<OperatorRuntimeStatus>;
   previewTask(input: OperatorTaskInput): Promise<OperatorTaskPreview>;
   runOperatorJob(input: OperatorTaskInput): Promise<OperatorRunSession>;
   waitForRun(jobId: string): Promise<OperatorRunSession>;
+  provideGuidanceAndContinue(escalationId: string, instruction: string): Promise<OperatorRunSession>;
+  cancelEscalatedJob(escalationId: string): Promise<OperatorRunSession>;
   listJobs(filter?: OperatorJobList): Promise<readonly OperatorJobSummary[]>;
   getJobDetail(jobId: string): Promise<OperatorJobDetail>;
 }

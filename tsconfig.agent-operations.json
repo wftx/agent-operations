@@ -21,6 +21,7 @@
     "scripts/orchestrate.ts",
     "scripts/operator.ts",
     "apps/ao-web/**/*.ts",
+    "packages/telegram-notification-adapter/**/*.ts",
     "tests/architecture/agent-operations-boundary.test.ts"
   ],
   "exclude": ["node_modules", "dist", "dashboard"]

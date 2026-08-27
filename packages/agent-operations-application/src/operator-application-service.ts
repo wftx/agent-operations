@@ -1,12 +1,15 @@
 import type {
   AgentOperationsStateStore,
+  AgentRuntimeAdapter,
   DurableJob,
   DurableJobAttempt,
+  DurableOperatorRun,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   REPOSITORY_READ_EXECUTION_CAPABILITIES,
   RESTRICTED_TEXT_EXECUTION_POLICY,
-  createEscalationId,
+  createHumanGuidanceId,
+  createOperatorRunId,
   isActiveAttemptStatus,
   isExactCompletionObservation,
 } from '../../agent-operations-contracts/src/index.js';
@@ -16,14 +19,19 @@ import {
   type OrchestrationPreview,
   type OrchestrationReadModel,
 } from '../../agent-operations-core/src/index.js';
+import type { OperatorNotifier } from './notification.js';
+import { OperatorRunner } from './operator-runner.js';
 import type {
   OperatorApplication,
   OperatorAttemptStory,
+  OperatorEscalationAction,
+  OperatorExecutionStage,
   OperatorJobDetail,
   OperatorJobList,
   OperatorJobSummary,
   OperatorPolicyDefaults,
   OperatorProjectOption,
+  OperatorRuntimeStatus,
   OperatorRunSession,
   OperatorTaskInput,
   OperatorTaskPreview,
@@ -36,6 +44,10 @@ export interface OperatorOrchestrationPort {
 
 export interface OperatorApplicationServiceOptions {
   readonly now?: () => Date;
+  readonly runtime?: AgentRuntimeAdapter;
+  readonly notifier?: OperatorNotifier;
+  readonly operatorRunIdFactory?: () => string;
+  readonly humanGuidanceIdFactory?: () => string;
 }
 
 export const OPERATOR_READ_ONLY_DEFAULTS: OperatorPolicyDefaults = {
@@ -53,10 +65,11 @@ export const OPERATOR_READ_ONLY_DEFAULTS: OperatorPolicyDefaults = {
 export class OperatorApplicationService implements OperatorApplication {
   private readonly lifecycle: JobLifecycleService;
   private readonly now: () => Date;
-  private activeJobId?: string;
   private runReserved = false;
-  private readonly sessions = new Map<string, OperatorRunSession>();
-  private readonly runPromises = new Map<string, Promise<OperatorRunSession>>();
+  private readonly runner: OperatorRunner;
+  private readonly runtime?: AgentRuntimeAdapter;
+  private readonly operatorRunIdFactory: () => string;
+  private readonly humanGuidanceIdFactory: () => string;
 
   constructor(
     private readonly store: AgentOperationsStateStore,
@@ -65,6 +78,40 @@ export class OperatorApplicationService implements OperatorApplication {
   ) {
     this.now = options.now ?? (() => new Date());
     this.lifecycle = new JobLifecycleService(store, { now: this.now });
+    this.runtime = options.runtime;
+    this.operatorRunIdFactory = options.operatorRunIdFactory ?? (() => createOperatorRunId());
+    this.humanGuidanceIdFactory = options.humanGuidanceIdFactory ?? (() => createHumanGuidanceId());
+    this.runner = new OperatorRunner(store, orchestration, {
+      now: this.now,
+      ...(options.notifier ? { notifier: options.notifier } : {}),
+    });
+  }
+
+  startRunner(): void {
+    this.runner.start();
+  }
+
+  async getRuntimeStatus(): Promise<OperatorRuntimeStatus> {
+    if (!this.runtime) {
+      return { state: 'offline', label: 'Offline', reason: 'Runtime inventory is not configured.' };
+    }
+    try {
+      const health = await this.runtime.getHealth();
+      const agents = await this.runtime.listAgents();
+      const ready = agents.some(agent => agent.configured && agent.enabled !== false
+        && agent.health.state === 'running');
+      if (health.state === 'available' && ready) return { state: 'ready', label: 'Ready' };
+      if (health.state === 'unavailable') {
+        return { state: 'offline', label: 'Offline', ...(health.reason ? { reason: health.reason } : {}) };
+      }
+      return {
+        state: 'degraded',
+        label: 'Needs attention',
+        reason: health.reason ?? 'No configured runtime is currently running.',
+      };
+    } catch (error) {
+      return { state: 'offline', label: 'Offline', reason: errorMessage(error) };
+    }
   }
 
   async listProjects(): Promise<readonly OperatorProjectOption[]> {
@@ -116,9 +163,11 @@ export class OperatorApplicationService implements OperatorApplication {
   }
 
   async runOperatorJob(input: OperatorTaskInput): Promise<OperatorRunSession> {
-    if (this.runReserved || this.activeJobId) {
-      throw new Error(this.activeJobId
-        ? `Operator orchestration is already running for Job ${this.activeJobId}`
+    const active = (await this.store.listOperatorRuns())
+      .find(run => run.status === 'pending' || run.status === 'running');
+    if (this.runReserved || active) {
+      throw new Error(active
+        ? `Operator orchestration is already running for Job ${active.jobId}`
         : 'Operator orchestration is already starting');
     }
     this.runReserved = true;
@@ -134,25 +183,91 @@ export class OperatorApplicationService implements OperatorApplication {
         automaticReadOnlyCompletion: true,
       });
       const job = await this.lifecycle.markJobReady(created.id);
-      const startedAt = this.now().toISOString();
-      const session: OperatorRunSession = { jobId: job.id, status: 'running', startedAt };
-      this.activeJobId = job.id;
-      this.sessions.set(job.id, session);
-      const promise = this.execute(job, session);
-      this.runPromises.set(job.id, promise);
-      void promise.catch(() => undefined);
-      return session;
+      const createdAt = this.now().toISOString();
+      await this.store.createOperatorRun({
+        id: this.operatorRunIdFactory(),
+        jobId: job.id,
+        status: 'pending',
+        revision: 0,
+        createdAt,
+        updatedAt: createdAt,
+      });
+      void this.runner.wake();
+      return { jobId: job.id, status: 'pending', startedAt: createdAt };
     } finally {
       this.runReserved = false;
     }
   }
 
   async waitForRun(jobId: string): Promise<OperatorRunSession> {
-    const promise = this.runPromises.get(required(jobId, 'Job ID'));
-    if (promise) return promise;
-    const session = this.sessions.get(jobId);
-    if (session) return session;
-    throw new Error(`Operator run session not found: ${jobId}`);
+    return toRunSession(await this.runner.waitForRun(required(jobId, 'Job ID')));
+  }
+
+  async provideGuidanceAndContinue(
+    escalationId: string,
+    instruction: string,
+  ): Promise<OperatorRunSession> {
+    const escalation = await this.requireUnresolvedEscalation(escalationId);
+    if (!['human_judgment_required', 'reviewer_uncertain'].includes(escalation.reason)) {
+      throw new Error(`Escalation ${escalation.id} does not permit guided continuation`);
+    }
+    const bounded = boundedRequired(instruction, 'Guidance', 4_096);
+    const attempts = await this.store.listAttemptsForJob(escalation.jobId);
+    if (attempts.some(attempt => isActiveAttemptStatus(attempt.status))) {
+      throw new Error('Guided continuation requires no active Attempt');
+    }
+    if (attempts.filter(attempt => attempt.executionRole === 'worker').length >= MVP_MAX_WORKER_ATTEMPTS) {
+      throw new Error(`Worker Attempt budget of ${MVP_MAX_WORKER_ATTEMPTS} is exhausted`);
+    }
+    if (await this.hasUncertainDispatch(attempts)) {
+      throw new Error('Guided continuation is forbidden while a Dispatch is uncertain');
+    }
+    const timestamp = this.now().toISOString();
+    const run = await this.requireOperatorRun(escalation.jobId);
+    if (run.status !== 'needs_human') throw new Error(`Operator Run ${run.id} is ${run.status}`);
+    const pending: DurableOperatorRun = {
+      ...run,
+      status: 'pending',
+      failureMessage: undefined,
+      revision: run.revision + 1,
+      updatedAt: timestamp,
+      startedAt: undefined,
+      finishedAt: undefined,
+    };
+    await this.store.createHumanGuidanceAndResumeOperatorRun({
+      id: this.humanGuidanceIdFactory(),
+      jobId: escalation.jobId,
+      escalationId: escalation.id,
+      instruction: bounded,
+      createdAt: timestamp,
+    }, timestamp, pending, run.revision);
+    void this.runner.wake();
+    return toRunSession(pending);
+  }
+
+  async cancelEscalatedJob(escalationId: string): Promise<OperatorRunSession> {
+    const escalation = await this.requireUnresolvedEscalation(escalationId);
+    const attempts = await this.store.listAttemptsForJob(escalation.jobId);
+    if (attempts.some(attempt => isActiveAttemptStatus(attempt.status))) {
+      throw new Error('Job cannot be cancelled while an Attempt may still be executing');
+    }
+    if (await this.hasUncertainDispatch(attempts)) {
+      throw new Error('Job cannot be cancelled while a Dispatch is uncertain');
+    }
+    await this.lifecycle.cancelJob(escalation.jobId);
+    const timestamp = this.now().toISOString();
+    await this.store.resolveEscalation(escalation.id, timestamp);
+    const run = await this.requireOperatorRun(escalation.jobId);
+    if (run.status !== 'needs_human') throw new Error(`Operator Run ${run.id} is ${run.status}`);
+    const cancelled: DurableOperatorRun = {
+      ...run,
+      status: 'cancelled',
+      revision: run.revision + 1,
+      updatedAt: timestamp,
+      finishedAt: timestamp,
+    };
+    await this.store.saveOperatorRunTransition(cancelled, run.revision);
+    return toRunSession(cancelled);
   }
 
   async listJobs(filter: OperatorJobList = 'all'): Promise<readonly OperatorJobSummary[]> {
@@ -170,6 +285,8 @@ export class OperatorApplicationService implements OperatorApplication {
     const attempts = await this.store.listAttemptsForJob(job.id);
     const reviews = await this.store.listAttemptReviewsForJob(job.id);
     const escalations = await this.store.listEscalations(job.id);
+    const guidance = await this.store.listHumanGuidance(job.id);
+    const notificationDeliveries = await this.store.listOperatorNotificationDeliveries(job.id);
     const stories = await Promise.all(attempts.map(attempt => this.buildAttemptStory(attempt)));
     const workerAttempts = stories
       .filter(story => story.attempt.executionRole === 'worker')
@@ -189,63 +306,16 @@ export class OperatorApplicationService implements OperatorApplication {
       reviewerAttempts,
       reviews,
       escalations,
+      guidance,
+      notificationDeliveries,
+      escalationActions: Object.fromEntries(await Promise.all(escalations.map(async escalation => [
+        escalation.id,
+        await this.actionsForEscalation(escalation, attempts),
+      ]))),
       ...(finalWorkerResult ? { finalWorkerResult } : {}),
       ...(finalReview ? { finalReview } : {}),
       ...(job.status === 'completed' ? { completedAt: job.updatedAt } : {}),
     };
-  }
-
-  private async execute(job: DurableJob, initial: OperatorRunSession): Promise<OperatorRunSession> {
-    try {
-      const preview = await this.orchestration.preview(job.id);
-      if (!preview.eligible) {
-        throw new Error(`Orchestration preflight failed: ${preview.findings.join('; ')}`);
-      }
-      const result = await this.orchestration.runJob(job.id);
-      const status = result.needsHuman || result.finalDecision === 'ESCALATED' ? 'needs-human' : 'done';
-      const completed: OperatorRunSession = {
-        ...initial,
-        status,
-        finishedAt: this.now().toISOString(),
-        message: status === 'done'
-          ? 'Worker result passed independent review.'
-          : 'Agent Operations stopped at a durable Needs Me boundary.',
-      };
-      this.sessions.set(job.id, completed);
-      return completed;
-    } catch (error) {
-      const message = errorMessage(error);
-      try {
-        if ((await this.store.listEscalations(job.id, true)).length === 0) {
-          await this.store.createEscalation({
-            id: createEscalationId(),
-            jobId: job.id,
-            reason: 'runtime_failure',
-            summary: `Operator orchestration stopped unexpectedly: ${message}`,
-            createdAt: this.now().toISOString(),
-          });
-        }
-        const escalated: OperatorRunSession = {
-          ...initial,
-          status: 'needs-human',
-          finishedAt: this.now().toISOString(),
-          message,
-        };
-        this.sessions.set(job.id, escalated);
-        return escalated;
-      } catch (persistenceError) {
-        const failed: OperatorRunSession = {
-          ...initial,
-          status: 'failed',
-          finishedAt: this.now().toISOString(),
-          message: `${message}; durable escalation failed: ${errorMessage(persistenceError)}`,
-        };
-        this.sessions.set(job.id, failed);
-        throw new Error(failed.message);
-      }
-    } finally {
-      if (this.activeJobId === job.id) this.activeJobId = undefined;
-    }
   }
 
   private async buildSummary(job: DurableJob): Promise<OperatorJobSummary> {
@@ -256,19 +326,26 @@ export class OperatorApplicationService implements OperatorApplication {
     const unresolved = await this.store.listEscalations(job.id, true);
     const latestAttempt = attempts.at(-1) ?? null;
     const activeAttempt = [...attempts].reverse().find(attempt => isActiveAttemptStatus(attempt.status));
-    const session = this.sessions.get(job.id);
-    const currentRole = activeAttempt?.executionRole
-      ?? (session?.status === 'running' ? latestAttempt?.executionRole ?? 'worker' : null);
+    const operatorRun = await this.store.getOperatorRunForJob(job.id);
+    const currentRole = activeAttempt?.executionRole ?? null;
+    const currentStage = await this.deriveStage(job, attempts, reviews, unresolved.length > 0, operatorRun);
+    const startedAt = operatorRun?.startedAt;
+    const finishedAt = operatorRun?.finishedAt;
     return {
       job,
       projectName: project?.name ?? job.projectId,
       repositoryName: repository?.name ?? job.repositoryId ?? 'No repository',
       latestAttempt,
       currentRole,
-      orchestrationState: orchestrationState(job, activeAttempt, session, unresolved.length > 0),
+      orchestrationState: currentStage,
       workerAttemptCount: attempts.filter(attempt => attempt.executionRole === 'worker').length,
       latestReviewDecision: reviews.at(-1)?.decision ?? null,
       needsHuman: unresolved.length > 0,
+      operatorRun,
+      currentStage,
+      ...(startedAt ? { startedAt } : {}),
+      ...(finishedAt ? { finishedAt } : {}),
+      ...(startedAt ? { durationMs: Math.max(0, new Date(finishedAt ?? this.now()).getTime() - new Date(startedAt).getTime()) } : {}),
     };
   }
 
@@ -286,8 +363,94 @@ export class OperatorApplicationService implements OperatorApplication {
       ...(dispatch ? { dispatchId: dispatch.id } : {}),
       ...(exact?.externalReference ?? dispatch?.externalReference
         ? { externalReference: exact?.externalReference ?? dispatch!.externalReference! }
-        : {}),
+      : {}),
     };
+  }
+
+  private async deriveStage(
+    job: DurableJob,
+    attempts: readonly DurableJobAttempt[],
+    reviews: readonly { readonly decision: string; readonly workerAttemptId: string }[],
+    needsHuman: boolean,
+    run: DurableOperatorRun | null,
+  ): Promise<OperatorExecutionStage> {
+    if (needsHuman || run?.status === 'needs_human') return 'Needs Me';
+    if (job.status === 'completed' || run?.status === 'completed') return 'Completed';
+    if (job.status === 'cancelled' || run?.status === 'cancelled') return 'Cancelled';
+    if (run?.status === 'failed') return 'Failed';
+    if (run?.status === 'pending') return 'Accepted';
+    const active = [...attempts].reverse().find(attempt => isActiveAttemptStatus(attempt.status));
+    if (active) {
+      const plan = await this.store.getExecutionPlanForAttempt(active.id);
+      if (!plan) {
+        return active.executionRole === 'reviewer'
+          ? 'Preparing Reviewer'
+          : active.roleSequence > 1 ? 'Preparing Revision' : 'Preparing Worker';
+      }
+      const dispatch = await this.store.getExecutionDispatchForPlan(plan.id);
+      if (!dispatch || dispatch.status === 'prepared') {
+        return active.executionRole === 'reviewer'
+          ? 'Preparing Reviewer'
+          : active.roleSequence > 1 ? 'Preparing Revision' : 'Preparing Worker';
+      }
+      if (dispatch.status === 'accepted') {
+        const observations = await this.store.listExecutionObservationsForDispatch(dispatch.id);
+        const providerRunning = observations.some(observation => observation.kind === 'runtime-running')
+          && !observations.some(isExactCompletionObservation);
+        if (active.executionRole === 'reviewer') {
+          return providerRunning ? 'Executing Reviewer' : 'Capturing Review';
+        }
+        return providerRunning ? 'Executing Worker' : 'Capturing Worker Result';
+      }
+    }
+    const workers = attempts.filter(attempt => attempt.executionRole === 'worker');
+    const latestWorker = workers.at(-1);
+    const latestReview = latestWorker
+      ? reviews.find(review => review.workerAttemptId === latestWorker.id)
+      : undefined;
+    if (latestReview?.decision === 'REVISION_REQUIRED') return 'Preparing Revision';
+    if (latestWorker?.status === 'completed' && !latestReview) return 'Preparing Reviewer';
+    return run ? 'Accepted' : job.status === 'draft' ? 'Accepted' : 'Preparing Worker';
+  }
+
+  private async actionsForEscalation(
+    escalation: Awaited<ReturnType<AgentOperationsStateStore['getEscalation']>> & {},
+    attempts: readonly DurableJobAttempt[],
+  ): Promise<readonly OperatorEscalationAction[]> {
+    if (escalation.resolvedAt || attempts.some(attempt => isActiveAttemptStatus(attempt.status))
+      || await this.hasUncertainDispatch(attempts)) return [];
+    const actions: OperatorEscalationAction[] = [];
+    const workerCount = attempts.filter(attempt => attempt.executionRole === 'worker').length;
+    if (['human_judgment_required', 'reviewer_uncertain'].includes(escalation.reason)
+      && workerCount < MVP_MAX_WORKER_ATTEMPTS) {
+      actions.push('provide-guidance');
+    }
+    const job = await this.store.getJob(escalation.jobId);
+    if (job?.status === 'ready') actions.push('cancel-job');
+    return actions;
+  }
+
+  private async hasUncertainDispatch(attempts: readonly DurableJobAttempt[]): Promise<boolean> {
+    for (const attempt of attempts) {
+      const plan = await this.store.getExecutionPlanForAttempt(attempt.id);
+      const dispatch = plan ? await this.store.getExecutionDispatchForPlan(plan.id) : null;
+      if (dispatch?.status === 'submitting' || dispatch?.status === 'uncertain') return true;
+    }
+    return false;
+  }
+
+  private async requireUnresolvedEscalation(id: string) {
+    const escalationId = required(id, 'Escalation ID');
+    const escalation = await this.store.getEscalation(escalationId);
+    if (!escalation) throw new Error(`Escalation not found: ${escalationId}`);
+    if (escalation.resolvedAt) throw new Error(`Escalation ${escalationId} is already resolved`);
+    return escalation;
+  }
+
+  private async requireOperatorRun(jobId: string): Promise<DurableOperatorRun> {
+    const run = await this.store.getOperatorRunForJob(jobId);
+    if (!run) throw new Error(`Operator Run not found for Job: ${jobId}`);
+    return run;
   }
 }
 
@@ -308,28 +471,25 @@ function taskTitle(task: string): string {
   return firstLine.length <= 100 ? firstLine : `${firstLine.slice(0, 97)}…`;
 }
 
-function orchestrationState(
-  job: DurableJob,
-  activeAttempt: DurableJobAttempt | undefined,
-  session: OperatorRunSession | undefined,
-  needsHuman: boolean,
-): string {
-  if (needsHuman) return 'Needs Me';
-  if (job.status === 'completed') return 'Done';
-  if (session?.status === 'running' || activeAttempt) {
-    const role = activeAttempt?.executionRole ?? 'worker';
-    return `${role === 'reviewer' ? 'Reviewer' : 'Worker'} running`;
-  }
-  if (session?.status === 'failed') return 'Run failed';
-  if (job.status === 'ready') return 'Ready';
-  return job.status === 'draft' ? 'New' : 'Cancelled';
-}
-
 function matchesFilter(summary: OperatorJobSummary, filter: OperatorJobList): boolean {
   if (filter === 'all') return true;
   if (filter === 'needs-human') return summary.needsHuman;
   if (filter === 'done') return summary.job.status === 'completed';
-  return summary.orchestrationState.endsWith('running');
+  return summary.operatorRun?.status === 'pending' || summary.operatorRun?.status === 'running'
+    || summary.currentRole !== null;
+}
+
+function toRunSession(run: DurableOperatorRun): OperatorRunSession {
+  const status: OperatorRunSession['status'] = run.status === 'completed'
+    ? 'done'
+    : run.status === 'needs_human' ? 'needs-human' : run.status;
+  return {
+    jobId: run.jobId,
+    status,
+    startedAt: run.startedAt ?? run.createdAt,
+    ...(run.finishedAt ? { finishedAt: run.finishedAt } : {}),
+    ...(run.failureMessage ? { message: run.failureMessage } : {}),
+  };
 }
 
 function errorMessage(error: unknown): string {

@@ -15,7 +15,8 @@ export const RUNTIME_POLICY_SCHEMA_VERSION = 6;
 export const EXECUTION_CONTEXT_EVIDENCE_SCHEMA_VERSION = 7;
 export const EXECUTION_CAPABILITY_SCHEMA_VERSION = 8;
 export const ORCHESTRATION_SCHEMA_VERSION = 9;
-export const CURRENT_SCHEMA_VERSION = ORCHESTRATION_SCHEMA_VERSION;
+export const DAILY_OPERATOR_SCHEMA_VERSION = 10;
+export const CURRENT_SCHEMA_VERSION = DAILY_OPERATOR_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -477,6 +478,63 @@ const ORCHESTRATION_SCHEMA_SQL = `
   CREATE INDEX escalations_by_job ON escalations(job_id, created_at, id);
 `;
 
+const DAILY_OPERATOR_SCHEMA_SQL = `
+  CREATE TABLE operator_runs (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+    status TEXT NOT NULL CHECK (status IN (
+      'pending', 'running', 'completed', 'needs_human', 'failed', 'cancelled'
+    )),
+    failure_message TEXT,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    CHECK (
+      (status = 'pending' AND started_at IS NULL AND finished_at IS NULL)
+      OR (status = 'running' AND started_at IS NOT NULL AND finished_at IS NULL)
+      OR (status IN ('completed', 'needs_human', 'failed', 'cancelled')
+        AND started_at IS NOT NULL AND finished_at IS NOT NULL)
+    )
+  );
+
+  CREATE INDEX operator_runs_by_status
+    ON operator_runs(status, created_at, id);
+
+  CREATE TABLE human_guidance (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES jobs(id),
+    escalation_id TEXT NOT NULL UNIQUE REFERENCES escalations(id),
+    instruction TEXT NOT NULL CHECK (
+      length(trim(instruction)) > 0 AND length(instruction) <= 4096
+    ),
+    created_at TEXT NOT NULL
+  );
+
+  CREATE INDEX human_guidance_by_job
+    ON human_guidance(job_id, created_at, id);
+
+  CREATE TABLE operator_notification_deliveries (
+    id TEXT PRIMARY KEY,
+    event_key TEXT NOT NULL UNIQUE CHECK (length(trim(event_key)) > 0),
+    kind TEXT NOT NULL CHECK (kind IN ('job_completed', 'needs_human')),
+    job_id TEXT NOT NULL REFERENCES jobs(id),
+    escalation_id TEXT REFERENCES escalations(id),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'sent', 'failed', 'skipped')),
+    message TEXT,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    attempted_at TEXT,
+    CHECK ((kind = 'needs_human') = (escalation_id IS NOT NULL)),
+    CHECK ((status = 'pending') = (attempted_at IS NULL))
+  );
+
+  CREATE INDEX operator_notifications_by_job
+    ON operator_notification_deliveries(job_id, created_at, id);
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -522,6 +580,11 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: ORCHESTRATION_SCHEMA_VERSION,
     name: 'mvp-orchestrator-review-and-escalation',
     up: database => database.exec(ORCHESTRATION_SCHEMA_SQL),
+  },
+  {
+    version: DAILY_OPERATOR_SCHEMA_VERSION,
+    name: 'daily-operator-runs-guidance-and-notifications',
+    up: database => database.exec(DAILY_OPERATOR_SCHEMA_SQL),
   },
 ];
 

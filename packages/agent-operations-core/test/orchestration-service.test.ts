@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type {
+  DurableAttemptOutcomeDecision,
+  DurableAttemptReview,
   DurableProjectConfiguration,
   RuntimeDispatchRequest,
   RuntimeDispatchResult,
@@ -113,12 +115,33 @@ class ScriptedObservationAdapter implements RuntimeExecutionObservationAdapter {
   }
 }
 
+class CrashOnceStore extends InMemoryAgentOperationsStateStore {
+  failOutcomeOnce = false;
+  failReviewOnce = false;
+
+  override async createAttemptOutcomeDecision(decision: DurableAttemptOutcomeDecision): Promise<void> {
+    if (this.failOutcomeOnce) {
+      this.failOutcomeOnce = false;
+      throw new Error('simulated crash before outcome persistence');
+    }
+    return super.createAttemptOutcomeDecision(decision);
+  }
+
+  override async createAttemptReview(review: DurableAttemptReview): Promise<void> {
+    if (this.failReviewOnce) {
+      this.failReviewOnce = false;
+      throw new Error('simulated crash before Review persistence');
+    }
+    return super.createAttemptReview(review);
+  }
+}
+
 async function harness(
   observationFixtures: readonly ObservationFixture[],
   dispatchResults: readonly ('accepted' | 'rejected' | 'uncertain')[] = [],
   runtimePolicySupported = true,
 ) {
-  const store = new InMemoryAgentOperationsStateStore({
+  const store = new CrashOnceStore({
     installation: { id: INSTALLATION_ID, createdAt: TIME },
   });
   const bindingId = createRepositoryCheckoutBindingId(INSTALLATION_ID, CHECKOUT);
@@ -222,7 +245,23 @@ async function harness(
     escalationIdFactory: () => `escalation:${++escalation}`,
     outcomeDecisionIdFactory: () => `outcome:${++outcome}`,
   });
-  return { store, service, execution, observer, job };
+  return { store, service, execution, observer, runtimes, repositories, job };
+}
+
+function resumedService(setup: Awaited<ReturnType<typeof harness>>): OrchestrationService {
+  return new OrchestrationService(
+    setup.store,
+    setup.runtimes,
+    setup.repositories,
+    setup.execution,
+    setup.observer,
+    {
+      now: () => new Date(TIME),
+      observationIntervalMs: 0,
+      observationTimeoutMs: 0,
+      sleep: async () => undefined,
+    },
+  );
 }
 
 describe('OrchestrationService', () => {
@@ -391,6 +430,67 @@ describe('OrchestrationService', () => {
     const plan = await setup.store.getExecutionPlanForAttempt(attempt.id);
     expect(plan).not.toBeNull();
     expect(await setup.store.getExecutionDispatchForPlan(plan!.id)).toMatchObject({ status });
+    await setup.service.runJob(JOB_ID);
+    expect(setup.execution.requests).toHaveLength(1);
+  });
+
+  it('recovers an accepted Worker result after restart without resending its Dispatch', async () => {
+    const setup = await harness([
+      { kind: 'completed', resultText: CORRECT_RESULT },
+      { kind: 'completed', resultText: PASS },
+    ]);
+    setup.store.failOutcomeOnce = true;
+    await expect(setup.service.runJob(JOB_ID)).rejects.toThrow('simulated crash');
+    expect(setup.execution.requests).toHaveLength(1);
+
+    const result = await resumedService(setup).runJob(JOB_ID);
+    expect(result.finalDecision).toBe('PASS');
+    expect(result.job.status).toBe('completed');
+    expect(setup.execution.requests).toHaveLength(2);
+    expect(new Set(setup.execution.requests.map(request => request.executionPlanId)).size).toBe(2);
+  });
+
+  it('recovers a captured Reviewer result and reconciles PASS after restart', async () => {
+    const setup = await harness([
+      { kind: 'completed', resultText: CORRECT_RESULT },
+      { kind: 'completed', resultText: PASS },
+    ]);
+    setup.store.failReviewOnce = true;
+    await expect(setup.service.runJob(JOB_ID)).rejects.toThrow('simulated crash before Review');
+    expect(setup.execution.requests).toHaveLength(2);
+
+    const result = await resumedService(setup).runJob(JOB_ID);
+    expect(result.finalDecision).toBe('PASS');
+    expect(result.reviews).toEqual([expect.objectContaining({ decision: 'PASS' })]);
+    expect(setup.execution.requests).toHaveLength(2);
+  });
+
+  it('uses resolved Human Guidance only in a fresh Worker Attempt', async () => {
+    const setup = await harness([
+      { kind: 'completed', resultText: CORRECT_RESULT },
+      { kind: 'completed', resultText: JSON.stringify({
+        decision: 'ESCALATE',
+        summary: 'The intended source boundary needs an operator decision.',
+      }) },
+      { kind: 'completed', resultText: CORRECT_RESULT },
+      { kind: 'completed', resultText: PASS },
+    ]);
+    const first = await setup.service.runJob(JOB_ID);
+    const escalation = first.escalations[0];
+    await setup.store.createHumanGuidanceAndResolveEscalation({
+      id: 'guidance:restart',
+      jobId: JOB_ID,
+      escalationId: escalation.id,
+      instruction: 'Treat the contracts package as authoritative.',
+      createdAt: TIME,
+    }, TIME);
+
+    const result = await resumedService(setup).runJob(JOB_ID);
+    expect(result.finalDecision).toBe('PASS');
+    expect(result.workerAttempts).toHaveLength(2);
+    expect(setup.execution.requests[2].input.instruction)
+      .toContain('<human_guidance>\nTreat the contracts package as authoritative.\n</human_guidance>');
+    expect(setup.execution.requests[0].input.instruction).not.toContain('human_guidance');
   });
 
   it('escalates runtime failure with no new Dispatch', async () => {

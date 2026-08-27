@@ -16,6 +16,11 @@ import type {
   DurableAttemptReview,
   DurableEscalation,
 } from './orchestration.js';
+import type {
+  DurableHumanGuidance,
+  DurableOperatorNotificationDelivery,
+  DurableOperatorRun,
+} from './operator.js';
 
 export interface AgentOperationsInstallation {
   readonly id: string;
@@ -131,6 +136,36 @@ export interface AgentOperationsStateStore {
   createEscalation(escalation: DurableEscalation): Promise<void>;
   getEscalation(id: string): Promise<DurableEscalation | null>;
   listEscalations(jobId?: string, unresolvedOnly?: boolean): Promise<readonly DurableEscalation[]>;
+  resolveEscalation(id: string, resolvedAt: string): Promise<DurableEscalation>;
+  createOperatorRun(run: DurableOperatorRun): Promise<void>;
+  getOperatorRun(id: string): Promise<DurableOperatorRun | null>;
+  getOperatorRunForJob(jobId: string): Promise<DurableOperatorRun | null>;
+  listOperatorRuns(): Promise<readonly DurableOperatorRun[]>;
+  saveOperatorRunTransition(run: DurableOperatorRun, expectedRevision: number): Promise<void>;
+  createHumanGuidanceAndResolveEscalation(
+    guidance: DurableHumanGuidance,
+    resolvedAt: string,
+  ): Promise<void>;
+  createHumanGuidanceAndResumeOperatorRun(
+    guidance: DurableHumanGuidance,
+    resolvedAt: string,
+    run: DurableOperatorRun,
+    expectedRunRevision: number,
+  ): Promise<void>;
+  listHumanGuidance(jobId: string): Promise<readonly DurableHumanGuidance[]>;
+  createOperatorNotificationDelivery(
+    delivery: DurableOperatorNotificationDelivery,
+  ): Promise<boolean>;
+  getOperatorNotificationDeliveryByEventKey(
+    eventKey: string,
+  ): Promise<DurableOperatorNotificationDelivery | null>;
+  listOperatorNotificationDeliveries(
+    jobId?: string,
+  ): Promise<readonly DurableOperatorNotificationDelivery[]>;
+  saveOperatorNotificationDeliveryTransition(
+    delivery: DurableOperatorNotificationDelivery,
+    expectedRevision: number,
+  ): Promise<void>;
   close(): Promise<void>;
 }
 

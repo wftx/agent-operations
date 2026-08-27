@@ -11,6 +11,7 @@ import type {
 } from '../../../packages/agent-operations-application/src/index.js';
 import { OPERATOR_READ_ONLY_DEFAULTS } from '../../../packages/agent-operations-application/src/index.js';
 import { OperatorWebApplication } from '../src/app.js';
+import { createOperatorHttpServer } from '../src/http-server.js';
 
 const TIME = '2026-08-27T06:00:00.000Z';
 const PROJECT_ID = 'project:ao';
@@ -20,6 +21,18 @@ const JOB_ID = 'job:operator-test';
 class StubOperatorApplication implements OperatorApplication {
   previewCalls = 0;
   runCalls = 0;
+  guidanceCalls = 0;
+  cancelCalls = 0;
+
+  constructor(private readonly runtimeReady = true) {}
+
+  startRunner(): void {}
+
+  async getRuntimeStatus() {
+    return this.runtimeReady
+      ? { state: 'ready' as const, label: 'Ready' }
+      : { state: 'offline' as const, label: 'Offline', reason: 'Runtime is not running.' };
+  }
 
   async listProjects(): Promise<readonly OperatorProjectOption[]> {
     return [PROJECT];
@@ -45,6 +58,16 @@ class StubOperatorApplication implements OperatorApplication {
 
   async waitForRun(): Promise<OperatorRunSession> {
     return { jobId: JOB_ID, status: 'done', startedAt: TIME, finishedAt: TIME };
+  }
+
+  async provideGuidanceAndContinue(): Promise<OperatorRunSession> {
+    this.guidanceCalls += 1;
+    return { jobId: SUMMARY_ESCALATED.job.id, status: 'pending', startedAt: TIME };
+  }
+
+  async cancelEscalatedJob(): Promise<OperatorRunSession> {
+    this.cancelCalls += 1;
+    return { jobId: SUMMARY_ESCALATED.job.id, status: 'cancelled', startedAt: TIME, finishedAt: TIME };
   }
 
   async listJobs(filter: OperatorJobList = 'all'): Promise<readonly OperatorJobSummary[]> {
@@ -75,11 +98,16 @@ describe('OperatorWebApplication', () => {
     const bodies = await Promise.all(pages.map(page => page.text()));
 
     expect(bodies[0]).toContain('What should Agent Operations do?');
+    expect(bodies[0]).toContain('Runtime');
+    expect(bodies[0]).toContain('Ready');
+    expect(bodies[0]).toContain('Done Today');
     expect(bodies[0]).toContain('New Job');
     expect(bodies[1]).toContain('Reviewer running');
     expect(bodies[2]).toContain('What happened');
     expect(bodies[2]).toContain('Choose whether to revise the task.');
     expect(bodies[2]).toContain('Clarify the intended source boundary.');
+    expect(bodies[2]).toContain('Provide Guidance + Continue');
+    expect(bodies[2]).toContain('Cancel Job');
     expect(bodies[3]).toContain('Final answer: PASS / REVISION_REQUIRED / ESCALATE');
     expect(bodies[3]).toContain('All acceptance criteria are satisfied.');
     expect(bodies[3]).toContain('2 Worker Attempts');
@@ -91,6 +119,76 @@ describe('OperatorWebApplication', () => {
     expect(await escalationDetail.text()).toContain('Choose whether to revise the task.');
     expect(service.previewCalls).toBe(0);
     expect(service.runCalls).toBe(0);
+  });
+
+  it('maps explicit Needs Me actions to application commands and never from GET', async () => {
+    const service = new StubOperatorApplication();
+    const app = new OperatorWebApplication(service);
+    await app.handle(new Request('http://127.0.0.1/needs-me'));
+    expect(service.guidanceCalls).toBe(0);
+    expect(service.cancelCalls).toBe(0);
+
+    const guidance = await app.handle(new Request(
+      `http://127.0.0.1/escalations/${encodeURIComponent('escalation:1')}/guidance`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ instruction: 'Use the documented contract.' }),
+      },
+    ));
+    expect(guidance.status).toBe(303);
+    expect(service.guidanceCalls).toBe(1);
+
+    const cancel = await app.handle(new Request(
+      `http://127.0.0.1/escalations/${encodeURIComponent('escalation:1')}/cancel`,
+      { method: 'POST' },
+    ));
+    expect(cancel.status).toBe(303);
+    expect(service.cancelCalls).toBe(1);
+  });
+
+  it('shows an offline runtime without starting it and rejects invalid action requests', async () => {
+    const service = new StubOperatorApplication(false);
+    service.provideGuidanceAndContinue = async () => { throw new Error('Guidance is not valid here'); };
+    const app = new OperatorWebApplication(service);
+
+    const landing = await app.handle(new Request('http://127.0.0.1/'));
+    const body = await landing.text();
+    expect(body).toContain('Offline');
+    expect(body).toContain('Runtime is not running.');
+    expect(service.runCalls).toBe(0);
+
+    const invalid = await app.handle(new Request(
+      `http://127.0.0.1/escalations/${encodeURIComponent('escalation:1')}/guidance`,
+      { method: 'POST', body: new URLSearchParams({ instruction: 'Invalid.' }) },
+    ));
+    expect(invalid.status).toBe(400);
+    expect(await invalid.text()).toContain('Guidance is not valid here');
+  });
+
+  it('serves a useful local landing page over an isolated fake HTTP server', async () => {
+    const service = new StubOperatorApplication();
+    const server = createOperatorHttpServer(new OperatorWebApplication(service), {
+      host: '127.0.0.1', port: 0,
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    try {
+      const address = server.address();
+      if (!address || typeof address === 'string') throw new Error('Fake AO server has no TCP address');
+      const response = await fetch(`http://127.0.0.1:${address.port}/`);
+      const body = await response.text();
+      expect(response.status).toBe(200);
+      expect(body).toContain('Agent Operations');
+      expect(body).toContain('Running');
+      expect(body).toContain('Needs Me');
+      expect(body).toContain('Done Today');
+      expect(service.runCalls).toBe(0);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
   });
 
   it('keeps preview non-executing and makes Run the only execution entry', async () => {
@@ -173,6 +271,21 @@ function summary(
     workerAttemptCount: status === 'completed' ? 2 : 0,
     latestReviewDecision: status === 'completed' ? 'PASS' : null,
     needsHuman,
+    operatorRun: {
+      id: `operator-run:${id}`,
+      jobId: id,
+      status: status === 'completed' ? 'completed' : needsHuman ? 'needs_human' : state.includes('running') ? 'running' : 'pending',
+      revision: 1,
+      createdAt: TIME,
+      updatedAt: TIME,
+      ...(state.includes('running') || status === 'completed' || needsHuman ? { startedAt: TIME } : {}),
+      ...(status === 'completed' || needsHuman ? { finishedAt: TIME } : {}),
+    },
+    currentStage: status === 'completed' ? 'Completed' : needsHuman ? 'Needs Me'
+      : state.includes('Reviewer') ? 'Executing Reviewer'
+      : state.includes('Worker') ? 'Executing Worker' : 'Accepted',
+    ...(state.includes('running') || status === 'completed' ? { startedAt: TIME } : {}),
+    ...(status === 'completed' ? { finishedAt: TIME, durationMs: 60_000 } : {}),
   };
 }
 
@@ -207,6 +320,9 @@ const DETAIL: OperatorJobDetail = {
   reviewerAttempts: [],
   reviews: [REVIEW_ONE, REVIEW_TWO],
   escalations: [],
+  guidance: [],
+  notificationDeliveries: [],
+  escalationActions: {},
   finalWorkerResult: 'Final answer: PASS / REVISION_REQUIRED / ESCALATE',
   finalReview: REVIEW_TWO,
   completedAt: TIME,
@@ -230,4 +346,7 @@ const ESCALATED_DETAIL: OperatorJobDetail = {
     id: 'escalation:1', jobId: SUMMARY_ESCALATED.job.id, reason: 'human_judgment_required',
     summary: 'Choose whether to revise the task.', createdAt: TIME,
   }],
+  guidance: [],
+  notificationDeliveries: [],
+  escalationActions: { 'escalation:1': ['provide-guidance', 'cancel-job'] },
 };

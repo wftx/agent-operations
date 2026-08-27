@@ -38,6 +38,12 @@ import type {
   DurableAttemptReview,
   DurableEscalation,
   EscalationReason,
+  DurableHumanGuidance,
+  DurableOperatorNotificationDelivery,
+  DurableOperatorRun,
+  OperatorNotificationDeliveryStatus,
+  OperatorNotificationKind,
+  OperatorRunStatus,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   createRepositoryCheckoutBindingId,
@@ -250,6 +256,40 @@ interface AttemptOutcomeDecisionRow {
   evidence_observation_id: string | null;
   override_without_exact_evidence: number;
   created_at: string;
+}
+
+interface OperatorRunRow {
+  id: string;
+  job_id: string;
+  status: OperatorRunStatus;
+  failure_message: string | null;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+interface HumanGuidanceRow {
+  id: string;
+  job_id: string;
+  escalation_id: string;
+  instruction: string;
+  created_at: string;
+}
+
+interface OperatorNotificationDeliveryRow {
+  id: string;
+  event_key: string;
+  kind: OperatorNotificationKind;
+  job_id: string;
+  escalation_id: string | null;
+  status: OperatorNotificationDeliveryStatus;
+  message: string | null;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+  attempted_at: string | null;
 }
 
 function requireNonEmpty(value: string, field: string): void {
@@ -530,9 +570,57 @@ function toAttemptOutcomeDecision(row: AttemptOutcomeDecisionRow): DurableAttemp
   };
 }
 
+function toOperatorRun(row: OperatorRunRow): DurableOperatorRun {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    status: row.status,
+    ...(row.failure_message ? { failureMessage: row.failure_message } : {}),
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(row.started_at ? { startedAt: row.started_at } : {}),
+    ...(row.finished_at ? { finishedAt: row.finished_at } : {}),
+  };
+}
+
+function toHumanGuidance(row: HumanGuidanceRow): DurableHumanGuidance {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    escalationId: row.escalation_id,
+    instruction: row.instruction,
+    createdAt: row.created_at,
+  };
+}
+
+function toOperatorNotificationDelivery(
+  row: OperatorNotificationDeliveryRow,
+): DurableOperatorNotificationDelivery {
+  return {
+    id: row.id,
+    eventKey: row.event_key,
+    kind: row.kind,
+    jobId: row.job_id,
+    ...(row.escalation_id ? { escalationId: row.escalation_id } : {}),
+    status: row.status,
+    ...(row.message ? { message: row.message } : {}),
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    ...(row.attempted_at ? { attemptedAt: row.attempted_at } : {}),
+  };
+}
+
 function isValidDispatchTransition(from: DispatchStatus, to: DispatchStatus): boolean {
   return from === 'prepared' && to === 'submitting'
     || from === 'submitting' && (to === 'accepted' || to === 'rejected' || to === 'uncertain');
+}
+
+function isValidOperatorRunTransition(from: OperatorRunStatus, to: OperatorRunStatus): boolean {
+  return from === 'pending' && (to === 'running' || to === 'failed')
+    || from === 'running' && (to === 'completed' || to === 'needs_human' || to === 'failed')
+    || from === 'needs_human' && (to === 'pending' || to === 'cancelled');
 }
 
 export class SqliteAgentOperationsStateStore implements AgentOperationsStateStore {
@@ -543,6 +631,7 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
   private readonly supportsExecutionContextEvidence: boolean;
   private readonly supportsExecutionCapabilities: boolean;
   private readonly supportsOrchestration: boolean;
+  private readonly supportsDailyOperator: boolean;
 
   private constructor(databasePath: string, database: Database.Database) {
     this.databasePath = databasePath;
@@ -558,6 +647,9 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     ).get() as unknown) !== undefined;
     this.supportsOrchestration = (database.prepare(
       "SELECT 1 FROM pragma_table_info('jobs') WHERE name = 'acceptance_criteria'",
+    ).get() as unknown) !== undefined;
+    this.supportsDailyOperator = (database.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'operator_runs'",
     ).get() as unknown) !== undefined;
   }
 
@@ -1663,6 +1755,256 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     return (this.database.prepare(
       `SELECT * FROM escalations${where} ORDER BY created_at, id`,
     ).all(...parameters) as EscalationRow[]).map(toEscalation);
+  }
+
+  async resolveEscalation(id: string, resolvedAt: string): Promise<DurableEscalation> {
+    this.assertOpen();
+    if (!this.supportsDailyOperator) throw new Error('Escalation resolution requires Agent Operations schema v10');
+    requireNonEmpty(id, 'Escalation ID');
+    requireNonEmpty(resolvedAt, 'Escalation resolution timestamp');
+    const existing = await this.getEscalation(id);
+    if (!existing) throw new Error(`Escalation not found: ${id}`);
+    if (existing.resolvedAt) {
+      if (existing.resolvedAt !== resolvedAt) throw new Error(`Escalation ${id} is already resolved`);
+      return existing;
+    }
+    const result = this.database.prepare(
+      'UPDATE escalations SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL',
+    ).run(resolvedAt, id);
+    if (result.changes !== 1) throw new Error(`Escalation resolution conflict: ${id}`);
+    return { ...existing, resolvedAt };
+  }
+
+  async createOperatorRun(run: DurableOperatorRun): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsDailyOperator) throw new Error('Operator Runs require Agent Operations schema v10');
+    if (!run.id.startsWith('operator-run:') || run.status !== 'pending' || run.revision !== 0) {
+      throw new Error(`Invalid new Operator Run: ${run.id}`);
+    }
+    try {
+      this.database.prepare(`
+        INSERT INTO operator_runs
+          (id, job_id, status, failure_message, revision, created_at, updated_at, started_at, finished_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        run.id, run.jobId, run.status, run.failureMessage ?? null, run.revision,
+        run.createdAt, run.updatedAt, run.startedAt ?? null, run.finishedAt ?? null,
+      );
+    } catch (error) {
+      throw new Error(`Could not create Operator Run ${run.id}: ${(error as Error).message}`);
+    }
+  }
+
+  async getOperatorRun(id: string): Promise<DurableOperatorRun | null> {
+    this.assertOpen();
+    if (!this.supportsDailyOperator) return null;
+    const row = this.database.prepare('SELECT * FROM operator_runs WHERE id = ?')
+      .get(id) as OperatorRunRow | undefined;
+    return row ? toOperatorRun(row) : null;
+  }
+
+  async getOperatorRunForJob(jobId: string): Promise<DurableOperatorRun | null> {
+    this.assertOpen();
+    if (!this.supportsDailyOperator) return null;
+    const row = this.database.prepare('SELECT * FROM operator_runs WHERE job_id = ?')
+      .get(jobId) as OperatorRunRow | undefined;
+    return row ? toOperatorRun(row) : null;
+  }
+
+  async listOperatorRuns(): Promise<readonly DurableOperatorRun[]> {
+    this.assertOpen();
+    if (!this.supportsDailyOperator) return [];
+    return (this.database.prepare('SELECT * FROM operator_runs ORDER BY created_at, id')
+      .all() as OperatorRunRow[]).map(toOperatorRun);
+  }
+
+  async saveOperatorRunTransition(run: DurableOperatorRun, expectedRevision: number): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsDailyOperator) throw new Error('Operator Runs require Agent Operations schema v10');
+    const existing = await this.getOperatorRun(run.id);
+    if (!existing || existing.revision !== expectedRevision || run.revision !== expectedRevision + 1
+      || existing.jobId !== run.jobId || !isValidOperatorRunTransition(existing.status, run.status)) {
+      throw new Error(`Invalid Operator Run transition: ${run.id}`);
+    }
+    const result = this.database.prepare(`
+      UPDATE operator_runs
+      SET status = ?, failure_message = ?, revision = ?, updated_at = ?, started_at = ?, finished_at = ?
+      WHERE id = ? AND revision = ?
+    `).run(
+      run.status, run.failureMessage ?? null, run.revision, run.updatedAt,
+      run.startedAt ?? null, run.finishedAt ?? null, run.id, expectedRevision,
+    );
+    if (result.changes !== 1) throw new Error(`Operator Run transition conflict: ${run.id}`);
+  }
+
+  async createHumanGuidanceAndResolveEscalation(
+    guidance: DurableHumanGuidance,
+    resolvedAt: string,
+  ): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsDailyOperator) throw new Error('Human Guidance requires Agent Operations schema v10');
+    requireNonEmpty(guidance.instruction, 'Human Guidance instruction');
+    if (guidance.instruction.length > 4_096 || !guidance.id.startsWith('guidance:')) {
+      throw new Error(`Invalid Human Guidance: ${guidance.id}`);
+    }
+    const persist = this.database.transaction(() => {
+      const escalation = this.database.prepare('SELECT job_id, resolved_at FROM escalations WHERE id = ?')
+        .get(guidance.escalationId) as { job_id: string; resolved_at: string | null } | undefined;
+      if (!escalation || escalation.job_id !== guidance.jobId || escalation.resolved_at) {
+        throw new Error(`Invalid Human Guidance association: ${guidance.id}`);
+      }
+      this.database.prepare(`
+        INSERT INTO human_guidance (id, job_id, escalation_id, instruction, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(guidance.id, guidance.jobId, guidance.escalationId, guidance.instruction, guidance.createdAt);
+      const update = this.database.prepare(
+        'UPDATE escalations SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL',
+      ).run(resolvedAt, guidance.escalationId);
+      if (update.changes !== 1) throw new Error(`Escalation resolution conflict: ${guidance.escalationId}`);
+    });
+    try {
+      persist();
+    } catch (error) {
+      throw new Error(`Could not persist Human Guidance ${guidance.id}: ${(error as Error).message}`);
+    }
+  }
+
+  async createHumanGuidanceAndResumeOperatorRun(
+    guidance: DurableHumanGuidance,
+    resolvedAt: string,
+    run: DurableOperatorRun,
+    expectedRunRevision: number,
+  ): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsDailyOperator) throw new Error('Human Guidance requires Agent Operations schema v10');
+    requireNonEmpty(guidance.instruction, 'Human Guidance instruction');
+    if (guidance.instruction.length > 4_096 || !guidance.id.startsWith('guidance:')) {
+      throw new Error(`Invalid Human Guidance: ${guidance.id}`);
+    }
+    const persist = this.database.transaction(() => {
+      const escalation = this.database.prepare('SELECT job_id, resolved_at FROM escalations WHERE id = ?')
+        .get(guidance.escalationId) as { job_id: string; resolved_at: string | null } | undefined;
+      const runRow = this.database.prepare('SELECT * FROM operator_runs WHERE id = ?')
+        .get(run.id) as OperatorRunRow | undefined;
+      const existingRun = runRow ? toOperatorRun(runRow) : null;
+      if (!escalation || escalation.job_id !== guidance.jobId || escalation.resolved_at) {
+        throw new Error(`Invalid Human Guidance association: ${guidance.id}`);
+      }
+      if (!existingRun || existingRun.jobId !== guidance.jobId
+        || existingRun.revision !== expectedRunRevision || run.revision !== expectedRunRevision + 1
+        || !isValidOperatorRunTransition(existingRun.status, run.status)) {
+        throw new Error(`Operator Run transition conflict: ${run.id}`);
+      }
+      this.database.prepare(`
+        INSERT INTO human_guidance (id, job_id, escalation_id, instruction, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(guidance.id, guidance.jobId, guidance.escalationId, guidance.instruction, guidance.createdAt);
+      const escalationUpdate = this.database.prepare(
+        'UPDATE escalations SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL',
+      ).run(resolvedAt, guidance.escalationId);
+      if (escalationUpdate.changes !== 1) {
+        throw new Error(`Escalation resolution conflict: ${guidance.escalationId}`);
+      }
+      const runUpdate = this.database.prepare(`
+        UPDATE operator_runs
+        SET status = ?, failure_message = ?, revision = ?, updated_at = ?, started_at = ?, finished_at = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        run.status, run.failureMessage ?? null, run.revision, run.updatedAt,
+        run.startedAt ?? null, run.finishedAt ?? null, run.id, expectedRunRevision,
+      );
+      if (runUpdate.changes !== 1) throw new Error(`Operator Run transition conflict: ${run.id}`);
+    });
+    try {
+      persist();
+    } catch (error) {
+      throw new Error(`Could not persist Human Guidance ${guidance.id}: ${(error as Error).message}`);
+    }
+  }
+
+  async listHumanGuidance(jobId: string): Promise<readonly DurableHumanGuidance[]> {
+    this.assertOpen();
+    if (!this.supportsDailyOperator) return [];
+    return (this.database.prepare(
+      'SELECT * FROM human_guidance WHERE job_id = ? ORDER BY created_at, id',
+    ).all(jobId) as HumanGuidanceRow[]).map(toHumanGuidance);
+  }
+
+  async createOperatorNotificationDelivery(
+    delivery: DurableOperatorNotificationDelivery,
+  ): Promise<boolean> {
+    this.assertOpen();
+    if (!this.supportsDailyOperator) throw new Error('Operator Notifications require Agent Operations schema v10');
+    if (!delivery.id.startsWith('notification-delivery:')
+      || delivery.status !== 'pending' || delivery.revision !== 0) {
+      throw new Error(`Invalid new Operator Notification Delivery: ${delivery.id}`);
+    }
+    try {
+      this.database.prepare(`
+        INSERT INTO operator_notification_deliveries
+          (id, event_key, kind, job_id, escalation_id, status, message,
+           revision, created_at, updated_at, attempted_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        delivery.id, delivery.eventKey, delivery.kind, delivery.jobId,
+        delivery.escalationId ?? null, delivery.status, delivery.message ?? null,
+        delivery.revision, delivery.createdAt, delivery.updatedAt, delivery.attemptedAt ?? null,
+      );
+      return true;
+    } catch (error) {
+      const existing = await this.getOperatorNotificationDeliveryByEventKey(delivery.eventKey);
+      if (existing) return false;
+      throw new Error(`Could not create Operator Notification Delivery ${delivery.id}: ${(error as Error).message}`);
+    }
+  }
+
+  async getOperatorNotificationDeliveryByEventKey(
+    eventKey: string,
+  ): Promise<DurableOperatorNotificationDelivery | null> {
+    this.assertOpen();
+    if (!this.supportsDailyOperator) return null;
+    const row = this.database.prepare(
+      'SELECT * FROM operator_notification_deliveries WHERE event_key = ?',
+    ).get(eventKey) as OperatorNotificationDeliveryRow | undefined;
+    return row ? toOperatorNotificationDelivery(row) : null;
+  }
+
+  async listOperatorNotificationDeliveries(
+    jobId?: string,
+  ): Promise<readonly DurableOperatorNotificationDelivery[]> {
+    this.assertOpen();
+    if (!this.supportsDailyOperator) return [];
+    const rows = jobId
+      ? this.database.prepare(
+        'SELECT * FROM operator_notification_deliveries WHERE job_id = ? ORDER BY created_at, id',
+      ).all(jobId)
+      : this.database.prepare(
+        'SELECT * FROM operator_notification_deliveries ORDER BY created_at, id',
+      ).all();
+    return (rows as OperatorNotificationDeliveryRow[]).map(toOperatorNotificationDelivery);
+  }
+
+  async saveOperatorNotificationDeliveryTransition(
+    delivery: DurableOperatorNotificationDelivery,
+    expectedRevision: number,
+  ): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsDailyOperator) throw new Error('Operator Notifications require Agent Operations schema v10');
+    if (delivery.status === 'pending' || delivery.revision !== expectedRevision + 1
+      || !delivery.attemptedAt) {
+      throw new Error(`Invalid Operator Notification transition: ${delivery.id}`);
+    }
+    const result = this.database.prepare(`
+      UPDATE operator_notification_deliveries
+      SET status = ?, message = ?, revision = ?, updated_at = ?, attempted_at = ?
+      WHERE id = ? AND revision = ? AND status = 'pending'
+    `).run(
+      delivery.status, delivery.message ?? null, delivery.revision,
+      delivery.updatedAt, delivery.attemptedAt, delivery.id, expectedRevision,
+    );
+    if (result.changes !== 1) {
+      throw new Error(`Operator Notification transition conflict: ${delivery.id}`);
+    }
   }
 
   async close(): Promise<void> {

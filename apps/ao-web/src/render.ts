@@ -2,6 +2,7 @@ import type {
   OperatorJobDetail,
   OperatorJobSummary,
   OperatorProjectOption,
+  OperatorRuntimeStatus,
   OperatorTaskInput,
   OperatorTaskPreview,
 } from '../../../packages/agent-operations-application/src/index.js';
@@ -9,6 +10,7 @@ import type {
 export function renderDashboard(
   projects: readonly OperatorProjectOption[],
   jobs: readonly OperatorJobSummary[],
+  runtime: OperatorRuntimeStatus,
   options: { readonly error?: string; readonly preview?: OperatorTaskPreview; readonly input?: Partial<OperatorTaskInput> } = {},
 ): string {
   const runnable = projects.filter(project => project.runnable);
@@ -16,7 +18,15 @@ export function renderDashboard(
   const selectedRepository = options.input?.repositoryId
     ?? runnable.find(project => project.project.id === selectedProject)?.repositories[0]?.id
     ?? '';
+  const running = jobs.filter(job => job.operatorRun?.status === 'pending' || job.operatorRun?.status === 'running').length;
+  const needsMe = jobs.filter(job => job.needsHuman).length;
+  const today = new Date().toISOString().slice(0, 10);
+  const doneToday = jobs.filter(job => job.job.status === 'completed' && job.job.updatedAt.startsWith(today)).length;
   const form = `
+    <section class="mission-summary">
+      <div class="runtime ${runtime.state}"><span class="runtime-dot"></span><div><p class="eyebrow">Runtime</p><strong>${escapeHtml(runtime.label)}</strong>${runtime.reason ? `<small>${escapeHtml(runtime.reason)}</small>` : ''}</div></div>
+      <div><span>${running}</span><small>Running</small></div><div><span>${needsMe}</span><small>Needs Me</small></div><div><span>${doneToday}</span><small>Done Today</small></div>
+    </section>
     <section class="hero">
       <div><p class="eyebrow">New repository job</p><h1>What should Agent Operations do?</h1>
       <p class="lede">One bounded Worker, one independent Reviewer, and at most one revision. Read-only by default.</p></div>
@@ -24,17 +34,12 @@ export function renderDashboard(
         ${options.error ? `<div class="alert error">${escapeHtml(options.error)}</div>` : ''}
         ${options.preview ? renderPreview(options.preview) : ''}
         <label>Project
-          <select name="projectId" required>${projects.map(project => `
-            <option value="${escapeAttr(project.project.id)}" ${project.project.id === selectedProject ? 'selected' : ''} ${project.runnable ? '' : 'disabled'}>
-              ${escapeHtml(project.project.name)}${project.unavailableReason ? ` — ${escapeHtml(project.unavailableReason)}` : ''}
-            </option>`).join('')}
-          </select>
-        </label>
-        <label>Repository
-          <select name="repositoryId" required>${projects.flatMap(project => project.repositories.map(repository => `
-            <option value="${escapeAttr(repository.id)}" ${repository.id === selectedRepository ? 'selected' : ''}>
-              ${escapeHtml(project.project.name)} / ${escapeHtml(repository.name)}
-            </option>`)).join('')}
+          <select name="selection" required>${projects.flatMap(project => project.repositories.length
+            ? project.repositories.map(repository => `
+            <option value="${escapeAttr(JSON.stringify({ projectId: project.project.id, repositoryId: repository.id }))}" ${project.project.id === selectedProject && repository.id === selectedRepository ? 'selected' : ''} ${project.runnable ? '' : 'disabled'}>
+              ${escapeHtml(project.project.name)}${project.repositories.length > 1 ? ` / ${escapeHtml(repository.name)}` : ''}${project.unavailableReason ? ` — ${escapeHtml(project.unavailableReason)}` : ''}
+            </option>`)
+            : [`<option value="" disabled>${escapeHtml(project.project.name)} — ${escapeHtml(project.unavailableReason ?? 'No repository is configured')}</option>`]).join('')}
           </select>
         </label>
         <label>Task
@@ -43,7 +48,7 @@ export function renderDashboard(
         <label>Acceptance criteria
           <textarea name="acceptanceCriteria" rows="3" required placeholder="Identify the authoritative contract file and its three dimensions.">${escapeHtml(options.input?.acceptanceCriteria ?? '')}</textarea>
         </label>
-        <div class="defaults"><span>Filesystem <strong>read-only</strong></span><span>Network <strong>deny</strong></span><span>Environment <strong>empty</strong></span><span>Reviewer <strong>on</strong></span></div>
+        <div class="defaults"><span>Repository <strong>read-only</strong></span><span>Network <strong>deny</strong></span><span>Environment <strong>empty</strong></span><span>Worker Attempts <strong>max 2</strong></span><span>Reviewer <strong>on</strong></span><span>Auto-complete <strong>after PASS</strong></span></div>
         <div class="actions"><button class="secondary" name="intent" value="preview">Preview</button><button name="intent" value="run" ${runnable.length ? '' : 'disabled'}>Run Job</button></div>
       </form>
     </section>
@@ -57,7 +62,7 @@ export function renderJobList(
   jobs: readonly OperatorJobSummary[],
   active: 'jobs' | 'running' | 'needs-me' | 'done',
 ): string {
-  return layout(title, `<header class="page-head"><div><p class="eyebrow">Mission control</p><h1>${escapeHtml(title)}</h1><p>${escapeHtml(description)}</p></div><a class="refresh" href="/${active === 'jobs' ? '' : active}">Refresh</a></header>${renderJobTable(jobs, title)}`, active);
+  return layout(title, `<header class="page-head"><div><p class="eyebrow">Mission control</p><h1>${escapeHtml(title)}</h1><p>${escapeHtml(description)}</p></div><a class="refresh" href="/${active === 'jobs' ? '' : active}">Refresh</a></header>${renderJobTable(jobs, title)}`, active, active === 'running' ? 10 : undefined);
 }
 
 export function renderNeedsMe(jobs: readonly OperatorJobDetail[]): string {
@@ -68,7 +73,8 @@ export function renderNeedsMe(jobs: readonly OperatorJobDetail[]): string {
       <dl class="facts"><div><dt>What happened</dt><dd>${escapeHtml(escalation.summary)}</dd></div><div><dt>Why AO stopped</dt><dd>${escapeHtml(humanize(escalation.reason))}</dd></div>
       <div><dt>Latest Worker result</dt><dd>${escapeHtml(detail.finalWorkerResult ?? 'No bounded Worker result was available before AO stopped.')}</dd></div>
       <div><dt>Reviewer feedback</dt><dd>${escapeHtml(detail.finalReview?.feedback ?? detail.finalReview?.summary ?? 'No Reviewer decision was recorded.')}</dd></div>
-      <div><dt>Decision needed</dt><dd>Review the evidence and decide whether to revise the task, repair runtime readiness, or close the work outside this MVP.</dd></div></dl>
+      <div><dt>What I need from you</dt><dd>${detail.escalationActions[escalation.id]?.includes('provide-guidance') ? 'Provide bounded guidance for a fresh Worker Attempt, or cancel this Job.' : detail.escalationActions[escalation.id]?.includes('cancel-job') ? 'Cancel this Job, or repair the blocking condition outside Agent Operations.' : 'Repair or reconcile the blocking condition outside Agent Operations. AO will not retry uncertain work.'}</dd></div></dl>
+      ${renderEscalationActions(detail, escalation.id)}
     </article>`)) : ['<div class="empty"><h2>Nothing needs you</h2><p>Unresolved durable escalations will appear here.</p></div>'];
   return layout('Needs Me', `<header class="page-head"><div><p class="eyebrow">Human boundary</p><h1>Needs Me</h1><p>Work Agent Operations stopped rather than guessing or exceeding its budget.</p></div><a class="refresh" href="/needs-me">Refresh</a></header><section class="stack">${cards.join('')}</section>`, 'needs-me');
 }
@@ -76,7 +82,7 @@ export function renderNeedsMe(jobs: readonly OperatorJobDetail[]): string {
 export function renderDone(jobs: readonly OperatorJobDetail[]): string {
   const content = jobs.length ? jobs.map(detail => `<article class="card done-card">
     <div class="card-head"><div><span class="status done">Done</span><h2><a href="/jobs/${encodeURIComponent(detail.summary.job.id)}">${escapeHtml(detail.summary.job.title)}</a></h2><p>${escapeHtml(detail.summary.projectName)} · ${escapeHtml(detail.summary.repositoryName)}</p></div><time>${formatTime(detail.completedAt ?? detail.summary.job.updatedAt)}</time></div>
-    <div class="done-grid"><div><p class="eyebrow">Final Worker result</p><div class="result">${escapeHtml(detail.finalWorkerResult ?? 'No bounded final result is available.')}</div></div><div><p class="eyebrow">Reviewer PASS</p><p>${escapeHtml(detail.finalReview?.summary ?? 'No final review summary is available.')}</p><p class="muted">${detail.summary.workerAttemptCount} Worker ${detail.summary.workerAttemptCount === 1 ? 'Attempt' : 'Attempts'}</p></div></div>
+    <div class="done-grid"><div><p class="eyebrow">Final Worker result</p><div class="result">${escapeHtml(detail.finalWorkerResult ?? 'No bounded final result is available.')}</div></div><div><p class="eyebrow">Reviewer PASS</p><p>${escapeHtml(detail.finalReview?.summary ?? 'No final review summary is available.')}</p><p class="muted">${detail.summary.workerAttemptCount} Worker ${detail.summary.workerAttemptCount === 1 ? 'Attempt' : 'Attempts'}${detail.summary.durationMs !== undefined ? ` · ${formatDuration(detail.summary.durationMs)}` : ''}</p></div></div>
   </article>`).join('') : '<div class="empty"><h2>No completed Jobs</h2><p>Reviewed read-only results will appear here.</p></div>';
   return layout('Done', `<header class="page-head"><div><p class="eyebrow">Reviewed results</p><h1>Done</h1><p>Jobs completed only after an independent Reviewer PASS.</p></div><a class="refresh" href="/done">Refresh</a></header><section class="stack">${content}</section>`, 'done');
 }
@@ -95,15 +101,16 @@ export function renderJobDetail(detail: OperatorJobDetail): string {
       </div>
     </article>`;
   }).join('');
-  const escalations = detail.escalations.map(escalation => `<div class="alert error"><strong>${escapeHtml(humanize(escalation.reason))}</strong><br>${escapeHtml(escalation.summary)}</div>`).join('');
+  const escalations = detail.escalations.map(escalation => `<div class="alert ${escalation.resolvedAt ? 'preview' : 'error'}"><strong>${escapeHtml(humanize(escalation.reason))}</strong><br>${escapeHtml(escalation.summary)}${escalation.resolvedAt ? `<br><small>Resolved ${formatTime(escalation.resolvedAt)}</small>` : ''}${!escalation.resolvedAt ? renderEscalationActions(detail, escalation.id) : ''}</div>`).join('');
+  const guidance = detail.guidance.map(item => `<article class="story-step"><div class="step-number">H</div><div class="step-body"><p class="eyebrow">Human guidance</p><div class="result">${escapeHtml(item.instruction)}</div><p class="muted">Applied only to the next fresh Worker Attempt · ${formatTime(item.createdAt)}</p></div></article>`).join('');
   const content = `<a class="back" href="/">← All Jobs</a><header class="detail-head"><div><span class="status ${statusClass(summary)}">${escapeHtml(summary.orchestrationState)}</span><h1>${escapeHtml(summary.job.title)}</h1><p>${escapeHtml(summary.projectName)} · ${escapeHtml(summary.repositoryName)}</p></div><time>Created ${formatTime(summary.job.createdAt)}</time></header>
     <section class="criteria"><p class="eyebrow">Acceptance criteria</p><p>${escapeHtml(detail.acceptanceCriteria)}</p></section>
-    ${escalations}<section class="story">${story || '<div class="empty"><h2>Ready to run</h2><p>No Worker Attempt has started.</p></div>'}</section>
+    ${escalations}<section class="story">${story || '<div class="empty"><h2>Accepted</h2><p>Agent Operations will prepare the first Worker Attempt.</p></div>'}${guidance}</section>
     <section class="final"><p class="eyebrow">Final state</p><h2>${escapeHtml(summary.orchestrationState)}</h2>
       ${detail.finalWorkerResult ? `<h3>Worker result</h3><div class="result">${escapeHtml(detail.finalWorkerResult)}</div>` : ''}
       ${detail.finalReview ? `<h3>Reviewer ${escapeHtml(detail.finalReview.decision)}</h3><p>${escapeHtml(detail.finalReview.summary)}</p>` : ''}
     </section>`;
-  return layout(summary.job.title, content, summary.needsHuman ? 'needs-me' : summary.job.status === 'completed' ? 'done' : 'running');
+  return layout(summary.job.title, content, summary.needsHuman ? 'needs-me' : summary.job.status === 'completed' ? 'done' : 'running', summary.operatorRun?.status === 'pending' || summary.operatorRun?.status === 'running' ? 10 : undefined);
 }
 
 export function renderError(message: string, status = 500): string {
@@ -118,20 +125,20 @@ function renderJobTable(jobs: readonly OperatorJobSummary[], title: string): str
   if (!jobs.length) return `<section class="panel"><h2>${escapeHtml(title)}</h2><div class="empty"><p>No matching Jobs.</p></div></section>`;
   return `<section class="panel"><div class="panel-title"><h2>${escapeHtml(title)}</h2><span>${jobs.length}</span></div><div class="job-list">${jobs.map(job => `<a class="job-row" href="/jobs/${encodeURIComponent(job.job.id)}">
     <div><span class="status ${statusClass(job)}">${escapeHtml(job.orchestrationState)}</span><h3>${escapeHtml(job.job.title)}</h3><p>${escapeHtml(job.projectName)} · ${escapeHtml(job.repositoryName)}</p></div>
-    <div class="job-meta"><span>${job.currentRole ? humanize(job.currentRole) : '—'}</span><span>${job.latestAttempt ? `Attempt ${job.latestAttempt.roleSequence}` : 'No Attempt'}</span><span>${escapeHtml(job.latestAttempt?.runtimeAgentId ?? 'Runtime unassigned')}</span><time>${formatTime(job.latestAttempt?.startedAt ?? job.job.createdAt)}</time></div>
+    <div class="job-meta"><span>${job.currentRole ? humanize(job.currentRole) : '—'}</span><span>${job.latestAttempt?.executionRole === 'worker' ? `Worker ${job.latestAttempt.roleSequence} of 2` : job.latestAttempt ? `Reviewer ${job.latestAttempt.roleSequence}` : 'Preparing'}</span><span>${escapeHtml(job.currentStage)}</span><time>${formatTime(job.startedAt ?? job.job.createdAt)}</time></div>
   </a>`).join('')}</div></section>`;
 }
 
-function layout(title: string, content: string, active: 'jobs' | 'running' | 'needs-me' | 'done'): string {
+function layout(title: string, content: string, active: 'jobs' | 'running' | 'needs-me' | 'done', refreshSeconds?: number): string {
   const nav = [['jobs', '/', 'Jobs'], ['running', '/running', 'Running'], ['needs-me', '/needs-me', 'Needs Me'], ['done', '/done', 'Done']]
     .map(([key, href, label]) => `<a href="${href}" ${active === key ? 'aria-current="page"' : ''}>${label}</a>`).join('');
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtml(title)} · Agent Operations</title><style>${styles}</style></head><body><header class="topbar"><a class="brand" href="/"><span>AO</span><strong>Agent Operations</strong></a><nav>${nav}</nav><span class="local">Local only</span></header><main>${content}</main><footer>Agent Operations mission control · read-only repository work only</footer></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refreshSeconds ? `<meta http-equiv="refresh" content="${refreshSeconds}">` : ''}<title>${escapeHtml(title)} · Agent Operations</title><style>${styles}</style></head><body><header class="topbar"><a class="brand" href="/"><span>AO</span><strong>Agent Operations</strong></a><nav>${nav}</nav><span class="local">Local only</span></header><main>${content}</main><footer>Agent Operations mission control · read-only repository work only</footer></body></html>`;
 }
 
 function statusClass(job: OperatorJobSummary): string {
   if (job.needsHuman) return 'needs';
   if (job.job.status === 'completed') return 'done';
-  if (job.orchestrationState.endsWith('running')) return 'running';
+  if (job.operatorRun?.status === 'pending' || job.operatorRun?.status === 'running') return 'running';
   return 'neutral';
 }
 
@@ -144,6 +151,19 @@ function humanize(value: string): string {
   return value.replaceAll('_', ' ').replace(/\b\w/g, character => character.toUpperCase());
 }
 
+function formatDuration(milliseconds: number): string {
+  const seconds = Math.max(0, Math.round(milliseconds / 1_000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${seconds % 60}s`;
+}
+
+function renderEscalationActions(detail: OperatorJobDetail, escalationId: string): string {
+  const actions = detail.escalationActions[escalationId] ?? [];
+  if (!actions.length) return '';
+  return `<div class="resolution-actions">${actions.includes('provide-guidance') ? `<form method="post" action="/escalations/${encodeURIComponent(escalationId)}/guidance"><label>Guidance for a fresh Worker Attempt<textarea name="instruction" rows="3" maxlength="4096" required></textarea></label><button>Provide Guidance + Continue</button></form>` : ''}${actions.includes('cancel-job') ? `<form method="post" action="/escalations/${encodeURIComponent(escalationId)}/cancel"><button class="danger">Cancel Job</button></form>` : ''}</div>`;
+}
+
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]!);
 }
@@ -154,5 +174,5 @@ function escapeAttr(value: string): string {
 
 const styles = `
 :root{color-scheme:light;--ink:#18221f;--muted:#66736f;--line:#dfe6e2;--paper:#f5f7f5;--card:#fff;--green:#206b4f;--lime:#dff4e8;--amber:#9a5b00;--amber-bg:#fff2d7;--blue:#255f85;--blue-bg:#e2f2fb;--red:#9d3030;--red-bg:#fde8e8;--shadow:0 16px 50px rgba(34,55,47,.08)}
-*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.5}.topbar{height:68px;display:flex;align-items:center;gap:32px;padding:0 max(24px,calc((100vw - 1180px)/2));background:#102b24;color:#fff}.brand{display:flex;align-items:center;gap:10px;color:#fff;text-decoration:none}.brand span{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:#61d09b;color:#102b24;font-weight:900}.topbar nav{display:flex;gap:4px;flex:1}.topbar nav a{color:#bad0c8;text-decoration:none;padding:8px 13px;border-radius:8px;font-weight:650}.topbar nav a:hover,.topbar nav a[aria-current=page]{background:#25473d;color:#fff}.local{font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:#9bb6ad}main{width:min(1180px,calc(100% - 40px));margin:42px auto 80px}h1,h2,h3,p{margin-top:0}h1{font-size:clamp(30px,4vw,52px);line-height:1.05;letter-spacing:-.035em}h2{letter-spacing:-.02em}.eyebrow{text-transform:uppercase;letter-spacing:.13em;font-size:12px;font-weight:800;color:var(--green);margin-bottom:10px}.lede{font-size:18px;color:var(--muted);max-width:620px}.hero{display:grid;grid-template-columns:.85fr 1.15fr;gap:50px;align-items:start;margin-bottom:36px}.task-form,.panel,.card,.criteria,.final{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow)}.task-form{padding:26px;display:grid;grid-template-columns:1fr 1fr;gap:18px}.task-form label{display:grid;gap:7px;font-weight:700;font-size:14px}.task-form label:nth-of-type(n+3),.task-form .defaults,.task-form .actions,.task-form .alert{grid-column:1/-1}textarea,select{width:100%;border:1px solid #cbd5d0;border-radius:10px;padding:11px 12px;background:#fff;color:var(--ink);font:inherit}textarea:focus,select:focus{outline:3px solid #ccecdf;border-color:var(--green)}.defaults{display:flex;flex-wrap:wrap;gap:8px;color:var(--muted);font-size:12px}.defaults span{border:1px solid var(--line);border-radius:999px;padding:5px 9px}.actions{display:flex;justify-content:flex-end;gap:10px}button,.refresh{border:0;border-radius:10px;background:var(--green);color:#fff;padding:11px 18px;font:inherit;font-weight:750;cursor:pointer;text-decoration:none}button.secondary{background:#e9efec;color:var(--ink)}button:disabled{opacity:.45;cursor:not-allowed}.panel{overflow:hidden}.panel-title{display:flex;justify-content:space-between;align-items:center;padding:22px 24px;border-bottom:1px solid var(--line)}.panel-title h2{margin:0}.panel-title span{background:#edf2ef;padding:3px 9px;border-radius:99px}.job-list{display:grid}.job-row{display:grid;grid-template-columns:1fr auto;gap:24px;padding:20px 24px;color:inherit;text-decoration:none;border-bottom:1px solid var(--line)}.job-row:last-child{border:0}.job-row:hover{background:#f8fbf9}.job-row h3{margin:8px 0 3px;font-size:18px}.job-row p,.page-head p,.detail-head p{color:var(--muted);margin:0}.job-meta{display:grid;grid-template-columns:repeat(4,auto);gap:16px;align-items:center;color:var(--muted);font-size:12px}.status{display:inline-flex;border-radius:999px;padding:4px 9px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;font-weight:850}.status.running{background:var(--blue-bg);color:var(--blue)}.status.done{background:var(--lime);color:var(--green)}.status.needs{background:var(--amber-bg);color:var(--amber)}.status.neutral{background:#edf0ef;color:#58635f}.page-head,.detail-head{display:flex;justify-content:space-between;gap:30px;align-items:start;margin-bottom:28px}.page-head h1,.detail-head h1{margin-bottom:8px}.refresh{background:#e4ece8;color:var(--ink)}.stack,.story{display:grid;gap:18px}.card{padding:24px}.card-head{display:flex;justify-content:space-between;gap:20px}.card-head h2{margin:9px 0}.card-head a{color:inherit}.facts{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin:20px 0 0}.facts div{background:#f8faf9;border-radius:10px;padding:14px}.facts dt,.compact dt{font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}.facts dd,.compact dd{margin:4px 0 0;white-space:pre-wrap}.done-grid{display:grid;grid-template-columns:2fr 1fr;gap:24px;margin-top:22px}.back{display:inline-block;margin-bottom:22px;color:var(--green);font-weight:750}.detail-head time{color:var(--muted)}.criteria,.final{padding:22px 24px;margin:20px 0}.criteria p:last-child{white-space:pre-wrap;margin:0}.story-step{display:grid;grid-template-columns:42px 1fr;gap:14px}.step-number{width:38px;height:38px;border-radius:50%;display:grid;place-items:center;background:#153a30;color:#fff;font-weight:850}.step-body{background:#fff;border:1px solid var(--line);border-radius:16px;padding:24px}.result{white-space:pre-wrap;background:#f3f6f4;border-radius:10px;padding:16px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.review{border-left:4px solid var(--green);margin-top:18px;padding:15px 18px;background:#f4faf7;border-radius:8px}.review.revision_required,.review.escalate{border-color:var(--amber);background:#fff8ea}.review h3{margin:0 0 6px}.review p:last-child{margin-bottom:0}details{margin-top:18px;color:var(--muted)}summary{cursor:pointer;font-weight:700}.compact{display:grid;grid-template-columns:auto 1fr;gap:7px 14px;font-size:12px}.alert{padding:13px 15px;border-radius:10px}.alert.error{background:var(--red-bg);color:var(--red)}.alert.preview{background:var(--blue-bg);color:var(--blue)}.empty{text-align:center;padding:55px 24px;color:var(--muted)}.muted{color:var(--muted)}footer{text-align:center;color:#84908c;font-size:12px;padding:25px}@media(max-width:800px){.topbar{height:auto;flex-wrap:wrap;padding:14px 20px;gap:12px}.topbar nav{order:3;width:100%;overflow:auto}.local{margin-left:auto}.hero{grid-template-columns:1fr;gap:20px}.task-form{grid-template-columns:1fr}.task-form label{grid-column:1/-1}.job-row{grid-template-columns:1fr}.job-meta{grid-template-columns:1fr}.facts,.done-grid{grid-template-columns:1fr}.page-head,.detail-head{display:block}.refresh{display:inline-block;margin-top:15px}}
+*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.5}.topbar{height:68px;display:flex;align-items:center;gap:32px;padding:0 max(24px,calc((100vw - 1180px)/2));background:#102b24;color:#fff}.brand{display:flex;align-items:center;gap:10px;color:#fff;text-decoration:none}.brand span{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:#61d09b;color:#102b24;font-weight:900}.topbar nav{display:flex;gap:4px;flex:1}.topbar nav a{color:#bad0c8;text-decoration:none;padding:8px 13px;border-radius:8px;font-weight:650}.topbar nav a:hover,.topbar nav a[aria-current=page]{background:#25473d;color:#fff}.local{font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:#9bb6ad}main{width:min(1180px,calc(100% - 40px));margin:42px auto 80px}h1,h2,h3,p{margin-top:0}h1{font-size:clamp(30px,4vw,52px);line-height:1.05;letter-spacing:-.035em}h2{letter-spacing:-.02em}.eyebrow{text-transform:uppercase;letter-spacing:.13em;font-size:12px;font-weight:800;color:var(--green);margin-bottom:10px}.lede{font-size:18px;color:var(--muted);max-width:620px}.mission-summary{display:grid;grid-template-columns:2fr repeat(3,1fr);gap:12px;margin-bottom:28px}.mission-summary>div{background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px 18px;display:grid;gap:3px}.mission-summary>div:not(.runtime){text-align:center}.mission-summary span{font-size:26px;font-weight:850}.mission-summary small{color:var(--muted)}.runtime{grid-template-columns:auto 1fr;align-items:center}.runtime .eyebrow{margin:0}.runtime-dot{width:12px;height:12px;border-radius:50%;background:var(--red)}.runtime.ready .runtime-dot{background:#34a26f}.runtime.degraded .runtime-dot{background:#d78a1f}.runtime small{display:block}.hero{display:grid;grid-template-columns:.85fr 1.15fr;gap:50px;align-items:start;margin-bottom:36px}.task-form,.panel,.card,.criteria,.final{background:var(--card);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow)}.task-form{padding:26px;display:grid;grid-template-columns:1fr 1fr;gap:18px}.task-form label{display:grid;gap:7px;font-weight:700;font-size:14px}.task-form label:nth-of-type(n+2),.task-form .defaults,.task-form .actions,.task-form .alert{grid-column:1/-1}textarea,select{width:100%;border:1px solid #cbd5d0;border-radius:10px;padding:11px 12px;background:#fff;color:var(--ink);font:inherit}textarea:focus,select:focus{outline:3px solid #ccecdf;border-color:var(--green)}.defaults{display:flex;flex-wrap:wrap;gap:8px;color:var(--muted);font-size:12px}.defaults span{border:1px solid var(--line);border-radius:999px;padding:5px 9px}.actions,.resolution-actions{display:flex;justify-content:flex-end;gap:10px}.resolution-actions{align-items:end;margin-top:16px;flex-wrap:wrap}.resolution-actions form:first-child{display:grid;gap:8px;flex:1;min-width:280px}.resolution-actions label{display:grid;gap:6px;font-weight:700}.resolution-actions textarea{background:#fff}.danger{background:var(--red)}button,.refresh{border:0;border-radius:10px;background:var(--green);color:#fff;padding:11px 18px;font:inherit;font-weight:750;cursor:pointer;text-decoration:none}button.secondary{background:#e9efec;color:var(--ink)}button:disabled{opacity:.45;cursor:not-allowed}.panel{overflow:hidden}.panel-title{display:flex;justify-content:space-between;align-items:center;padding:22px 24px;border-bottom:1px solid var(--line)}.panel-title h2{margin:0}.panel-title span{background:#edf2ef;padding:3px 9px;border-radius:99px}.job-list{display:grid}.job-row{display:grid;grid-template-columns:1fr auto;gap:24px;padding:20px 24px;color:inherit;text-decoration:none;border-bottom:1px solid var(--line)}.job-row:last-child{border:0}.job-row:hover{background:#f8fbf9}.job-row h3{margin:8px 0 3px;font-size:18px}.job-row p,.page-head p,.detail-head p{color:var(--muted);margin:0}.job-meta{display:grid;grid-template-columns:repeat(4,auto);gap:16px;align-items:center;color:var(--muted);font-size:12px}.status{display:inline-flex;border-radius:999px;padding:4px 9px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;font-weight:850}.status.running{background:var(--blue-bg);color:var(--blue)}.status.done{background:var(--lime);color:var(--green)}.status.needs{background:var(--amber-bg);color:var(--amber)}.status.neutral{background:#edf0ef;color:#58635f}.page-head,.detail-head{display:flex;justify-content:space-between;gap:30px;align-items:start;margin-bottom:28px}.page-head h1,.detail-head h1{margin-bottom:8px}.refresh{background:#e4ece8;color:var(--ink)}.stack,.story{display:grid;gap:18px}.card{padding:24px}.card-head{display:flex;justify-content:space-between;gap:20px}.card-head h2{margin:9px 0}.card-head a{color:inherit}.facts{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin:20px 0 0}.facts div{background:#f8faf9;border-radius:10px;padding:14px}.facts dt,.compact dt{font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}.facts dd,.compact dd{margin:4px 0 0;white-space:pre-wrap}.done-grid{display:grid;grid-template-columns:2fr 1fr;gap:24px;margin-top:22px}.back{display:inline-block;margin-bottom:22px;color:var(--green);font-weight:750}.detail-head time{color:var(--muted)}.criteria,.final{padding:22px 24px;margin:20px 0}.criteria p:last-child{white-space:pre-wrap;margin:0}.story-step{display:grid;grid-template-columns:42px 1fr;gap:14px}.step-number{width:38px;height:38px;border-radius:50%;display:grid;place-items:center;background:#153a30;color:#fff;font-weight:850}.step-body{background:#fff;border:1px solid var(--line);border-radius:16px;padding:24px}.result{white-space:pre-wrap;background:#f3f6f4;border-radius:10px;padding:16px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}.review{border-left:4px solid var(--green);margin-top:18px;padding:15px 18px;background:#f4faf7;border-radius:8px}.review.revision_required,.review.escalate{border-color:var(--amber);background:#fff8ea}.review h3{margin:0 0 6px}.review p:last-child{margin-bottom:0}details{margin-top:18px;color:var(--muted)}summary{cursor:pointer;font-weight:700}.compact{display:grid;grid-template-columns:auto 1fr;gap:7px 14px;font-size:12px}.alert{padding:13px 15px;border-radius:10px}.alert.error{background:var(--red-bg);color:var(--red)}.alert.preview{background:var(--blue-bg);color:var(--blue)}.empty{text-align:center;padding:55px 24px;color:var(--muted)}.muted{color:var(--muted)}footer{text-align:center;color:#84908c;font-size:12px;padding:25px}@media(max-width:800px){.topbar{height:auto;flex-wrap:wrap;padding:14px 20px;gap:12px}.topbar nav{order:3;width:100%;overflow:auto}.local{margin-left:auto}.mission-summary{grid-template-columns:1fr 1fr}.mission-summary .runtime{grid-column:1/-1}.hero{grid-template-columns:1fr;gap:20px}.task-form{grid-template-columns:1fr}.task-form label{grid-column:1/-1}.job-row{grid-template-columns:1fr}.job-meta{grid-template-columns:1fr}.facts,.done-grid{grid-template-columns:1fr}.page-head,.detail-head{display:block}.refresh{display:inline-block;margin-top:15px}}
 `;
