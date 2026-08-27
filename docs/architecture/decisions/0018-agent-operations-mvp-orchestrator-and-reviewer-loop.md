@@ -89,6 +89,18 @@ after exact bounded result capture, so later Reviewer uncertainty cannot leave a
 provider turn falsely represented as still running. The historical failed
 Reviewer and Escalation remain unchanged.
 
+The second live MVP invocation completed autonomously after the Phase 20B
+hardening. AO created one Worker Attempt and one Reviewer Attempt, each with a
+fresh immutable Plan, accepted Dispatch, policy-isolated thread, and exact
+turn-completion evidence. The Worker produced the correct authoritative
+`RuntimeExecutionPolicy` source and dimensions. The Reviewer independently
+returned a valid `PASS`; AO persisted the review and runtime-evidence outcomes,
+completed both Attempts, and automatically completed the explicitly opted-in
+read-only Job. It used two submissions, no Dispatch retry or revision, six
+bounded repository-reader operations, and no shell, Git, repository write,
+network, skill, plugin, app, or MCP operation. No human copied results or
+constructed a retry prompt.
+
 ## Non-decisions
 
 This decision does not add repository writes, worktrees, branches, commits,
