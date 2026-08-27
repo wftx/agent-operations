@@ -33,11 +33,17 @@ import type {
   RuntimeEnvironmentPolicy,
   RuntimeState,
   WorkingTreeState,
+  ExecutionRole,
+  AttemptReviewDecision,
+  DurableAttemptReview,
+  DurableEscalation,
+  EscalationReason,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   createRepositoryCheckoutBindingId,
   isRuntimeExecutionCapabilitiesNoBroaderThan,
   isRuntimeExecutionPolicyNoBroaderThan,
+  isBoundedExecutionResult,
 } from '../../agent-operations-contracts/src/index.js';
 import { applyStateMigrations, type SqliteStateMigration } from './migrations.js';
 import { resolveAgentOperationsStateLocation } from './state-location.js';
@@ -111,6 +117,8 @@ interface JobRow {
   project_id: string;
   title: string;
   description: string | null;
+  acceptance_criteria?: string | null;
+  automatic_read_only_completion?: number;
   status: JobStatus;
   repository_id: string | null;
   preferred_runtime_agent_id: string | null;
@@ -123,6 +131,8 @@ interface AttemptRow {
   id: string;
   job_id: string;
   sequence: number;
+  execution_role?: ExecutionRole;
+  role_sequence?: number;
   runtime_agent_id: string | null;
   status: AttemptStatus;
   started_at: string | null;
@@ -193,6 +203,7 @@ interface ExecutionObservationRow {
   external_reference: string | null;
   message: string | null;
   output_summary: string | null;
+  result_text?: string | null;
   execution_working_directory?: string | null;
   effective_policy_version?: 1 | null;
   effective_filesystem?: RuntimeFilesystemPolicy | null;
@@ -203,6 +214,29 @@ interface ExecutionObservationRow {
   effective_repository_read?: number | null;
   observed_at: string;
   recorded_at: string;
+}
+
+interface AttemptReviewRow {
+  id: string;
+  job_id: string;
+  worker_attempt_id: string;
+  reviewer_attempt_id: string;
+  reviewer_runtime_agent_id: string;
+  decision: AttemptReviewDecision;
+  summary: string;
+  feedback: string | null;
+  created_at: string;
+}
+
+interface EscalationRow {
+  id: string;
+  job_id: string;
+  attempt_id: string | null;
+  review_id: string | null;
+  reason: EscalationReason;
+  summary: string;
+  created_at: string;
+  resolved_at: string | null;
 }
 
 interface AttemptOutcomeDecisionRow {
@@ -295,6 +329,10 @@ function toJob(row: JobRow): DurableJob {
     projectId: row.project_id,
     title: row.title,
     ...(row.description ? { description: row.description } : {}),
+    ...(row.acceptance_criteria ? { acceptanceCriteria: row.acceptance_criteria } : {}),
+    ...(row.automatic_read_only_completion === 1
+      ? { automaticReadOnlyCompletion: true }
+      : {}),
     status: row.status,
     ...(row.repository_id ? { repositoryId: row.repository_id } : {}),
     ...(row.preferred_runtime_agent_id
@@ -311,6 +349,8 @@ function toAttempt(row: AttemptRow): DurableJobAttempt {
     id: row.id,
     jobId: row.job_id,
     sequence: row.sequence,
+    executionRole: row.execution_role ?? 'worker',
+    roleSequence: row.role_sequence ?? row.sequence,
     ...(row.runtime_agent_id ? { runtimeAgentId: row.runtime_agent_id } : {}),
     status: row.status,
     ...(row.started_at ? { startedAt: row.started_at } : {}),
@@ -414,6 +454,7 @@ function toExecutionObservation(row: ExecutionObservationRow): DurableExecutionO
     ...(row.external_reference ? { externalReference: row.external_reference } : {}),
     ...(row.message ? { message: row.message } : {}),
     ...(row.output_summary ? { outputSummary: row.output_summary } : {}),
+    ...(row.result_text ? { resultText: row.result_text } : {}),
     ...(row.execution_working_directory
       ? {
           executionContext: {
@@ -447,6 +488,33 @@ function toExecutionObservation(row: ExecutionObservationRow): DurableExecutionO
   };
 }
 
+function toAttemptReview(row: AttemptReviewRow): DurableAttemptReview {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    workerAttemptId: row.worker_attempt_id,
+    reviewerAttemptId: row.reviewer_attempt_id,
+    reviewerRuntimeAgentId: row.reviewer_runtime_agent_id,
+    decision: row.decision,
+    summary: row.summary,
+    ...(row.feedback ? { feedback: row.feedback } : {}),
+    createdAt: row.created_at,
+  };
+}
+
+function toEscalation(row: EscalationRow): DurableEscalation {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    ...(row.attempt_id ? { attemptId: row.attempt_id } : {}),
+    ...(row.review_id ? { reviewId: row.review_id } : {}),
+    reason: row.reason,
+    summary: row.summary,
+    createdAt: row.created_at,
+    ...(row.resolved_at ? { resolvedAt: row.resolved_at } : {}),
+  };
+}
+
 function toAttemptOutcomeDecision(row: AttemptOutcomeDecisionRow): DurableAttemptOutcomeDecision {
   return {
     id: row.id,
@@ -474,6 +542,7 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
   private readonly supportsRuntimePolicies: boolean;
   private readonly supportsExecutionContextEvidence: boolean;
   private readonly supportsExecutionCapabilities: boolean;
+  private readonly supportsOrchestration: boolean;
 
   private constructor(databasePath: string, database: Database.Database) {
     this.databasePath = databasePath;
@@ -486,6 +555,9 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     ).get() as unknown) !== undefined;
     this.supportsExecutionCapabilities = (database.prepare(
       "SELECT 1 FROM pragma_table_info('execution_plans') WHERE name = 'requested_capabilities_version'",
+    ).get() as unknown) !== undefined;
+    this.supportsOrchestration = (database.prepare(
+      "SELECT 1 FROM pragma_table_info('jobs') WHERE name = 'acceptance_criteria'",
     ).get() as unknown) !== undefined;
   }
 
@@ -750,6 +822,13 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     requireNonEmpty(job.title, 'Job title');
     if (!job.id.startsWith('job:')) throw new Error(`Invalid Agent Operations job ID: ${job.id}`);
     if (job.status !== 'draft' || job.revision !== 0) throw new Error('New jobs must be draft at revision 0');
+    if (job.automaticReadOnlyCompletion && !job.acceptanceCriteria?.trim()) {
+      throw new Error('Automatic read-only completion requires acceptance criteria');
+    }
+    if (!this.supportsOrchestration
+      && (job.acceptanceCriteria !== undefined || job.automaticReadOnlyCompletion === true)) {
+      throw new Error('Job orchestration fields require Agent Operations schema v9');
+    }
     try {
       const project = this.database.prepare('SELECT 1 FROM projects WHERE id = ?').get(job.projectId);
       if (!project) throw new Error(`Unknown project for job: ${job.projectId}`);
@@ -771,12 +850,7 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
           );
         }
       }
-      this.database.prepare(`
-        INSERT INTO jobs
-          (id, project_id, title, description, status, repository_id,
-           preferred_runtime_agent_id, revision, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
+      const common = [
         job.id,
         job.projectId,
         job.title,
@@ -787,7 +861,27 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         job.revision,
         job.createdAt,
         job.updatedAt,
-      );
+      ] as const;
+      if (this.supportsOrchestration) {
+        this.database.prepare(`
+          INSERT INTO jobs
+            (id, project_id, title, description, status, repository_id,
+             preferred_runtime_agent_id, revision, created_at, updated_at,
+             acceptance_criteria, automatic_read_only_completion)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ...common,
+          job.acceptanceCriteria ?? null,
+          job.automaticReadOnlyCompletion ? 1 : 0,
+        );
+      } else {
+        this.database.prepare(`
+          INSERT INTO jobs
+            (id, project_id, title, description, status, repository_id,
+             preferred_runtime_agent_id, revision, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(...common);
+      }
     } catch (error) {
       throw new Error(`Could not create job ${job.id}: ${(error as Error).message}`);
     }
@@ -815,6 +909,8 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     if (existing.projectId !== job.projectId
       || existing.repositoryId !== job.repositoryId
       || existing.preferredRuntimeAgentId !== job.preferredRuntimeAgentId
+      || existing.acceptanceCriteria !== job.acceptanceCriteria
+      || existing.automaticReadOnlyCompletion !== job.automaticReadOnlyCompletion
       || existing.createdAt !== job.createdAt) {
       throw new Error(`Job transition cannot rewrite durable identity or assignment: ${job.id}`);
     }
@@ -842,6 +938,10 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     if (attempt.status !== 'created' || attempt.revision !== 0) {
       throw new Error('New attempts must be created at revision 0');
     }
+    const executionRole = attempt.executionRole ?? 'worker';
+    if (!this.supportsOrchestration && executionRole !== 'worker') {
+      throw new Error('Reviewer Attempts require Agent Operations schema v9');
+    }
     try {
       const create = this.database.transaction(() => {
         const job = this.database.prepare('SELECT project_id FROM jobs WHERE id = ?')
@@ -857,28 +957,64 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
             );
           }
         }
-        const active = this.database.prepare(`
-          SELECT id FROM job_attempts WHERE job_id = ? AND status IN ('created', 'running') LIMIT 1
-        `).get(attempt.jobId) as { id: string } | undefined;
-        if (active) throw new Error(`Job ${attempt.jobId} already has an active attempt`);
+        const active = this.supportsOrchestration
+          ? this.database.prepare(`
+              SELECT id FROM job_attempts
+              WHERE job_id = ? AND execution_role = ? AND status IN ('created', 'running') LIMIT 1
+            `).get(attempt.jobId, executionRole) as { id: string } | undefined
+          : this.database.prepare(`
+              SELECT id FROM job_attempts WHERE job_id = ? AND status IN ('created', 'running') LIMIT 1
+            `).get(attempt.jobId) as { id: string } | undefined;
+        if (active) throw new Error(`Job ${attempt.jobId} already has an active attempt for role ${executionRole}`);
         const row = this.database.prepare(`
           SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM job_attempts WHERE job_id = ?
         `).get(attempt.jobId) as { next_sequence: number };
-        this.database.prepare(`
-          INSERT INTO job_attempts
-            (id, job_id, sequence, runtime_agent_id, status, revision, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          attempt.id,
-          attempt.jobId,
-          row.next_sequence,
-          attempt.runtimeAgentId ?? null,
-          attempt.status,
-          attempt.revision,
-          attempt.createdAt,
-          attempt.updatedAt,
-        );
-        return { ...attempt, sequence: row.next_sequence };
+        const roleRow = this.supportsOrchestration
+          ? this.database.prepare(`
+              SELECT COALESCE(MAX(role_sequence), 0) + 1 AS next_sequence
+              FROM job_attempts WHERE job_id = ? AND execution_role = ?
+            `).get(attempt.jobId, executionRole) as { next_sequence: number }
+          : row;
+        if (this.supportsOrchestration) {
+          this.database.prepare(`
+            INSERT INTO job_attempts
+              (id, job_id, sequence, runtime_agent_id, status, revision, created_at, updated_at,
+               execution_role, role_sequence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            attempt.id,
+            attempt.jobId,
+            row.next_sequence,
+            attempt.runtimeAgentId ?? null,
+            attempt.status,
+            attempt.revision,
+            attempt.createdAt,
+            attempt.updatedAt,
+            executionRole,
+            roleRow.next_sequence,
+          );
+        } else {
+          this.database.prepare(`
+            INSERT INTO job_attempts
+              (id, job_id, sequence, runtime_agent_id, status, revision, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            attempt.id,
+            attempt.jobId,
+            row.next_sequence,
+            attempt.runtimeAgentId ?? null,
+            attempt.status,
+            attempt.revision,
+            attempt.createdAt,
+            attempt.updatedAt,
+          );
+        }
+        return {
+          ...attempt,
+          sequence: row.next_sequence,
+          executionRole,
+          roleSequence: roleRow.next_sequence,
+        };
       });
       return create.immediate();
     } catch (error) {
@@ -907,6 +1043,8 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     const existing = toAttempt(existingRow);
     if (existing.jobId !== attempt.jobId
       || existing.sequence !== attempt.sequence
+      || existing.executionRole !== attempt.executionRole
+      || existing.roleSequence !== attempt.roleSequence
       || existing.runtimeAgentId !== attempt.runtimeAgentId
       || existing.createdAt !== attempt.createdAt) {
       throw new Error(`Attempt transition cannot rewrite durable identity or assignment: ${attempt.id}`);
@@ -1229,6 +1367,15 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     this.assertOpen();
     requireNonEmpty(observation.source, 'Execution Observation source');
     requireNonEmpty(observation.sourceEventId, 'Execution Observation source event ID');
+    if (observation.resultText !== undefined
+      && (!isBoundedExecutionResult(observation.resultText)
+        || observation.kind !== 'turn-completed'
+        || observation.correlation !== 'exact')) {
+      throw new Error(`Execution result text requires exact bounded completion evidence: ${observation.id}`);
+    }
+    if (!this.supportsOrchestration && observation.resultText !== undefined) {
+      throw new Error('Execution result capture requires Agent Operations schema v9');
+    }
     const existing = this.database.prepare(`
       SELECT id FROM execution_observations
       WHERE id = ? OR (dispatch_id = ? AND source = ? AND source_event_id = ?)
@@ -1255,7 +1402,33 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         observation.message ?? null,
         observation.outputSummary ?? null,
       ];
-      if (this.supportsExecutionCapabilities) {
+      if (this.supportsOrchestration) {
+        this.database.prepare(`
+          INSERT INTO execution_observations
+            (id, dispatch_id, attempt_id, source, source_event_id, kind, correlation,
+             correlated_dispatch_id, runtime_session_id, external_reference, message,
+             output_summary, execution_working_directory, effective_policy_version,
+             effective_filesystem, effective_network, effective_environment,
+             repository_read_root, effective_capabilities_version,
+             effective_repository_read, observed_at, recorded_at, result_text)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ...common,
+          observation.executionContext?.workingDirectory ?? null,
+          observation.effectivePolicy?.version ?? null,
+          observation.effectivePolicy?.filesystem ?? null,
+          observation.effectivePolicy?.network ?? null,
+          observation.effectivePolicy?.environment ?? null,
+          observation.executionContext?.repositoryReadRoot ?? null,
+          observation.effectiveCapabilities?.version ?? null,
+          observation.effectiveCapabilities?.repositoryRead === undefined
+            ? null
+            : observation.effectiveCapabilities.repositoryRead ? 1 : 0,
+          observation.observedAt,
+          observation.recordedAt,
+          observation.resultText ?? null,
+        );
+      } else if (this.supportsExecutionCapabilities) {
         this.database.prepare(`
           INSERT INTO execution_observations
             (id, dispatch_id, attempt_id, source, source_event_id, kind, correlation,
@@ -1365,6 +1538,131 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     const row = this.database.prepare('SELECT * FROM attempt_outcome_decisions WHERE attempt_id = ?')
       .get(attemptId) as AttemptOutcomeDecisionRow | undefined;
     return row ? toAttemptOutcomeDecision(row) : null;
+  }
+
+  async createAttemptReview(review: DurableAttemptReview): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsOrchestration) throw new Error('Attempt Reviews require Agent Operations schema v9');
+    requireNonEmpty(review.summary, 'Attempt Review summary');
+    if (!review.id.startsWith('review:')) throw new Error(`Invalid Attempt Review ID: ${review.id}`);
+    if (review.decision === 'REVISION_REQUIRED' && !review.feedback?.trim()) {
+      throw new Error('Revision-required review needs concrete feedback');
+    }
+    const worker = this.database.prepare('SELECT * FROM job_attempts WHERE id = ?')
+      .get(review.workerAttemptId) as AttemptRow | undefined;
+    const reviewer = this.database.prepare('SELECT * FROM job_attempts WHERE id = ?')
+      .get(review.reviewerAttemptId) as AttemptRow | undefined;
+    if (!worker || !reviewer || worker.job_id !== review.jobId || reviewer.job_id !== review.jobId
+      || worker.execution_role !== 'worker' || reviewer.execution_role !== 'reviewer'
+      || reviewer.runtime_agent_id !== review.reviewerRuntimeAgentId) {
+      throw new Error(`Invalid Attempt Review associations: ${review.id}`);
+    }
+    try {
+      this.database.prepare(`
+        INSERT INTO attempt_reviews
+          (id, job_id, worker_attempt_id, reviewer_attempt_id,
+           reviewer_runtime_agent_id, decision, summary, feedback, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        review.id,
+        review.jobId,
+        review.workerAttemptId,
+        review.reviewerAttemptId,
+        review.reviewerRuntimeAgentId,
+        review.decision,
+        review.summary,
+        review.feedback ?? null,
+        review.createdAt,
+      );
+    } catch (error) {
+      throw new Error(`Could not create Attempt Review ${review.id}: ${(error as Error).message}`);
+    }
+  }
+
+  async getAttemptReviewForWorkerAttempt(workerAttemptId: string): Promise<DurableAttemptReview | null> {
+    this.assertOpen();
+    if (!this.supportsOrchestration) return null;
+    const row = this.database.prepare('SELECT * FROM attempt_reviews WHERE worker_attempt_id = ?')
+      .get(workerAttemptId) as AttemptReviewRow | undefined;
+    return row ? toAttemptReview(row) : null;
+  }
+
+  async listAttemptReviewsForJob(jobId: string): Promise<readonly DurableAttemptReview[]> {
+    this.assertOpen();
+    if (!this.supportsOrchestration) return [];
+    return (this.database.prepare(`
+      SELECT * FROM attempt_reviews WHERE job_id = ? ORDER BY created_at, id
+    `).all(jobId) as AttemptReviewRow[]).map(toAttemptReview);
+  }
+
+  async createEscalation(escalation: DurableEscalation): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsOrchestration) throw new Error('Escalations require Agent Operations schema v9');
+    requireNonEmpty(escalation.summary, 'Escalation summary');
+    if (!escalation.id.startsWith('escalation:')) {
+      throw new Error(`Invalid Escalation ID: ${escalation.id}`);
+    }
+    const job = this.database.prepare('SELECT 1 FROM jobs WHERE id = ?').get(escalation.jobId);
+    if (!job) throw new Error(`Unknown Job for Escalation: ${escalation.jobId}`);
+    if (escalation.attemptId) {
+      const attempt = this.database.prepare('SELECT job_id FROM job_attempts WHERE id = ?')
+        .get(escalation.attemptId) as { job_id: string } | undefined;
+      if (attempt?.job_id !== escalation.jobId) {
+        throw new Error(`Invalid Escalation Attempt association: ${escalation.id}`);
+      }
+    }
+    if (escalation.reviewId) {
+      const review = this.database.prepare('SELECT job_id FROM attempt_reviews WHERE id = ?')
+        .get(escalation.reviewId) as { job_id: string } | undefined;
+      if (review?.job_id !== escalation.jobId) {
+        throw new Error(`Invalid Escalation Review association: ${escalation.id}`);
+      }
+    }
+    try {
+      this.database.prepare(`
+        INSERT INTO escalations
+          (id, job_id, attempt_id, review_id, reason, summary, created_at, resolved_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        escalation.id,
+        escalation.jobId,
+        escalation.attemptId ?? null,
+        escalation.reviewId ?? null,
+        escalation.reason,
+        escalation.summary,
+        escalation.createdAt,
+        escalation.resolvedAt ?? null,
+      );
+    } catch (error) {
+      throw new Error(`Could not create Escalation ${escalation.id}: ${(error as Error).message}`);
+    }
+  }
+
+  async getEscalation(id: string): Promise<DurableEscalation | null> {
+    this.assertOpen();
+    if (!this.supportsOrchestration) return null;
+    const row = this.database.prepare('SELECT * FROM escalations WHERE id = ?')
+      .get(id) as EscalationRow | undefined;
+    return row ? toEscalation(row) : null;
+  }
+
+  async listEscalations(
+    jobId?: string,
+    unresolvedOnly = false,
+  ): Promise<readonly DurableEscalation[]> {
+    this.assertOpen();
+    if (!this.supportsOrchestration) return [];
+    const clauses: string[] = [];
+    const parameters: string[] = [];
+    if (jobId) {
+      clauses.push('job_id = ?');
+      parameters.push(jobId);
+    }
+    if (unresolvedOnly) clauses.push('resolved_at IS NULL');
+    const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
+    return (this.database.prepare(
+      `SELECT * FROM escalations${where} ORDER BY created_at, id`,
+    ).all(...parameters) as EscalationRow[]).map(toEscalation);
   }
 
   async close(): Promise<void> {

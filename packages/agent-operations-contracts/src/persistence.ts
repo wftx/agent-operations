@@ -12,6 +12,10 @@ import type {
   DurableAttemptOutcomeDecision,
   DurableExecutionObservation,
 } from './observation.js';
+import type {
+  DurableAttemptReview,
+  DurableEscalation,
+} from './orchestration.js';
 
 export interface AgentOperationsInstallation {
   readonly id: string;
@@ -121,6 +125,12 @@ export interface AgentOperationsStateStore {
   ): Promise<readonly DurableExecutionObservation[]>;
   createAttemptOutcomeDecision(decision: DurableAttemptOutcomeDecision): Promise<void>;
   getAttemptOutcomeDecision(attemptId: string): Promise<DurableAttemptOutcomeDecision | null>;
+  createAttemptReview(review: DurableAttemptReview): Promise<void>;
+  getAttemptReviewForWorkerAttempt(workerAttemptId: string): Promise<DurableAttemptReview | null>;
+  listAttemptReviewsForJob(jobId: string): Promise<readonly DurableAttemptReview[]>;
+  createEscalation(escalation: DurableEscalation): Promise<void>;
+  getEscalation(id: string): Promise<DurableEscalation | null>;
+  listEscalations(jobId?: string, unresolvedOnly?: boolean): Promise<readonly DurableEscalation[]>;
   close(): Promise<void>;
 }
 

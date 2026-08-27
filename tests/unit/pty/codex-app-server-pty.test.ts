@@ -808,15 +808,45 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
       selectedCapabilityRoots: [],
       config: {
         features: {
+          apps: false,
+          auth_elicitation: false,
+          browser_use: false,
+          browser_use_external: false,
+          browser_use_full_cdp_access: false,
           code_mode: false,
           code_mode_host: false,
+          computer_use: false,
+          deferred_executor: false,
+          enable_mcp_apps: false,
+          executor_capability_discovery: false,
           goals: false,
+          guardian_approval: false,
           hooks: false,
+          image_generation: false,
+          in_app_browser: false,
+          in_app_chat: false,
+          in_app_local_automation: false,
           memories: false,
           multi_agent: false,
+          network_proxy: false,
+          plugin_sharing: false,
+          plugins: false,
+          recommended_plugins: false,
+          remote_plugin: false,
+          request_permissions_tool: false,
           shell_snapshot: false,
           shell_snapshot_v2: false,
           shell_tool: false,
+          skill_mcp_dependency_install: false,
+          skill_search: false,
+          standalone_web_search: false,
+          tool_call_mcp_elicitation: false,
+          tool_suggest: false,
+          unified_exec: false,
+          view_image: false,
+          web_search_cached: false,
+          web_search_request: false,
+          workspace_dependencies: false,
         },
         agents: { enabled: false },
         allow_login_shell: false,
@@ -957,11 +987,28 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
     expect(threadStart.runtimeWorkspaceRoots).toEqual([]);
     expect(threadStart.sandbox).toBe('read-only');
     expect(threadStart.config.features).toMatchObject({
+      apps: false,
+      auth_elicitation: false,
+      browser_use: false,
       code_mode: false,
       code_mode_host: false,
+      computer_use: false,
+      deferred_executor: false,
+      enable_mcp_apps: false,
+      plugin_sharing: false,
+      plugins: false,
+      recommended_plugins: false,
+      remote_plugin: false,
       shell_snapshot: false,
       shell_snapshot_v2: false,
       shell_tool: false,
+      skill_mcp_dependency_install: false,
+      skill_search: false,
+      unified_exec: false,
+      view_image: false,
+      web_search_request: false,
+      tool_call_mcp_elicitation: false,
+      workspace_dependencies: false,
     });
     expect(JSON.stringify(threadStart)).not.toContain('.agent-operations');
     expect(JSON.stringify(threadStart.dynamicTools)).not.toContain('shell');
@@ -969,6 +1016,17 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
     const record = String(atomicWriteSyncMock.mock.calls.at(-1)?.[1]);
     expect(record).toContain(`"repositoryReadRoot":"${root}"`);
     expect(record).toContain('"repositoryRead":true');
+
+    rpc(pty).handleRpcMessage({
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-reader',
+        turnId: 'turn-reader',
+        item: { type: 'agentMessage', text: 'bounded final repository result' },
+      },
+    });
+    expect(String(atomicWriteSyncMock.mock.calls.at(-1)?.[1]))
+      .toContain('"resultText":"bounded final repository result"');
 
     rpc(pty).handleRpcMessage({
       method: 'turn/completed',
@@ -1010,6 +1068,21 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
 
     rpc(pty).handleRpcMessage({
       method: 'item/tool/call',
+      id: 73,
+      params: {
+        threadId: 'thread-reader',
+        turnId: 'turn-reader',
+        callId: 'call-root',
+        namespace: 'repository',
+        tool: 'list',
+        arguments: { path: '' },
+      },
+    });
+    expect(list).toHaveBeenLastCalledWith('.');
+    expect(String(atomicWriteSyncMock.mock.calls.at(-1)?.[1])).not.toContain('"path":""');
+
+    rpc(pty).handleRpcMessage({
+      method: 'item/tool/call',
       id: 72,
       params: {
         threadId: 'thread-other',
@@ -1020,7 +1093,7 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
         arguments: { path: '.' },
       },
     });
-    expect(list).toHaveBeenCalledTimes(1);
+    expect(list).toHaveBeenCalledTimes(2);
     expect(respondMock).toHaveBeenCalledWith(72, expect.objectContaining({ success: false }));
   });
 

@@ -4,6 +4,7 @@ import type {
   DurableJobAttempt,
   DurableProject,
   DurableRepository,
+  ExecutionRole,
   JobStatus,
 } from '../../agent-operations-contracts/src/index.js';
 import {
@@ -16,6 +17,8 @@ export interface CreateJobInput {
   readonly projectId: string;
   readonly title: string;
   readonly description?: string;
+  readonly acceptanceCriteria?: string;
+  readonly automaticReadOnlyCompletion?: boolean;
   readonly repositoryId?: string;
   readonly preferredRuntimeAgentId?: string;
 }
@@ -23,6 +26,7 @@ export interface CreateJobInput {
 export interface CreateAttemptInput {
   /** Actual runtime for this attempt. Omit to inherit the job preference. */
   readonly runtimeAgentId?: string;
+  readonly executionRole?: ExecutionRole;
 }
 
 export interface JobDetail {
@@ -78,11 +82,17 @@ export class JobLifecycleService {
       await this.requireRuntimeAssociation(projectId, input.preferredRuntimeAgentId);
     }
     const timestamp = this.now().toISOString();
+    const acceptanceCriteria = optional(input.acceptanceCriteria);
+    if (input.automaticReadOnlyCompletion && !acceptanceCriteria) {
+      throw new Error('Automatic read-only completion requires acceptance criteria');
+    }
     const job: DurableJob = {
       id: this.jobIdFactory(),
       projectId,
       title: required(input.title, 'Job title'),
       ...(optional(input.description) ? { description: optional(input.description) } : {}),
+      ...(acceptanceCriteria ? { acceptanceCriteria } : {}),
+      ...(input.automaticReadOnlyCompletion ? { automaticReadOnlyCompletion: true } : {}),
       status: 'draft',
       ...(input.repositoryId ? { repositoryId: input.repositoryId } : {}),
       ...(input.preferredRuntimeAgentId
@@ -109,8 +119,9 @@ export class JobLifecycleService {
     if (attempts.some(attempt => isActiveAttemptStatus(attempt.status))) {
       throw new Error(`Job ${job.id} cannot complete while an attempt is active`);
     }
-    if (!attempts.some(attempt => attempt.status === 'completed')) {
-      throw new Error(`Job ${job.id} requires a completed attempt before completion`);
+    if (!attempts.some(attempt => attempt.executionRole === 'worker'
+      && attempt.status === 'completed')) {
+      throw new Error(`Job ${job.id} requires a completed attempt from the Worker role before completion`);
     }
     return this.transitionJob(job, 'completed');
   }
@@ -137,6 +148,7 @@ export class JobLifecycleService {
       id: this.attemptIdFactory(),
       jobId: job.id,
       ...(runtimeAgentId ? { runtimeAgentId } : {}),
+      executionRole: input.executionRole ?? 'worker',
       status: 'created',
       revision: 0,
       createdAt: timestamp,

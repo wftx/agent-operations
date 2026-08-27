@@ -71,9 +71,10 @@ export class ExecutionPlanningService {
       throw new Error(`Attempt ${attempt.id} must be created to prepare an Execution Plan`);
     }
     const activeAttempts = (await this.store.listAttemptsForJob(job.id))
-      .filter(candidate => candidate.status === 'created' || candidate.status === 'running');
+      .filter(candidate => candidate.executionRole === attempt.executionRole
+        && (candidate.status === 'created' || candidate.status === 'running'));
     if (activeAttempts.length !== 1 || activeAttempts[0].id !== attempt.id) {
-      throw new Error(`Attempt ${attempt.id} must be the Job's only active Attempt`);
+      throw new Error(`Attempt ${attempt.id} must be the Job's only active ${attempt.executionRole} Attempt`);
     }
     if (!attempt.runtimeAgentId) {
       throw new Error(`Attempt ${attempt.id} requires an actual runtime assignment`);

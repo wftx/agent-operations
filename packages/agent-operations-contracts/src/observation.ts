@@ -4,6 +4,7 @@ import type {
   RuntimeExecutionContext,
   RuntimeExecutionPolicy,
 } from './execution.js';
+import { EXECUTION_RESULT_MAX_CHARS } from './orchestration.js';
 
 export const EXECUTION_OBSERVATION_KINDS = [
   'runtime-running',
@@ -46,6 +47,8 @@ export interface RuntimeExecutionObservation {
   readonly externalReference?: string;
   readonly message?: string;
   readonly outputSummary?: string;
+  /** Bounded final visible assistant text from the exact correlated turn. */
+  readonly resultText?: string;
   /** Trusted exact-turn context; omitted for weak or legacy observations. */
   readonly executionContext?: RuntimeExecutionContext;
   /** Trusted exact-turn policy; omitted for weak or legacy observations. */
@@ -109,4 +112,8 @@ export function isExactCompletionObservation(
   return observation.kind === 'turn-completed'
     && observation.correlation === 'exact'
     && observation.correlatedDispatchId === observation.dispatchId;
+}
+
+export function isBoundedExecutionResult(value: string): boolean {
+  return Boolean(value.trim()) && value.length <= EXECUTION_RESULT_MAX_CHARS;
 }

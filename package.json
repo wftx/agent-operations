@@ -33,6 +33,8 @@
     "dev:observe-cortextos": "node --import tsx scripts/observe-cortextos.ts",
     "dev:live-rehearsal": "node --import tsx scripts/live-rehearsal.ts",
     "dev:repository-rehearsal": "node --import tsx scripts/repository-rehearsal.ts",
+    "dev:orchestrate": "node --import tsx scripts/orchestrate.ts",
+    "test:agent-operations-orchestration": "vitest run packages/agent-operations-core/test/orchestration-service.test.ts packages/sqlite-state-adapter/test/orchestration-persistence.test.ts packages/cortextos-execution-observer/test/cortextos-execution-observer.test.ts tests/unit/pty/codex-app-server-pty.test.ts",
     "test:agent-operations-repository-execution": "vitest run packages/git-adapter/test packages/agent-operations-core/test/repository-execution.test.ts packages/agent-operations-rehearsal/test/control-plane-authority.test.ts packages/cortextos-execution-adapter/test packages/cortextos-execution-observer/test tests/unit/daemon/ipc-correlation.test.ts tests/unit/pty/repository-read-capability.test.ts tests/unit/pty/codex-app-server-pty.test.ts",
     "test:codex": "vitest run tests/e2e/lifecycle-codex.test.ts tests/integration/multi-agent-crons-codex.test.ts tests/integration/codex-bus-roundtrip.test.ts tests/integration/codex-handoff-lifecycle.test.ts tests/integration/fleet-health-mixed-codex-claude.test.ts dashboard/src/lib/__tests__/cost-parser-codex.test.ts",
     "typecheck": "tsc --noEmit && tsc --project tsconfig.agent-operations.json --noEmit",

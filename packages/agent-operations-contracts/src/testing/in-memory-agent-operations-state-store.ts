@@ -21,6 +21,8 @@ import type {
   DurableAttemptOutcomeDecision,
   DurableExecutionObservation,
 } from '../observation.js';
+import { isBoundedExecutionResult } from '../observation.js';
+import type { DurableAttemptReview, DurableEscalation } from '../orchestration.js';
 
 export type InMemoryStateStoreOperation =
   | 'get-installation'
@@ -34,6 +36,8 @@ export type InMemoryStateStoreOperation =
   | 'write-execution-dispatch'
   | 'write-execution-observation'
   | 'write-attempt-outcome'
+  | 'write-attempt-review'
+  | 'write-escalation'
   | 'close';
 
 export interface InMemoryAgentOperationsStateStoreOptions {
@@ -104,6 +108,14 @@ function copyAttemptOutcomeDecision(value: DurableAttemptOutcomeDecision): Durab
   return { ...value };
 }
 
+function copyAttemptReview(value: DurableAttemptReview): DurableAttemptReview {
+  return { ...value };
+}
+
+function copyEscalation(value: DurableEscalation): DurableEscalation {
+  return { ...value };
+}
+
 function isValidDispatchTransition(from: string, to: string): boolean {
   return from === 'prepared' && to === 'submitting'
     || from === 'submitting' && (to === 'accepted' || to === 'rejected' || to === 'uncertain');
@@ -159,6 +171,8 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   private readonly executionDispatches = new Map<string, DurableExecutionDispatch>();
   private readonly executionObservations = new Map<string, DurableExecutionObservation>();
   private readonly attemptOutcomeDecisions = new Map<string, DurableAttemptOutcomeDecision>();
+  private readonly attemptReviews = new Map<string, DurableAttemptReview>();
+  private readonly escalations = new Map<string, DurableEscalation>();
   private closed = false;
 
   constructor(options: InMemoryAgentOperationsStateStoreOptions = {}) {
@@ -331,6 +345,9 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     this.assertAvailable('write-job');
     requireNonEmpty(job.id, 'Job ID');
     requireNonEmpty(job.title, 'Job title');
+    if (job.automaticReadOnlyCompletion && !job.acceptanceCriteria?.trim()) {
+      throw new Error('Automatic read-only completion requires acceptance criteria');
+    }
     if (!job.id.startsWith('job:')) throw new Error(`Invalid Agent Operations job ID: ${job.id}`);
     if (job.status !== 'draft' || job.revision !== 0) throw new Error('New jobs must be draft at revision 0');
     if (!this.projects.has(job.projectId)) throw new Error(`Unknown project for job: ${job.projectId}`);
@@ -369,6 +386,8 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     if (existing.projectId !== job.projectId
       || existing.repositoryId !== job.repositoryId
       || existing.preferredRuntimeAgentId !== job.preferredRuntimeAgentId
+      || existing.acceptanceCriteria !== job.acceptanceCriteria
+      || existing.automaticReadOnlyCompletion !== job.automaticReadOnlyCompletion
       || existing.createdAt !== job.createdAt) {
       throw new Error(`Job transition cannot rewrite durable identity or assignment: ${job.id}`);
     }
@@ -388,13 +407,17 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
       throw new Error(`Runtime ${attempt.runtimeAgentId} is not associated with project ${job.projectId}`);
     }
     if (this.attempts.has(attempt.id)) throw new Error(`Duplicate attempt ID: ${attempt.id}`);
+    const executionRole = attempt.executionRole ?? 'worker';
     const jobAttempts = [...this.attempts.values()].filter(candidate => candidate.jobId === attempt.jobId);
-    if (jobAttempts.some(candidate => isActiveAttemptStatus(candidate.status))) {
-      throw new Error(`Job ${attempt.jobId} already has an active attempt`);
+    const roleAttempts = jobAttempts.filter(candidate => candidate.executionRole === executionRole);
+    if (roleAttempts.some(candidate => isActiveAttemptStatus(candidate.status))) {
+      throw new Error(`Job ${attempt.jobId} already has an active attempt for role ${executionRole}`);
     }
     const created: DurableJobAttempt = {
       ...attempt,
       sequence: Math.max(0, ...jobAttempts.map(candidate => candidate.sequence)) + 1,
+      roleSequence: Math.max(0, ...roleAttempts.map(candidate => candidate.roleSequence)) + 1,
+      executionRole,
     };
     this.attempts.set(created.id, copyAttempt(created));
     return copyAttempt(created);
@@ -410,7 +433,7 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     this.assertAvailable('read');
     return [...this.attempts.values()]
       .filter(attempt => attempt.jobId === jobId)
-      .sort((a, b) => a.sequence - b.sequence)
+      .sort((a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id))
       .map(copyAttempt);
   }
 
@@ -423,6 +446,8 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     }
     if (existing.jobId !== attempt.jobId
       || existing.sequence !== attempt.sequence
+      || existing.roleSequence !== attempt.roleSequence
+      || existing.executionRole !== attempt.executionRole
       || existing.runtimeAgentId !== attempt.runtimeAgentId
       || existing.createdAt !== attempt.createdAt) {
       throw new Error(`Attempt transition cannot rewrite durable identity or assignment: ${attempt.id}`);
@@ -601,6 +626,12 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     if (observation.correlation !== 'exact' && observation.correlatedDispatchId !== undefined) {
       throw new Error(`Non-exact Execution Observation cannot identify a Dispatch: ${observation.id}`);
     }
+    if (observation.resultText !== undefined
+      && (!isBoundedExecutionResult(observation.resultText)
+        || observation.kind !== 'turn-completed'
+        || observation.correlation !== 'exact')) {
+      throw new Error(`Execution result text requires exact bounded completion evidence: ${observation.id}`);
+    }
     const duplicate = this.executionObservations.get(observation.id)
       ?? [...this.executionObservations.values()].find(candidate =>
         candidate.dispatchId === observation.dispatchId
@@ -654,6 +685,79 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     this.assertAvailable('read');
     const decision = this.attemptOutcomeDecisions.get(attemptId);
     return decision ? copyAttemptOutcomeDecision(decision) : null;
+  }
+
+  async createAttemptReview(review: DurableAttemptReview): Promise<void> {
+    this.assertAvailable('write-attempt-review');
+    requireNonEmpty(review.id, 'Attempt Review ID');
+    requireNonEmpty(review.summary, 'Attempt Review summary');
+    if (!review.id.startsWith('review:')) throw new Error(`Invalid Attempt Review ID: ${review.id}`);
+    const worker = this.attempts.get(review.workerAttemptId);
+    const reviewer = this.attempts.get(review.reviewerAttemptId);
+    if (!worker || !reviewer || worker.jobId !== review.jobId || reviewer.jobId !== review.jobId
+      || worker.executionRole !== 'worker' || reviewer.executionRole !== 'reviewer'
+      || reviewer.runtimeAgentId !== review.reviewerRuntimeAgentId) {
+      throw new Error(`Invalid Attempt Review associations: ${review.id}`);
+    }
+    if (review.decision === 'REVISION_REQUIRED' && !review.feedback?.trim()) {
+      throw new Error('Revision-required review needs concrete feedback');
+    }
+    if ([...this.attemptReviews.values()].some(candidate =>
+      candidate.id === review.id
+      || candidate.workerAttemptId === review.workerAttemptId
+      || candidate.reviewerAttemptId === review.reviewerAttemptId)) {
+      throw new Error(`Duplicate Attempt Review: ${review.id}`);
+    }
+    this.attemptReviews.set(review.id, copyAttemptReview(review));
+  }
+
+  async getAttemptReviewForWorkerAttempt(workerAttemptId: string): Promise<DurableAttemptReview | null> {
+    this.assertAvailable('read');
+    const value = [...this.attemptReviews.values()]
+      .find(review => review.workerAttemptId === workerAttemptId);
+    return value ? copyAttemptReview(value) : null;
+  }
+
+  async listAttemptReviewsForJob(jobId: string): Promise<readonly DurableAttemptReview[]> {
+    this.assertAvailable('read');
+    return [...this.attemptReviews.values()]
+      .filter(review => review.jobId === jobId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map(copyAttemptReview);
+  }
+
+  async createEscalation(escalation: DurableEscalation): Promise<void> {
+    this.assertAvailable('write-escalation');
+    requireNonEmpty(escalation.id, 'Escalation ID');
+    requireNonEmpty(escalation.summary, 'Escalation summary');
+    if (!escalation.id.startsWith('escalation:')) throw new Error(`Invalid Escalation ID: ${escalation.id}`);
+    if (!this.jobs.has(escalation.jobId)) throw new Error(`Unknown Job for Escalation: ${escalation.jobId}`);
+    if (escalation.attemptId && this.attempts.get(escalation.attemptId)?.jobId !== escalation.jobId) {
+      throw new Error(`Invalid Escalation Attempt association: ${escalation.id}`);
+    }
+    if (escalation.reviewId && this.attemptReviews.get(escalation.reviewId)?.jobId !== escalation.jobId) {
+      throw new Error(`Invalid Escalation Review association: ${escalation.id}`);
+    }
+    if (this.escalations.has(escalation.id)) throw new Error(`Duplicate Escalation ID: ${escalation.id}`);
+    this.escalations.set(escalation.id, copyEscalation(escalation));
+  }
+
+  async getEscalation(id: string): Promise<DurableEscalation | null> {
+    this.assertAvailable('read');
+    const value = this.escalations.get(id);
+    return value ? copyEscalation(value) : null;
+  }
+
+  async listEscalations(
+    jobId?: string,
+    unresolvedOnly = false,
+  ): Promise<readonly DurableEscalation[]> {
+    this.assertAvailable('read');
+    return [...this.escalations.values()]
+      .filter(escalation => (!jobId || escalation.jobId === jobId)
+        && (!unresolvedOnly || !escalation.resolvedAt))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map(copyEscalation);
   }
 
   async close(): Promise<void> {

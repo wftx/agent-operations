@@ -84,6 +84,8 @@ interface CorrelatedTurnRecord {
   completedAt?: string;
   durationMs?: number;
   error?: string;
+  /** Bounded visible assistant output only; never hidden reasoning or transcript. */
+  resultText?: string;
   workingDirectory?: string;
   effectivePolicy?: RuntimeExecutionPolicyEnvelope;
   effectiveCapabilities?: RuntimeExecutionCapabilitiesEnvelope;
@@ -114,6 +116,8 @@ export interface CodexExecutionPolicyMapping {
   readonly shellEnvironmentInherit: 'none' | 'core' | 'all';
   readonly runtimeWorkspaceRoots: readonly string[];
 }
+
+const CORRELATED_RESULT_MAX_CHARS = 16_384;
 
 interface SkillsListResponse {
   data?: Array<{
@@ -246,6 +250,7 @@ export class CodexAppServerPTY {
   private _protectedThreadId: string | null = null;
   private _repositoryReader: RootScopedRepositoryReader | null = null;
   private _repositoryReadOperations: RepositoryReadAuditEvent[] = [];
+  private _protectedTurnResultText: string | null = null;
   private _correlationStartPending = false;
   private _writeBuffer = '';
   private _turnQueue: unknown[][] = [];
@@ -342,6 +347,7 @@ export class CodexAppServerPTY {
     this._protectedThreadId = null;
     this._repositoryReader = null;
     this._repositoryReadOperations = [];
+    this._protectedTurnResultText = null;
     this._correlationStartPending = false;
     this._turnQueue = [];
     this.rejectTurnCompletion(new Error('Codex app-server stopped'));
@@ -439,6 +445,7 @@ export class CodexAppServerPTY {
         ? new RootScopedRepositoryReader(executionWorkingDirectory)
         : null;
       this._repositoryReadOperations = [];
+      this._protectedTurnResultText = null;
       threadId = policyMapping
         ? await this.startPolicyIsolatedThread(
             policyMapping,
@@ -451,6 +458,7 @@ export class CodexAppServerPTY {
       this._correlationStartPending = false;
       this._repositoryReader = null;
       this._repositoryReadOperations = [];
+      this._protectedTurnResultText = null;
       if (this._alive && this._turnQueue.length > 0) void this.drainQueue();
       throw new Error(`POLICY_THREAD_SETUP_FAILED: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -559,15 +567,45 @@ export class CodexAppServerPTY {
       selectedCapabilityRoots: [],
       config: {
         features: {
+          apps: false,
+          auth_elicitation: false,
+          browser_use: false,
+          browser_use_external: false,
+          browser_use_full_cdp_access: false,
           code_mode: false,
           code_mode_host: false,
+          computer_use: false,
+          deferred_executor: false,
+          enable_mcp_apps: false,
+          executor_capability_discovery: false,
           goals: false,
+          guardian_approval: false,
           hooks: false,
+          image_generation: false,
+          in_app_browser: false,
+          in_app_chat: false,
+          in_app_local_automation: false,
           memories: false,
           multi_agent: false,
+          network_proxy: false,
+          plugin_sharing: false,
+          plugins: false,
+          recommended_plugins: false,
+          remote_plugin: false,
+          request_permissions_tool: false,
           shell_snapshot: false,
           shell_snapshot_v2: false,
           shell_tool: false,
+          skill_mcp_dependency_install: false,
+          skill_search: false,
+          standalone_web_search: false,
+          tool_call_mcp_elicitation: false,
+          tool_suggest: false,
+          unified_exec: false,
+          view_image: false,
+          web_search_cached: false,
+          web_search_request: false,
+          workspace_dependencies: false,
         },
         agents: { enabled: false },
         allow_login_shell: false,
@@ -1160,6 +1198,19 @@ export class CodexAppServerPTY {
         break;
       case 'item/completed':
         if (isRecord(params.item) && params.item.type === 'agentMessage' && typeof params.item.text === 'string') {
+          if (params.threadId === this._protectedThreadId
+            && params.turnId === this._protectedTurnId) {
+            const resultText = params.item.text.trim();
+            this._protectedTurnResultText = resultText
+              ? resultText.slice(0, CORRELATED_RESULT_MAX_CHARS)
+              : null;
+            if (this._protectedThreadId && this._protectedTurnId) {
+              this.writeCorrelatedTurnRecord(
+                this._protectedThreadId,
+                { id: this._protectedTurnId, status: 'inProgress' },
+              );
+            }
+          }
           this._outputBuffer.push('\n');
         }
         break;
@@ -1222,7 +1273,7 @@ export class CodexAppServerPTY {
       ? params.tool
       : null;
     const args = params && isRecord(params.arguments) ? params.arguments : {};
-    const path = typeof args.path === 'string' ? args.path : '.';
+    const path = typeof args.path === 'string' && args.path.trim() ? args.path : '.';
     const query = typeof args.query === 'string' ? args.query : undefined;
     const reply = (success: boolean, value: unknown): void => {
       this._rpc?.respond(id, {
@@ -1328,6 +1379,7 @@ export class CodexAppServerPTY {
     this._correlationStartPending = false;
     this._repositoryReader = null;
     this._repositoryReadOperations = [];
+    this._protectedTurnResultText = null;
     this._executing = false;
     if (this._alive && this._turnQueue.length > 0) {
       this.drainQueue().catch((error) => {
@@ -1378,6 +1430,7 @@ export class CodexAppServerPTY {
     const recordedOperations = this._repositoryReadOperations.length
       ? this._repositoryReadOperations
       : previous?.repositoryReadOperations;
+    const recordedResultText = this._protectedTurnResultText ?? previous?.resultText;
     const record: CorrelatedTurnRecord = {
       version: 1,
       provider: 'codex',
@@ -1392,6 +1445,7 @@ export class CodexAppServerPTY {
       ...(completedAt ? { completedAt } : {}),
       ...(durationMs !== undefined ? { durationMs } : {}),
       ...(error ? { error: error.slice(0, 2_000) } : {}),
+      ...(recordedResultText ? { resultText: recordedResultText } : {}),
       ...((workingDirectory ?? previous?.workingDirectory)
         ? { workingDirectory: workingDirectory ?? previous!.workingDirectory }
         : {}),

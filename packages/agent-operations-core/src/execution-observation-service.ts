@@ -12,6 +12,7 @@ import type {
 } from '../../agent-operations-contracts/src/index.js';
 import {
   createExecutionObservationId,
+  EXECUTION_RESULT_MAX_CHARS,
   isExactCompletionObservation,
 } from '../../agent-operations-contracts/src/index.js';
 
@@ -214,6 +215,10 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
     || effectivePolicy !== undefined || effectiveCapabilities !== undefined)) {
     throw new Error('Only exact runtime observations may carry execution context evidence');
   }
+  const resultText = boundedOptional(value.resultText, EXECUTION_RESULT_MAX_CHARS);
+  if (resultText && (correlation !== 'exact' || kind !== 'turn-completed')) {
+    throw new Error('Execution result text requires exact turn-completion evidence');
+  }
   return {
     source,
     sourceEventId,
@@ -233,6 +238,7 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
     ...(boundedOptional(value.outputSummary, MAX_OUTPUT_SUMMARY_LENGTH)
       ? { outputSummary: boundedOptional(value.outputSummary, MAX_OUTPUT_SUMMARY_LENGTH) }
       : {}),
+    ...(resultText ? { resultText } : {}),
     ...(executionContext
       ? {
           executionContext: {

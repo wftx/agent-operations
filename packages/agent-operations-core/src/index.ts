@@ -44,3 +44,12 @@ export {
   type ConfirmAttemptSucceededInput,
   type ExecutionOutcomeServiceOptions,
 } from './execution-outcome-service.js';
+export {
+  MVP_MAX_REVIEWER_PASSES_PER_ATTEMPT,
+  MVP_MAX_WORKER_ATTEMPTS,
+  OrchestrationService,
+  parseReviewerResult,
+  type OrchestrationPreview,
+  type OrchestrationReadModel,
+  type OrchestrationServiceOptions,
+} from './orchestration-service.js';

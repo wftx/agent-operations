@@ -14,7 +14,8 @@ export const OBSERVATION_SCHEMA_VERSION = 5;
 export const RUNTIME_POLICY_SCHEMA_VERSION = 6;
 export const EXECUTION_CONTEXT_EVIDENCE_SCHEMA_VERSION = 7;
 export const EXECUTION_CAPABILITY_SCHEMA_VERSION = 8;
-export const CURRENT_SCHEMA_VERSION = EXECUTION_CAPABILITY_SCHEMA_VERSION;
+export const ORCHESTRATION_SCHEMA_VERSION = 9;
+export const CURRENT_SCHEMA_VERSION = ORCHESTRATION_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -391,6 +392,91 @@ const EXECUTION_CAPABILITY_SCHEMA_SQL = `
   END;
 `;
 
+const ORCHESTRATION_SCHEMA_SQL = `
+  ALTER TABLE jobs ADD COLUMN acceptance_criteria TEXT;
+  ALTER TABLE jobs ADD COLUMN automatic_read_only_completion INTEGER NOT NULL DEFAULT 0
+    CHECK (automatic_read_only_completion IN (0, 1));
+
+  CREATE TRIGGER jobs_automatic_completion_criteria_insert
+  BEFORE INSERT ON jobs
+  WHEN NEW.automatic_read_only_completion = 1
+    AND (NEW.acceptance_criteria IS NULL OR length(trim(NEW.acceptance_criteria)) = 0)
+  BEGIN
+    SELECT RAISE(ABORT, 'automatic read-only completion requires acceptance criteria');
+  END;
+
+  CREATE TRIGGER jobs_automatic_completion_criteria_update
+  BEFORE UPDATE OF automatic_read_only_completion, acceptance_criteria ON jobs
+  WHEN NEW.automatic_read_only_completion = 1
+    AND (NEW.acceptance_criteria IS NULL OR length(trim(NEW.acceptance_criteria)) = 0)
+  BEGIN
+    SELECT RAISE(ABORT, 'automatic read-only completion requires acceptance criteria');
+  END;
+
+  ALTER TABLE job_attempts ADD COLUMN execution_role TEXT NOT NULL DEFAULT 'worker'
+    CHECK (execution_role IN ('worker', 'reviewer'));
+  ALTER TABLE job_attempts ADD COLUMN role_sequence INTEGER NOT NULL DEFAULT 1
+    CHECK (role_sequence > 0);
+  UPDATE job_attempts SET role_sequence = sequence WHERE execution_role = 'worker';
+
+  DROP INDEX one_active_attempt_per_job;
+  CREATE UNIQUE INDEX one_active_attempt_per_job_role
+    ON job_attempts(job_id, execution_role)
+    WHERE status IN ('created', 'running');
+  CREATE UNIQUE INDEX attempts_role_sequence
+    ON job_attempts(job_id, execution_role, role_sequence);
+
+  ALTER TABLE execution_observations ADD COLUMN result_text TEXT;
+
+  CREATE TRIGGER execution_observations_result_insert
+  BEFORE INSERT ON execution_observations
+  WHEN NEW.result_text IS NOT NULL AND (
+    length(trim(NEW.result_text)) = 0
+    OR length(NEW.result_text) > 16384
+    OR NEW.kind <> 'turn-completed'
+    OR NEW.correlation <> 'exact'
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'execution result requires bounded exact completion evidence');
+  END;
+
+  CREATE TABLE attempt_reviews (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES jobs(id),
+    worker_attempt_id TEXT NOT NULL UNIQUE,
+    reviewer_attempt_id TEXT NOT NULL UNIQUE,
+    reviewer_runtime_agent_id TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('PASS', 'REVISION_REQUIRED', 'ESCALATE')),
+    summary TEXT NOT NULL CHECK (length(trim(summary)) > 0),
+    feedback TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (worker_attempt_id, job_id) REFERENCES job_attempts(id, job_id),
+    FOREIGN KEY (reviewer_attempt_id, job_id) REFERENCES job_attempts(id, job_id),
+    CHECK (decision <> 'REVISION_REQUIRED' OR length(trim(feedback)) > 0)
+  );
+
+  CREATE INDEX attempt_reviews_by_job ON attempt_reviews(job_id, created_at, id);
+
+  CREATE TABLE escalations (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES jobs(id),
+    attempt_id TEXT REFERENCES job_attempts(id),
+    review_id TEXT REFERENCES attempt_reviews(id),
+    reason TEXT NOT NULL CHECK (reason IN (
+      'review_failed_after_budget', 'reviewer_uncertain', 'dispatch_rejected',
+      'dispatch_uncertain', 'runtime_failure', 'exact_correlation_missing',
+      'observation_timeout', 'policy_blocked', 'human_judgment_required'
+    )),
+    summary TEXT NOT NULL CHECK (length(trim(summary)) > 0),
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+  );
+
+  CREATE INDEX escalations_needing_attention
+    ON escalations(resolved_at, created_at, id);
+  CREATE INDEX escalations_by_job ON escalations(job_id, created_at, id);
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -431,6 +517,11 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: EXECUTION_CAPABILITY_SCHEMA_VERSION,
     name: 'repository-read-execution-capability',
     up: database => database.exec(EXECUTION_CAPABILITY_SCHEMA_SQL),
+  },
+  {
+    version: ORCHESTRATION_SCHEMA_VERSION,
+    name: 'mvp-orchestrator-review-and-escalation',
+    up: database => database.exec(ORCHESTRATION_SCHEMA_SQL),
   },
 ];
 

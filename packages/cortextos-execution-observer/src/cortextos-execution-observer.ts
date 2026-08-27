@@ -12,6 +12,7 @@ import {
   CortextOSRuntimeAdapter,
   parseCodexExecutionReference,
 } from '../../cortextos-adapter/src/index.js';
+import { EXECUTION_RESULT_MAX_CHARS } from '../../agent-operations-contracts/src/index.js';
 
 interface CorrelatedTurnRecord {
   readonly version: 1;
@@ -23,6 +24,7 @@ interface CorrelatedTurnRecord {
   readonly startedAt?: string;
   readonly completedAt?: string;
   readonly error?: string;
+  readonly resultText?: string;
   readonly workingDirectory?: string;
   readonly repositoryReadRoot?: string;
   readonly effectivePolicy?: {
@@ -166,7 +168,11 @@ export class CortextOSExecutionObserver implements RuntimeExecutionObservationAd
       if (record.version !== 1 || record.provider !== 'codex'
         || record.threadId !== reference.threadId || record.turnId !== reference.turnId
         || !['inProgress', 'completed', 'failed', 'interrupted'].includes(record.status)
-        || Number.isNaN(new Date(record.observedAt).getTime())) {
+        || Number.isNaN(new Date(record.observedAt).getTime())
+        || (record.resultText !== undefined
+          && (typeof record.resultText !== 'string'
+            || !record.resultText.trim()
+            || record.resultText.length > EXECUTION_RESULT_MAX_CHARS))) {
         return this.unknownReference(request, 'The structured Codex turn record is malformed or mismatched.');
       }
       const kind = record.status === 'completed'
@@ -207,11 +213,14 @@ export class CortextOSExecutionObserver implements RuntimeExecutionObservationAd
         ...(executionContext ? { executionContext } : {}),
         ...(effectivePolicy ? { effectivePolicy } : {}),
         ...(effectiveCapabilities ? { effectiveCapabilities } : {}),
+        ...(record.status === 'completed' && record.resultText
+          ? { resultText: record.resultText }
+          : {}),
         ...(record.repositoryReadOperations?.length
           ? { outputSummary: `${record.repositoryReadOperations.length} bounded repository-read operation(s) recorded; file contents are not persisted.` }
           : {}),
         message: record.status === 'completed'
-          ? 'Codex reported structured completion for the exact accepted turn; semantic success still requires human judgment.'
+          ? 'Codex reported structured completion for the exact accepted turn; semantic outcome remains an Agent Operations control-plane decision.'
           : record.status === 'inProgress'
             ? 'The exact accepted Codex turn is still in progress.'
             : `The exact accepted Codex turn ended with status ${record.status}${record.error ? `: ${record.error}` : '.'}`,

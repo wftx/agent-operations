@@ -49,6 +49,7 @@ function writeTurnRecord(
   turnId: string,
   status: 'inProgress' | 'completed' | 'failed' | 'interrupted',
   executionEvidence = false,
+  resultText?: string,
 ): void {
   const directory = join(ctxRoot, 'state', 'coder', 'codex-turns', threadId);
   mkdirSync(directory, { recursive: true });
@@ -62,6 +63,7 @@ function writeTurnRecord(
     startedAt: TIME,
     ...(status === 'inProgress' ? {} : { completedAt: TIME }),
     ...(status === 'failed' ? { error: 'fixture failure' } : {}),
+    ...(resultText ? { resultText } : {}),
     ...(executionEvidence
       ? {
           workingDirectory: '/tmp/agent-operations',
@@ -153,7 +155,7 @@ describe('CortextOSExecutionObserver', () => {
 
   it('emits exact evidence only for the stored matching thread and turn', async () => {
     const ctxRoot = root();
-    writeTurnRecord(ctxRoot, 'thread-1', 'turn-1', 'completed', true);
+    writeTurnRecord(ctxRoot, 'thread-1', 'turn-1', 'completed', true, 'bounded final result');
     const observer = new CortextOSExecutionObserver({ runtimeAdapter: runtime(), ctxRoot });
     const observations = await observer.observe({ ...REQUEST, externalReference: EXACT_REFERENCE });
     expect(observations.at(-1)).toMatchObject({
@@ -170,6 +172,7 @@ describe('CortextOSExecutionObserver', () => {
         network: 'deny',
         environment: 'empty',
       },
+      resultText: 'bounded final result',
     });
   });
 
