@@ -9,7 +9,10 @@ import type {
   RepositoryCheckoutBinding,
 } from '../persistence.js';
 import { createRepositoryCheckoutBindingId } from '../persistence.js';
-import { isRuntimeExecutionPolicyNoBroaderThan } from '../execution.js';
+import {
+  isRuntimeExecutionCapabilitiesNoBroaderThan,
+  isRuntimeExecutionPolicyNoBroaderThan,
+} from '../execution.js';
 import type { DurableJob, DurableJobAttempt, NewDurableJobAttempt } from '../work.js';
 import { isActiveAttemptStatus } from '../work.js';
 import type { DurableExecutionPlan } from '../execution.js';
@@ -77,6 +80,9 @@ function copyExecutionPlan(value: DurableExecutionPlan): DurableExecutionPlan {
     ...value,
     input: { ...value.input },
     ...(value.requestedPolicy ? { requestedPolicy: { ...value.requestedPolicy } } : {}),
+    ...(value.requestedCapabilities
+      ? { requestedCapabilities: { ...value.requestedCapabilities } }
+      : {}),
   };
 }
 
@@ -84,6 +90,9 @@ function copyExecutionDispatch(value: DurableExecutionDispatch): DurableExecutio
   return {
     ...value,
     ...(value.effectivePolicy ? { effectivePolicy: { ...value.effectivePolicy } } : {}),
+    ...(value.effectiveCapabilities
+      ? { effectiveCapabilities: { ...value.effectiveCapabilities } }
+      : {}),
   };
 }
 
@@ -428,6 +437,7 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     if (!plan.id.startsWith('plan:')) throw new Error(`Invalid Execution Plan ID: ${plan.id}`);
     if (plan.input.version !== 1) throw new Error(`Unsupported execution input version: ${plan.input.version}`);
     if (!plan.requestedPolicy) throw new Error('New Execution Plans require an explicit runtime execution policy');
+    if (!plan.requestedCapabilities) throw new Error('New Execution Plans require explicit runtime tool capabilities');
     if (plan.jobRevisionAtPreparation < 0 || plan.attemptRevisionAtPreparation < 0) {
       throw new Error('Execution Plan revisions must be non-negative');
     }
@@ -547,8 +557,8 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     if (!isValidDispatchTransition(existing.status, dispatch.status)) {
       throw new Error(`Execution Dispatch cannot transition from ${existing.status} to ${dispatch.status}`);
     }
-    if (dispatch.status !== 'accepted' && dispatch.effectivePolicy) {
-      throw new Error(`Only an accepted Execution Dispatch may record effective policy: ${dispatch.id}`);
+    if (dispatch.status !== 'accepted' && (dispatch.effectivePolicy || dispatch.effectiveCapabilities)) {
+      throw new Error(`Only an accepted Execution Dispatch may record effective policy and capabilities: ${dispatch.id}`);
     }
     if (dispatch.status === 'accepted') {
       const requestedPolicy = this.executionPlans.get(dispatch.executionPlanId)?.requestedPolicy;
@@ -558,6 +568,17 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
       }
       if (!requestedPolicy && dispatch.effectivePolicy) {
         throw new Error(`Legacy Execution Dispatch cannot invent effective policy: ${dispatch.id}`);
+      }
+      const requestedCapabilities = this.executionPlans.get(dispatch.executionPlanId)?.requestedCapabilities;
+      if (requestedCapabilities && (!dispatch.effectiveCapabilities
+        || !isRuntimeExecutionCapabilitiesNoBroaderThan(
+          dispatch.effectiveCapabilities,
+          requestedCapabilities,
+        ))) {
+        throw new Error(`Accepted Execution Dispatch must record non-broader effective capabilities: ${dispatch.id}`);
+      }
+      if (!requestedCapabilities && dispatch.effectiveCapabilities) {
+        throw new Error(`Legacy Execution Dispatch cannot invent effective capabilities: ${dispatch.id}`);
       }
     }
     validateDispatchShape(dispatch);

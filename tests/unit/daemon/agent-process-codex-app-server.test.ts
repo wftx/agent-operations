@@ -262,7 +262,7 @@ describe('AgentProcess codex-app-server runtime', () => {
     expect(fsMocks.writeFileSync.mock.invocationCallOrder.at(-1))
       .toBeLessThan(mockCodexAppServerPty.startCorrelationSafeTurn.mock.invocationCallOrder[0]);
     expect(mockCodexAppServerPty.startCorrelationSafeTurn)
-      .toHaveBeenCalledWith('bounded task', 'dispatch-plan:plan-1', policy);
+      .toHaveBeenCalledWith('bounded task', 'dispatch-plan:plan-1', policy, undefined, undefined);
   });
 
   it('rejects a busy Codex runtime before marker or turn creation', async () => {

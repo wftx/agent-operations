@@ -12,9 +12,52 @@ const REQUEST: RuntimeDispatchRequest = {
   executionPlanId: 'plan:test',
   input: { version: 1, instruction: 'Investigate the failing test.' },
   requestedPolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
+  requestedCapabilities: { version: 1, repositoryRead: false },
 };
 
 describe('CortextOSExecutionAdapter', () => {
+  it('requires the daemon acknowledgement to prove the requested execution directory', async () => {
+    const request = {
+      ...REQUEST,
+      executionContext: { workingDirectory: '/tmp/agent-operations' },
+    };
+    const accepted = new CortextOSExecutionAdapter({
+      requestSender: async () => ({
+        success: true,
+        data: {
+          execution: {
+            provider: 'codex',
+            sessionId: 'thread-repository',
+            turnId: 'turn-repository',
+            effectivePolicy: REQUEST.requestedPolicy,
+            effectiveCapabilities: REQUEST.requestedCapabilities,
+            executionContext: request.executionContext,
+          },
+        },
+      }),
+    });
+    await expect(accepted.dispatch(request)).resolves.toMatchObject({ status: 'accepted' });
+
+    const mismatched = new CortextOSExecutionAdapter({
+      requestSender: async () => ({
+        success: true,
+        data: {
+          execution: {
+            provider: 'codex',
+            sessionId: 'thread-wrong',
+            turnId: 'turn-wrong',
+            effectivePolicy: REQUEST.requestedPolicy,
+            executionContext: { workingDirectory: '/tmp/wrong' },
+          },
+        },
+      }),
+    });
+    await expect(mismatched.dispatch(request)).resolves.toMatchObject({
+      status: 'uncertain',
+      code: 'SUBMISSION_UNCERTAIN',
+    });
+  });
+
   it('maps a structured Codex turn acknowledgement to one opaque external reference', async () => {
     const captured: unknown[] = [];
     const adapter = new CortextOSExecutionAdapter({
@@ -29,6 +72,7 @@ describe('CortextOSExecutionAdapter', () => {
               sessionId: 'thread-1',
               turnId: 'turn-1',
               effectivePolicy: REQUEST.requestedPolicy,
+              effectiveCapabilities: REQUEST.requestedCapabilities,
             },
           },
         };
@@ -39,6 +83,7 @@ describe('CortextOSExecutionAdapter', () => {
       externalReference: 'cortextos:codex-turn:v1:thread-1:turn-1',
       message: 'Started a new correlated turn for agent coder',
       effectivePolicy: REQUEST.requestedPolicy,
+      effectiveCapabilities: REQUEST.requestedCapabilities,
     });
     expect(captured).toEqual([{
       agentName: 'coder',

@@ -1,4 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
+import type {
+  RuntimeExecutionCapabilities,
+  RuntimeExecutionContext,
+  RuntimeExecutionPolicy,
+} from './execution.js';
 
 export const EXECUTION_OBSERVATION_KINDS = [
   'runtime-running',
@@ -41,6 +46,12 @@ export interface RuntimeExecutionObservation {
   readonly externalReference?: string;
   readonly message?: string;
   readonly outputSummary?: string;
+  /** Trusted exact-turn context; omitted for weak or legacy observations. */
+  readonly executionContext?: RuntimeExecutionContext;
+  /** Trusted exact-turn policy; omitted for weak or legacy observations. */
+  readonly effectivePolicy?: RuntimeExecutionPolicy;
+  /** Trusted exact-turn tool capability evidence; omitted for weak or legacy observations. */
+  readonly effectiveCapabilities?: RuntimeExecutionCapabilities;
 }
 
 /** Read-only, explicitly invoked observation capability. */

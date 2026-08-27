@@ -1,5 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import type { ExecutionInputEnvelope, RuntimeExecutionPolicy } from './execution.js';
+import type {
+  ExecutionInputEnvelope,
+  RuntimeExecutionCapabilities,
+  RuntimeExecutionContext,
+  RuntimeExecutionPolicy,
+} from './execution.js';
 
 export const DISPATCH_STATUSES = [
   'prepared',
@@ -22,6 +27,8 @@ export interface DurableExecutionDispatch {
   readonly status: DispatchStatus;
   /** Present after accepted policy-aware execution; absent for legacy history. */
   readonly effectivePolicy?: RuntimeExecutionPolicy;
+  /** Present after accepted capability-aware execution; absent for legacy history. */
+  readonly effectiveCapabilities?: RuntimeExecutionCapabilities;
   readonly externalReference?: string;
   readonly message?: string;
   readonly revision: number;
@@ -39,6 +46,9 @@ export interface RuntimeDispatchRequest {
   readonly executionPlanId: string;
   readonly input: ExecutionInputEnvelope;
   readonly requestedPolicy: RuntimeExecutionPolicy;
+  readonly requestedCapabilities: RuntimeExecutionCapabilities;
+  /** Present only when AO resolved and revalidated a repository-bound checkout. */
+  readonly executionContext?: RuntimeExecutionContext;
 }
 
 export type RuntimeDispatchResultCode =
@@ -53,6 +63,8 @@ export interface RuntimeDispatchResult {
   readonly code?: RuntimeDispatchResultCode;
   /** Required by AO before an accepted policy-aware result can be trusted. */
   readonly effectivePolicy?: RuntimeExecutionPolicy;
+  /** Required by AO before an accepted capability-aware result can be trusted. */
+  readonly effectiveCapabilities?: RuntimeExecutionCapabilities;
   readonly externalReference?: string;
   readonly message?: string;
 }

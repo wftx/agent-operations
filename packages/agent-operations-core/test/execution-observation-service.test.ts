@@ -75,6 +75,7 @@ async function harness(fixtures: readonly RuntimeExecutionObservation[] = []) {
     resolvedAt: TIME,
     revision: 2,
     effectivePolicy: plan.requestedPolicy,
+    effectiveCapabilities: plan.requestedCapabilities,
   };
   await store.saveExecutionDispatchTransition(accepted, 1);
   await lifecycle.startAttempt(attempt.id);

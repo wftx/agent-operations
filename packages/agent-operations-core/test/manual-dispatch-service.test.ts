@@ -131,6 +131,7 @@ describe('ManualDispatchService', () => {
         status: 'accepted',
         externalReference: 'external:one',
         effectivePolicy: plan.requestedPolicy,
+        effectiveCapabilities: plan.requestedCapabilities,
         revision: 2,
       },
     });
@@ -140,6 +141,7 @@ describe('ManualDispatchService', () => {
       executionPlanId: plan.id,
       input: { version: 1, instruction: 'Perform exactly one manual action.' },
       requestedPolicy: plan.requestedPolicy,
+      requestedCapabilities: plan.requestedCapabilities,
     });
     expect(await store.getAttempt(attempt.id)).toMatchObject({ status: 'running', revision: 1 });
 
@@ -245,6 +247,7 @@ describe('ManualDispatchService', () => {
       resolvedAt: TIME,
       revision: 2,
       effectivePolicy: setup.plan.requestedPolicy,
+      effectiveCapabilities: setup.plan.requestedCapabilities,
     };
     await setup.store.saveExecutionDispatchTransition(accepted, 1);
 

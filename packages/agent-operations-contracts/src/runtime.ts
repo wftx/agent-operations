@@ -24,6 +24,8 @@ export type RuntimeState = (typeof RUNTIME_STATES)[number];
 export type RuntimeCapability =
   | 'session-resume'
   | 'exact-turn-correlation'
+  | 'execution-working-directory'
+  | 'repository-read-tools'
   | 'filesystem-none'
   | 'filesystem-read-only'
   | 'filesystem-workspace-write'

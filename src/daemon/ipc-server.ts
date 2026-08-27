@@ -6,7 +6,9 @@ import type {
   IPCResponse,
   CronSummaryRow,
   CronDefinition,
+  RuntimeExecutionCapabilitiesEnvelope,
   RuntimeExecutionPolicyEnvelope,
+  RuntimeExecutionContextEnvelope,
 } from '../types/index.js';
 import { AgentManager } from './agent-manager.js';
 import { getIpcPath } from '../utils/paths.js';
@@ -726,6 +728,8 @@ export class IPCServer {
           const requireNewTurn = request.data?.requireNewTurn === true;
           const correlationId = request.data?.correlationId;
           const executionPolicy = request.data?.executionPolicy;
+          const executionContext = request.data?.executionContext;
+          const executionCapabilities = request.data?.executionCapabilities;
           if (!agentToInject || !textToInject) {
             response = { success: false, error: 'inject-agent requires: agent, data.text', code: 'INVALID_INPUT' };
           } else if (requireNewTurn && (typeof correlationId !== 'string'
@@ -734,12 +738,25 @@ export class IPCServer {
           } else if (requireNewTurn && executionPolicy !== undefined
             && !isRuntimeExecutionPolicyEnvelope(executionPolicy)) {
             response = { success: false, error: 'invalid correlation-safe executionPolicy', code: 'INVALID_INPUT' };
+          } else if (requireNewTurn && executionContext !== undefined
+            && !isRuntimeExecutionContextEnvelope(executionContext)) {
+            response = { success: false, error: 'invalid correlation-safe executionContext', code: 'INVALID_INPUT' };
+          } else if (requireNewTurn && executionCapabilities !== undefined
+            && !isRuntimeExecutionCapabilitiesEnvelope(executionCapabilities)) {
+            response = { success: false, error: 'invalid correlation-safe executionCapabilities', code: 'INVALID_INPUT' };
+          } else if (requireNewTurn
+            && (executionCapabilities as RuntimeExecutionCapabilitiesEnvelope | undefined)?.repositoryRead === true
+            && (executionContext as RuntimeExecutionContextEnvelope | undefined)?.repositoryReadRoot
+              !== (executionContext as RuntimeExecutionContextEnvelope | undefined)?.workingDirectory) {
+            response = { success: false, error: 'repository-read root must match execution working directory', code: 'INVALID_INPUT' };
           } else if (requireNewTurn) {
             const result = await this.agentManager.injectAgentCorrelatedDetailed(
               agentToInject,
               textToInject,
               correlationId as string,
               executionPolicy as RuntimeExecutionPolicyEnvelope | undefined,
+              executionContext as RuntimeExecutionContextEnvelope | undefined,
+              executionCapabilities as RuntimeExecutionCapabilitiesEnvelope | undefined,
             );
             if (result.ok) {
               response = {
@@ -752,6 +769,12 @@ export class IPCServer {
                     turnId: result.turnId,
                     ...(result.effectivePolicy
                       ? { effectivePolicy: result.effectivePolicy }
+                      : {}),
+                    ...(result.effectiveCapabilities
+                      ? { effectiveCapabilities: result.effectiveCapabilities }
+                      : {}),
+                    ...(result.executionContext
+                      ? { executionContext: result.executionContext }
                       : {}),
                   },
                 },
@@ -918,6 +941,30 @@ function isRuntimeExecutionPolicyEnvelope(value: unknown): value is RuntimeExecu
     && (policy.environment === 'empty'
       || policy.environment === 'minimal'
       || policy.environment === 'inherit');
+}
+
+function isRuntimeExecutionCapabilitiesEnvelope(
+  value: unknown,
+): value is RuntimeExecutionCapabilitiesEnvelope {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const capabilities = value as Record<string, unknown>;
+  return capabilities.version === 1 && typeof capabilities.repositoryRead === 'boolean';
+}
+
+function isRuntimeExecutionContextEnvelope(value: unknown): value is RuntimeExecutionContextEnvelope {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const context = value as Record<string, unknown>;
+  return typeof context.workingDirectory === 'string'
+    && context.workingDirectory.startsWith('/')
+    && context.workingDirectory.length <= 4_096
+    && !context.workingDirectory.includes('\0')
+    && pathResolve(context.workingDirectory) === context.workingDirectory
+    && (context.repositoryReadRoot === undefined
+      || (typeof context.repositoryReadRoot === 'string'
+        && context.repositoryReadRoot.startsWith('/')
+        && context.repositoryReadRoot.length <= 4_096
+        && !context.repositoryReadRoot.includes('\0')
+        && pathResolve(context.repositoryReadRoot) === context.repositoryReadRoot));
 }
 
 /**

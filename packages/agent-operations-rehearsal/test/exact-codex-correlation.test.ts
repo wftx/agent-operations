@@ -126,6 +126,7 @@ describe('exact Codex correlation across the durable AO boundary', () => {
           sessionId: THREAD_ID,
           turnId: TURN_ID,
           effectivePolicy: plan.requestedPolicy,
+          effectiveCapabilities: plan.requestedCapabilities,
         },
       },
     });
@@ -153,6 +154,7 @@ describe('exact Codex correlation across the durable AO boundary', () => {
     expect(sender.mock.calls[0]?.[2]).toMatchObject({
       dispatchId: 'dispatch:exact-correlation',
       idempotencyKey: 'dispatch-plan:plan:exact-correlation',
+      requestedCapabilities: { version: 1, repositoryRead: false },
     });
 
     await store.close();

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type {
   AgentRuntimeAdapter,
   RuntimeExecutionObservation,
@@ -23,6 +23,26 @@ interface CorrelatedTurnRecord {
   readonly startedAt?: string;
   readonly completedAt?: string;
   readonly error?: string;
+  readonly workingDirectory?: string;
+  readonly repositoryReadRoot?: string;
+  readonly effectivePolicy?: {
+    readonly version: 1;
+    readonly filesystem: 'none' | 'read-only' | 'workspace-write';
+    readonly network: 'deny' | 'allow';
+    readonly environment: 'empty' | 'minimal' | 'inherit';
+  };
+  readonly effectiveCapabilities?: {
+    readonly version: 1;
+    readonly repositoryRead: boolean;
+  };
+  readonly repositoryReadOperations?: readonly {
+    readonly operation: 'list' | 'read' | 'search';
+    readonly path: string;
+    readonly query?: string;
+    readonly success: boolean;
+    readonly occurredAt: string;
+    readonly errorCode?: string;
+  }[];
 }
 
 export interface CortextOSExecutionObserverOptions {
@@ -160,6 +180,21 @@ export class CortextOSExecutionObserver implements RuntimeExecutionObservationAd
       const observedAt = Number.isNaN(new Date(candidateObservedAt).getTime())
         ? record.observedAt
         : candidateObservedAt;
+      const executionContext = typeof record.workingDirectory === 'string'
+        && record.workingDirectory.startsWith('/')
+        && resolve(record.workingDirectory) === record.workingDirectory
+        && (record.repositoryReadRoot === undefined
+          || (record.repositoryReadRoot === record.workingDirectory
+            && resolve(record.repositoryReadRoot) === record.repositoryReadRoot))
+        ? {
+            workingDirectory: record.workingDirectory,
+            ...(record.repositoryReadRoot
+              ? { repositoryReadRoot: record.repositoryReadRoot }
+              : {}),
+          }
+        : undefined;
+      const effectivePolicy = parseExecutionPolicy(record.effectivePolicy);
+      const effectiveCapabilities = parseExecutionCapabilities(record.effectiveCapabilities);
       return {
         source: 'cortextos-codex-turn-record',
         sourceEventId: `codex-turn:${record.threadId}:${record.turnId}:${record.status}`,
@@ -169,6 +204,12 @@ export class CortextOSExecutionObserver implements RuntimeExecutionObservationAd
         runtimeSessionId: record.threadId,
         externalReference: request.externalReference,
         observedAt,
+        ...(executionContext ? { executionContext } : {}),
+        ...(effectivePolicy ? { effectivePolicy } : {}),
+        ...(effectiveCapabilities ? { effectiveCapabilities } : {}),
+        ...(record.repositoryReadOperations?.length
+          ? { outputSummary: `${record.repositoryReadOperations.length} bounded repository-read operation(s) recorded; file contents are not persisted.` }
+          : {}),
         message: record.status === 'completed'
           ? 'Codex reported structured completion for the exact accepted turn; semantic success still requires human judgment.'
           : record.status === 'inProgress'
@@ -210,6 +251,25 @@ export class CortextOSExecutionObserver implements RuntimeExecutionObservationAd
       message,
     };
   }
+}
+
+function parseExecutionPolicy(value: unknown): CorrelatedTurnRecord['effectivePolicy'] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const policy = value as Record<string, unknown>;
+  if (policy.version !== 1
+    || !['none', 'read-only', 'workspace-write'].includes(String(policy.filesystem))
+    || !['deny', 'allow'].includes(String(policy.network))
+    || !['empty', 'minimal', 'inherit'].includes(String(policy.environment))) return undefined;
+  return policy as unknown as NonNullable<CorrelatedTurnRecord['effectivePolicy']>;
+}
+
+function parseExecutionCapabilities(
+  value: unknown,
+): CorrelatedTurnRecord['effectiveCapabilities'] | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const capabilities = value as Record<string, unknown>;
+  if (capabilities.version !== 1 || typeof capabilities.repositoryRead !== 'boolean') return undefined;
+  return { version: 1, repositoryRead: capabilities.repositoryRead };
 }
 
 function runtimeAgentName(runtimeAgentId: string): string {

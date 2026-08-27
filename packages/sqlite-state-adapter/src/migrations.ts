@@ -12,7 +12,9 @@ export const EXECUTION_PLAN_SCHEMA_VERSION = 3;
 export const DISPATCH_SCHEMA_VERSION = 4;
 export const OBSERVATION_SCHEMA_VERSION = 5;
 export const RUNTIME_POLICY_SCHEMA_VERSION = 6;
-export const CURRENT_SCHEMA_VERSION = RUNTIME_POLICY_SCHEMA_VERSION;
+export const EXECUTION_CONTEXT_EVIDENCE_SCHEMA_VERSION = 7;
+export const EXECUTION_CAPABILITY_SCHEMA_VERSION = 8;
+export const CURRENT_SCHEMA_VERSION = EXECUTION_CAPABILITY_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -321,6 +323,74 @@ const RUNTIME_POLICY_SCHEMA_SQL = `
   END;
 `;
 
+const EXECUTION_CONTEXT_EVIDENCE_SCHEMA_SQL = `
+  ALTER TABLE execution_observations ADD COLUMN execution_working_directory TEXT;
+  ALTER TABLE execution_observations ADD COLUMN effective_policy_version INTEGER
+    CHECK (effective_policy_version IS NULL OR effective_policy_version = 1);
+  ALTER TABLE execution_observations ADD COLUMN effective_filesystem TEXT
+    CHECK (effective_filesystem IS NULL OR effective_filesystem IN ('none', 'read-only', 'workspace-write'));
+  ALTER TABLE execution_observations ADD COLUMN effective_network TEXT
+    CHECK (effective_network IS NULL OR effective_network IN ('deny', 'allow'));
+  ALTER TABLE execution_observations ADD COLUMN effective_environment TEXT
+    CHECK (effective_environment IS NULL OR effective_environment IN ('empty', 'minimal', 'inherit'));
+`;
+
+const EXECUTION_CAPABILITY_SCHEMA_SQL = `
+  ALTER TABLE execution_plans ADD COLUMN requested_capabilities_version INTEGER
+    CHECK (requested_capabilities_version IS NULL OR requested_capabilities_version = 1);
+  ALTER TABLE execution_plans ADD COLUMN requested_repository_read INTEGER
+    CHECK (requested_repository_read IS NULL OR requested_repository_read IN (0, 1));
+
+  ALTER TABLE execution_dispatches ADD COLUMN effective_capabilities_version INTEGER
+    CHECK (effective_capabilities_version IS NULL OR effective_capabilities_version = 1);
+  ALTER TABLE execution_dispatches ADD COLUMN effective_repository_read INTEGER
+    CHECK (effective_repository_read IS NULL OR effective_repository_read IN (0, 1));
+
+  ALTER TABLE execution_observations ADD COLUMN repository_read_root TEXT;
+  ALTER TABLE execution_observations ADD COLUMN effective_capabilities_version INTEGER
+    CHECK (effective_capabilities_version IS NULL OR effective_capabilities_version = 1);
+  ALTER TABLE execution_observations ADD COLUMN effective_repository_read INTEGER
+    CHECK (effective_repository_read IS NULL OR effective_repository_read IN (0, 1));
+
+  CREATE TRIGGER execution_plans_capabilities_complete_insert
+  BEFORE INSERT ON execution_plans
+  WHEN (NEW.requested_capabilities_version IS NULL) != (NEW.requested_repository_read IS NULL)
+  BEGIN
+    SELECT RAISE(ABORT, 'execution plan capabilities must be wholly null or wholly specified');
+  END;
+
+  CREATE TRIGGER execution_plans_capabilities_complete_update
+  BEFORE UPDATE OF requested_capabilities_version, requested_repository_read
+  ON execution_plans
+  WHEN (NEW.requested_capabilities_version IS NULL) != (NEW.requested_repository_read IS NULL)
+  BEGIN
+    SELECT RAISE(ABORT, 'execution plan capabilities must be wholly null or wholly specified');
+  END;
+
+  CREATE TRIGGER execution_dispatches_capabilities_complete_insert
+  BEFORE INSERT ON execution_dispatches
+  WHEN (NEW.effective_capabilities_version IS NULL) != (NEW.effective_repository_read IS NULL)
+  BEGIN
+    SELECT RAISE(ABORT, 'execution dispatch capabilities must be wholly null or wholly specified');
+  END;
+
+  CREATE TRIGGER execution_dispatches_capabilities_complete_update
+  BEFORE UPDATE OF effective_capabilities_version, effective_repository_read
+  ON execution_dispatches
+  WHEN (NEW.effective_capabilities_version IS NULL) != (NEW.effective_repository_read IS NULL)
+  BEGIN
+    SELECT RAISE(ABORT, 'execution dispatch capabilities must be wholly null or wholly specified');
+  END;
+
+  CREATE TRIGGER execution_observations_capabilities_complete_insert
+  BEFORE INSERT ON execution_observations
+  WHEN (NEW.effective_capabilities_version IS NULL) != (NEW.effective_repository_read IS NULL)
+    OR (NEW.repository_read_root IS NOT NULL AND NEW.effective_repository_read != 1)
+  BEGIN
+    SELECT RAISE(ABORT, 'execution observation repository capability evidence is incomplete');
+  END;
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -351,6 +421,16 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: RUNTIME_POLICY_SCHEMA_VERSION,
     name: 'runtime-capability-policy',
     up: database => database.exec(RUNTIME_POLICY_SCHEMA_SQL),
+  },
+  {
+    version: EXECUTION_CONTEXT_EVIDENCE_SCHEMA_VERSION,
+    name: 'exact-execution-context-evidence',
+    up: database => database.exec(EXECUTION_CONTEXT_EVIDENCE_SCHEMA_SQL),
+  },
+  {
+    version: EXECUTION_CAPABILITY_SCHEMA_VERSION,
+    name: 'repository-read-execution-capability',
+    up: database => database.exec(EXECUTION_CAPABILITY_SCHEMA_SQL),
   },
 ];
 

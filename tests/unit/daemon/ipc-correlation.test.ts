@@ -4,6 +4,8 @@ import { IPCServer } from '../../../src/daemon/ipc-server.js';
 import { CortextOSExecutionAdapter } from '../../../packages/cortextos-execution-adapter/src/index.js';
 
 const POLICY = { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const };
+const CAPABILITIES = { version: 1 as const, repositoryRead: false };
+const EXECUTION_CONTEXT = { workingDirectory: '/tmp/agent-operations' };
 
 function socketCapture() {
   let body = '';
@@ -24,6 +26,7 @@ function manager(overrides: Record<string, unknown> = {}) {
       sessionId: 'thread-1',
       turnId: 'turn-1',
       effectivePolicy: POLICY,
+      effectiveCapabilities: CAPABILITIES,
     }),
     injectAgentDetailed: vi.fn().mockReturnValue({ ok: true }),
     ...overrides,
@@ -53,6 +56,7 @@ describe('inject-agent correlation-safe IPC mode', () => {
         executionPlanId: 'plan:socket-roundtrip',
         input: { version: 1, instruction: 'One isolated fixture instruction.' },
         requestedPolicy: POLICY,
+        requestedCapabilities: CAPABILITIES,
       })).resolves.toMatchObject({
         status: 'accepted',
         externalReference: 'cortextos:codex-turn:v1:thread-1:turn-1',
@@ -62,6 +66,8 @@ describe('inject-agent correlation-safe IPC mode', () => {
         'One isolated fixture instruction.',
         'dispatch-plan:socket-roundtrip',
         POLICY,
+        undefined,
+        CAPABILITIES,
       );
     } finally {
       server.stop();
@@ -69,7 +75,17 @@ describe('inject-agent correlation-safe IPC mode', () => {
   });
 
   it('returns a structured provider turn identity without waiting for completion', async () => {
-    const fake = manager();
+    const fake = manager({
+      injectAgentCorrelatedDetailed: vi.fn().mockResolvedValue({
+        ok: true,
+        provider: 'codex',
+        sessionId: 'thread-1',
+        turnId: 'turn-1',
+        effectivePolicy: POLICY,
+        effectiveCapabilities: CAPABILITIES,
+        executionContext: EXECUTION_CONTEXT,
+      }),
+    });
     const server = new IPCServer(fake as never, process.env.CTX_INSTANCE_ID);
     await expect(request(server, {
       type: 'inject-agent',
@@ -79,6 +95,8 @@ describe('inject-agent correlation-safe IPC mode', () => {
         requireNewTurn: true,
         correlationId: 'dispatch-plan:plan-1',
         executionPolicy: POLICY,
+        executionCapabilities: CAPABILITIES,
+        executionContext: EXECUTION_CONTEXT,
       },
       source: 'test fixture',
     })).resolves.toEqual({
@@ -90,6 +108,8 @@ describe('inject-agent correlation-safe IPC mode', () => {
           sessionId: 'thread-1',
           turnId: 'turn-1',
           effectivePolicy: POLICY,
+          effectiveCapabilities: CAPABILITIES,
+          executionContext: EXECUTION_CONTEXT,
         },
       },
     });
@@ -98,6 +118,8 @@ describe('inject-agent correlation-safe IPC mode', () => {
       'One bounded action.',
       'dispatch-plan:plan-1',
       POLICY,
+      EXECUTION_CONTEXT,
+      CAPABILITIES,
     );
     expect(fake.injectAgentDetailed).not.toHaveBeenCalled();
   });
@@ -154,6 +176,23 @@ describe('inject-agent correlation-safe IPC mode', () => {
         requireNewTurn: true,
         correlationId: 'dispatch-plan:invalid-policy',
         executionPolicy: { version: 1, filesystem: 'danger-full-access' },
+      },
+    })).resolves.toMatchObject({ success: false, code: 'INVALID_INPUT' });
+    expect(fake.injectAgentCorrelatedDetailed).not.toHaveBeenCalled();
+  });
+
+  it('rejects a relative or non-canonical execution context before injection', async () => {
+    const fake = manager();
+    const server = new IPCServer(fake as never, process.env.CTX_INSTANCE_ID);
+    await expect(request(server, {
+      type: 'inject-agent',
+      agent: 'coder',
+      data: {
+        text: 'One bounded action.',
+        requireNewTurn: true,
+        correlationId: 'dispatch-plan:invalid-context',
+        executionPolicy: POLICY,
+        executionContext: { workingDirectory: 'relative/repository' },
       },
     })).resolves.toMatchObject({ success: false, code: 'INVALID_INPUT' });
     expect(fake.injectAgentCorrelatedDetailed).not.toHaveBeenCalled();

@@ -8,7 +8,10 @@ import {
   createCodexExecutionReference,
   resolveCortextOSSocketPath,
 } from '../../cortextos-adapter/src/index.js';
-import { isRuntimeExecutionPolicyNoBroaderThan } from '../../agent-operations-contracts/src/index.js';
+import {
+  isRuntimeExecutionCapabilitiesNoBroaderThan,
+  isRuntimeExecutionPolicyNoBroaderThan,
+} from '../../agent-operations-contracts/src/index.js';
 
 type RequestSender = (
   agentName: string,
@@ -58,6 +61,8 @@ export class CortextOSExecutionAdapter implements RuntimeExecutionAdapter {
         request.idempotencyKey,
         requireExactTurnCorrelation,
         request.requestedPolicy,
+        request.executionContext,
+        request.requestedCapabilities,
       ));
   }
 
@@ -84,6 +89,22 @@ export class CortextOSExecutionAdapter implements RuntimeExecutionAdapter {
           if (!isRuntimeExecutionPolicyNoBroaderThan(effectivePolicy, request.requestedPolicy)) {
             return { status: 'uncertain', code: 'SUBMISSION_UNCERTAIN', message: 'CortextOS reported broader execution authority than the Plan permits.' };
           }
+          const effectiveCapabilities = parseExecutionCapabilities(execution.effectiveCapabilities);
+          if (!effectiveCapabilities) {
+            return { status: 'uncertain', code: 'SUBMISSION_UNCERTAIN', message: 'CortextOS omitted effective execution capabilities.' };
+          }
+          if (!isRuntimeExecutionCapabilitiesNoBroaderThan(
+            effectiveCapabilities,
+            request.requestedCapabilities,
+          )) {
+            return { status: 'uncertain', code: 'SUBMISSION_UNCERTAIN', message: 'CortextOS reported broader tool capabilities than the Plan permits.' };
+          }
+          const executionContext = parseExecutionContext(execution.executionContext);
+          if (request.executionContext
+            && (executionContext?.workingDirectory !== request.executionContext.workingDirectory
+              || executionContext?.repositoryReadRoot !== request.executionContext.repositoryReadRoot)) {
+            return { status: 'uncertain', code: 'SUBMISSION_UNCERTAIN', message: 'CortextOS did not prove the requested execution working directory.' };
+          }
           try {
             const message = typeof data?.message === 'string'
               ? data.message
@@ -96,6 +117,7 @@ export class CortextOSExecutionAdapter implements RuntimeExecutionAdapter {
               ),
               message,
               effectivePolicy,
+              effectiveCapabilities,
             };
           } catch {
             return { status: 'uncertain', message: 'CortextOS returned invalid Codex turn identifiers.' };
@@ -171,6 +193,8 @@ function sendInjectRequest(
   correlationId: string,
   requireExactTurnCorrelation: boolean,
   requestedPolicy: RuntimeDispatchRequest['requestedPolicy'],
+  executionContext: RuntimeDispatchRequest['executionContext'],
+  requestedCapabilities: RuntimeDispatchRequest['requestedCapabilities'],
 ): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const socket = createConnection(socketPath);
@@ -196,6 +220,10 @@ function sendInjectRequest(
                 requireNewTurn: true,
                 correlationId,
                 executionPolicy: requestPolicy(requestedPolicy),
+                executionCapabilities: { ...requestedCapabilities },
+                ...(executionContext
+                  ? { executionContext: { ...executionContext } }
+                  : {}),
               }
             : {}),
         },
@@ -247,6 +275,29 @@ function parseExecutionPolicy(value: unknown): RuntimeDispatchRequest['requested
     network: value.network,
     environment: value.environment,
   };
+}
+
+function parseExecutionContext(value: unknown): RuntimeDispatchRequest['executionContext'] | null {
+  if (!isRecord(value) || typeof value.workingDirectory !== 'string'
+    || !value.workingDirectory.startsWith('/')) return null;
+  if (value.repositoryReadRoot !== undefined
+    && (typeof value.repositoryReadRoot !== 'string'
+      || !value.repositoryReadRoot.startsWith('/'))) return null;
+  return {
+    workingDirectory: value.workingDirectory,
+    ...(typeof value.repositoryReadRoot === 'string'
+      ? { repositoryReadRoot: value.repositoryReadRoot }
+      : {}),
+  };
+}
+
+function parseExecutionCapabilities(
+  value: unknown,
+): RuntimeDispatchRequest['requestedCapabilities'] | null {
+  if (!isRecord(value) || value.version !== 1 || typeof value.repositoryRead !== 'boolean') {
+    return null;
+  }
+  return { version: 1, repositoryRead: value.repositoryRead };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -649,6 +649,18 @@ export interface RuntimeExecutionPolicyEnvelope {
   readonly environment: 'empty' | 'minimal' | 'inherit';
 }
 
+/** Explicit per-turn tool capabilities, independent of sandbox policy. */
+export interface RuntimeExecutionCapabilitiesEnvelope {
+  readonly version: 1;
+  readonly repositoryRead: boolean;
+}
+
+/** Provider-neutral per-turn execution context supplied by Agent Operations. */
+export interface RuntimeExecutionContextEnvelope {
+  readonly workingDirectory: string;
+  readonly repositoryReadRoot?: string;
+}
+
 export type IPCCommandType =
   | 'status'
   | 'start-agent'

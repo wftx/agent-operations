@@ -104,6 +104,7 @@ describe('ExecutionPlanningService', () => {
       checkoutBindingId: binding('/repos/ao').id,
       input: { version: 1, instruction: 'Investigate the failing test.' },
       requestedPolicy: POLICY,
+      requestedCapabilities: { version: 1, repositoryRead: false },
       jobRevisionAtPreparation: 1,
       attemptRevisionAtPreparation: 0,
       createdAt: TIME,

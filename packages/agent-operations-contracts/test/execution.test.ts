@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   createExecutionInputEnvelope,
   createExecutionPlanId,
+  createRuntimeExecutionCapabilities,
   createRuntimeExecutionPolicy,
+  isRuntimeExecutionCapabilitiesNoBroaderThan,
   isRuntimeExecutionPolicyNoBroaderThan,
   resolveRuntimeExecutionPolicy,
 } from '../src/index.js';
@@ -57,5 +59,17 @@ describe('Execution Plan contracts', () => {
       supported: false,
       reason: 'Runtime cannot enforce filesystem=none without broader access.',
     });
+  });
+
+  it('models repository reading as a narrow capability independent of sandbox policy', () => {
+    const denied = createRuntimeExecutionCapabilities({ repositoryRead: false });
+    const allowed = createRuntimeExecutionCapabilities({ repositoryRead: true });
+    expect(denied).toEqual({ version: 1, repositoryRead: false });
+    expect(allowed).toEqual({ version: 1, repositoryRead: true });
+    expect(isRuntimeExecutionCapabilitiesNoBroaderThan(denied, allowed)).toBe(true);
+    expect(isRuntimeExecutionCapabilitiesNoBroaderThan(allowed, denied)).toBe(false);
+    expect(() => createRuntimeExecutionCapabilities({
+      repositoryRead: 'yes' as unknown as boolean,
+    })).toThrow('must be boolean');
   });
 });

@@ -41,6 +41,7 @@ const requestMock = vi.fn();
 const notifyMock = vi.fn();
 const closeMock = vi.fn();
 const respondErrorMock = vi.fn();
+const respondMock = vi.fn();
 const logEventMock = vi.fn();
 let messageHandler: ((message: unknown) => void) | null = null;
 
@@ -51,6 +52,7 @@ vi.mock('../../../src/utils/ws-unix-client.js', () => ({
       close: closeMock,
       notify: notifyMock,
       respondError: respondErrorMock,
+      respond: respondMock,
       onMessage: vi.fn().mockImplementation((handler: (message: unknown) => void) => {
         messageHandler = handler;
         return vi.fn();
@@ -90,6 +92,7 @@ beforeEach(() => {
   notifyMock.mockReset();
   closeMock.mockReset();
   respondErrorMock.mockReset();
+  respondMock.mockReset();
   logEventMock.mockReset();
   atomicWriteSyncMock.mockReset();
   messageHandler = null;
@@ -805,10 +808,15 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
       selectedCapabilityRoots: [],
       config: {
         features: {
+          code_mode: false,
+          code_mode_host: false,
           goals: false,
           hooks: false,
           memories: false,
           multi_agent: false,
+          shell_snapshot: false,
+          shell_snapshot_v2: false,
+          shell_tool: false,
         },
         agents: { enabled: false },
         allow_login_shell: false,
@@ -856,6 +864,213 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
     });
     await flush();
     delete process.env.AO_TEST_SECRET_SENTINEL;
+  });
+
+  it('creates a new restricted thread at the repository checkout and records exact CWD evidence', async () => {
+    requestMock.mockImplementation(async (method: string) => {
+      if (method === 'config/read') return { result: { config: { mcp_servers: {} } } };
+      return method === 'thread/start'
+        ? { result: { thread: { id: 'thread-repository' } } }
+        : { result: { turn: { id: 'turn-repository', status: 'inProgress' } } };
+    });
+    const pty = makeReadyPty();
+    const context = { workingDirectory: '/tmp/agent-operations' };
+
+    await expect(pty.startCorrelationSafeTurn(
+      'inspect repository read-only',
+      'dispatch-plan:repository',
+      restrictedPolicy,
+      context,
+    )).resolves.toEqual({
+      provider: 'codex',
+      sessionId: 'thread-repository',
+      turnId: 'turn-repository',
+      executionContext: context,
+    });
+    expect(requestMock).toHaveBeenNthCalledWith(1, 'config/read', {
+      cwd: '/tmp/agent-operations',
+      includeLayers: false,
+    });
+    expect(requestMock).toHaveBeenNthCalledWith(2, 'thread/start', expect.objectContaining({
+      cwd: '/tmp/agent-operations',
+      sandbox: 'read-only',
+      runtimeWorkspaceRoots: [],
+      environments: [],
+    }));
+    expect(requestMock).toHaveBeenNthCalledWith(3, 'turn/start', expect.objectContaining({
+      threadId: 'thread-repository',
+      cwd: '/tmp/agent-operations',
+      sandboxPolicy: { type: 'readOnly', networkAccess: false },
+      runtimeWorkspaceRoots: [],
+      environments: [],
+    }));
+    const record = String(atomicWriteSyncMock.mock.calls.at(-1)?.[1]);
+    expect(record).toContain('"workingDirectory":"/tmp/agent-operations"');
+    expect(record).toContain('"filesystem":"read-only"');
+    expect(record).not.toContain('dangerFullAccess');
+
+    rpc(pty).handleRpcMessage({
+      method: 'turn/completed',
+      params: { threadId: 'thread-repository', turn: { id: 'turn-repository', status: 'completed' } },
+    });
+    await flush();
+  });
+
+  it('exposes only bounded repository list/read/search tools for an explicitly capable turn', async () => {
+    requestMock.mockImplementation(async (method: string) => {
+      if (method === 'config/read') return { result: { config: { mcp_servers: {} } } };
+      return method === 'thread/start'
+        ? { result: { thread: { id: 'thread-reader' } } }
+        : { result: { turn: { id: 'turn-reader', status: 'inProgress' } } };
+    });
+    const pty = makeReadyPty();
+    const root = process.cwd();
+    const context = { workingDirectory: root, repositoryReadRoot: root };
+    const capabilities = { version: 1 as const, repositoryRead: true };
+
+    await expect(pty.startCorrelationSafeTurn(
+      'inspect repository through bounded tools',
+      'dispatch-plan:repository-reader',
+      restrictedPolicy,
+      context,
+      capabilities,
+    )).resolves.toEqual({
+      provider: 'codex',
+      sessionId: 'thread-reader',
+      turnId: 'turn-reader',
+      executionContext: context,
+      effectiveCapabilities: capabilities,
+    });
+
+    const threadStart = requestMock.mock.calls.find(([method]) => method === 'thread/start')?.[1] as {
+      dynamicTools: Array<{ type: string; name: string; tools: Array<{ name: string }> }>;
+      runtimeWorkspaceRoots: string[];
+      sandbox: string;
+      config: { features: Record<string, boolean> };
+    };
+    expect(threadStart.dynamicTools).toHaveLength(1);
+    expect(threadStart.dynamicTools[0]).toMatchObject({
+      type: 'namespace',
+      name: 'repository',
+      tools: [{ name: 'list' }, { name: 'read' }, { name: 'search' }],
+    });
+    expect(threadStart.runtimeWorkspaceRoots).toEqual([]);
+    expect(threadStart.sandbox).toBe('read-only');
+    expect(threadStart.config.features).toMatchObject({
+      code_mode: false,
+      code_mode_host: false,
+      shell_snapshot: false,
+      shell_snapshot_v2: false,
+      shell_tool: false,
+    });
+    expect(JSON.stringify(threadStart)).not.toContain('.agent-operations');
+    expect(JSON.stringify(threadStart.dynamicTools)).not.toContain('shell');
+
+    const record = String(atomicWriteSyncMock.mock.calls.at(-1)?.[1]);
+    expect(record).toContain(`"repositoryReadRoot":"${root}"`);
+    expect(record).toContain('"repositoryRead":true');
+
+    rpc(pty).handleRpcMessage({
+      method: 'turn/completed',
+      params: { threadId: 'thread-reader', turn: { id: 'turn-reader', status: 'completed' } },
+    });
+    await flush();
+  });
+
+  it('serves repository dynamic calls only for the exact protected turn and audits metadata without contents', () => {
+    const pty = makeReadyPty();
+    const list = vi.fn().mockReturnValue({ path: '.', entries: [], truncated: false, omittedRestricted: 0 });
+    (pty as unknown as {
+      _protectedThreadId: string;
+      _protectedTurnId: string;
+      _repositoryReader: { list: typeof list };
+      _rpc: { respond: typeof respondMock };
+    })._protectedThreadId = 'thread-reader';
+    (pty as unknown as { _protectedTurnId: string })._protectedTurnId = 'turn-reader';
+    (pty as unknown as { _repositoryReader: { list: typeof list } })._repositoryReader = { list };
+    (pty as unknown as { _rpc: { respond: typeof respondMock } })._rpc = { respond: respondMock };
+
+    rpc(pty).handleRpcMessage({
+      method: 'item/tool/call',
+      id: 71,
+      params: {
+        threadId: 'thread-reader',
+        turnId: 'turn-reader',
+        callId: 'call-1',
+        namespace: 'repository',
+        tool: 'list',
+        arguments: { path: '.' },
+      },
+    });
+    expect(list).toHaveBeenCalledWith('.');
+    expect(respondMock).toHaveBeenCalledWith(71, expect.objectContaining({ success: true }));
+    const record = String(atomicWriteSyncMock.mock.calls.at(-1)?.[1]);
+    expect(record).toContain('"operation":"list"');
+    expect(record).not.toContain('file contents');
+
+    rpc(pty).handleRpcMessage({
+      method: 'item/tool/call',
+      id: 72,
+      params: {
+        threadId: 'thread-other',
+        turnId: 'turn-reader',
+        callId: 'call-2',
+        namespace: 'repository',
+        tool: 'list',
+        arguments: { path: '.' },
+      },
+    });
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(respondMock).toHaveBeenCalledWith(72, expect.objectContaining({ success: false }));
+  });
+
+  it('creates distinct restricted threads when repository checkout CWD changes', async () => {
+    let thread = 0;
+    let turn = 0;
+    requestMock.mockImplementation(async (method: string) => {
+      if (method === 'config/read') return { result: { config: { mcp_servers: {} } } };
+      if (method === 'thread/start') {
+        thread += 1;
+        return { result: { thread: { id: `thread-repository-${thread}` } } };
+      }
+      turn += 1;
+      return { result: { turn: { id: `turn-repository-${turn}`, status: 'inProgress' } } };
+    });
+    const pty = makeReadyPty();
+    await pty.startCorrelationSafeTurn(
+      'inspect first',
+      'dispatch-plan:first-repository',
+      restrictedPolicy,
+      { workingDirectory: '/tmp/repository-one' },
+    );
+    rpc(pty).handleRpcMessage({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-repository-1',
+        turn: { id: 'turn-repository-1', status: 'completed' },
+      },
+    });
+    await flush();
+    await pty.startCorrelationSafeTurn(
+      'inspect second',
+      'dispatch-plan:second-repository',
+      restrictedPolicy,
+      { workingDirectory: '/tmp/repository-two' },
+    );
+    const threadStarts = requestMock.mock.calls
+      .filter(([method]) => method === 'thread/start')
+      .map(([, params]) => params as { cwd: string });
+    expect(threadStarts.map(params => params.cwd))
+      .toEqual(['/tmp/repository-one', '/tmp/repository-two']);
+    expect(thread).toBe(2);
+    rpc(pty).handleRpcMessage({
+      method: 'turn/completed',
+      params: {
+        threadId: 'thread-repository-2',
+        turn: { id: 'turn-repository-2', status: 'completed' },
+      },
+    });
+    await flush();
   });
 
   it('fails closed before thread or turn creation when MCP configuration cannot be inspected', async () => {

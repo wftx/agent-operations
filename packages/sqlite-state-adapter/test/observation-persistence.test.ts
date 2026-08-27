@@ -70,6 +70,7 @@ function configuration(): DurableProjectConfiguration {
 async function seedAcceptedDispatch(
   store: SqliteAgentOperationsStateStore,
   withPolicy = true,
+  withCapabilities = withPolicy,
 ): Promise<void> {
   await store.applyProjectConfiguration(configuration());
   const draft = {
@@ -105,7 +106,12 @@ async function seedAcceptedDispatch(
     checkoutBindingId: CHECKOUT_ID,
     input: { version: 1 as const, instruction: 'Observe this accepted Dispatch.' },
     ...(withPolicy
-      ? { requestedPolicy: { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const } }
+      ? {
+          requestedPolicy: { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const },
+          ...(withCapabilities
+            ? { requestedCapabilities: { version: 1 as const, repositoryRead: true } }
+            : {}),
+        }
       : {}),
     jobRevisionAtPreparation: 1,
     attemptRevisionAtPreparation: 0,
@@ -131,6 +137,7 @@ async function seedAcceptedDispatch(
     ...submitting,
     status: 'accepted',
     ...(withPolicy ? { effectivePolicy: plan.requestedPolicy } : {}),
+    ...(withCapabilities ? { effectiveCapabilities: plan.requestedCapabilities } : {}),
     acceptedAt: TIME,
     resolvedAt: TIME,
     revision: 2,
@@ -156,6 +163,17 @@ function observation(): DurableExecutionObservation {
     runtimeSessionId: 'thread:one',
     externalReference: 'turn:one',
     outputSummary: 'Bounded output summary.',
+    executionContext: {
+      workingDirectory: CHECKOUT_PATH,
+      repositoryReadRoot: CHECKOUT_PATH,
+    },
+    effectiveCapabilities: { version: 1, repositoryRead: true },
+    effectivePolicy: {
+      version: 1,
+      filesystem: 'read-only',
+      network: 'deny',
+      environment: 'empty',
+    },
     observedAt: TIME,
     recordedAt: TIME,
   };
@@ -176,6 +194,38 @@ function decision(): DurableAttemptOutcomeDecision {
 }
 
 describe('SQLite execution observation persistence', () => {
+  it('migrates populated v7 history to v8 without inventing capability evidence', async () => {
+    const databasePath = path();
+    const versionSeven = open(databasePath, 7);
+    await seedAcceptedDispatch(versionSeven, true, false);
+    await versionSeven.close();
+
+    const upgraded = open(databasePath);
+    expect(await upgraded.getExecutionPlan('plan:observation')).toMatchObject({
+      requestedPolicy: {
+        version: 1,
+        filesystem: 'read-only',
+        network: 'deny',
+        environment: 'empty',
+      },
+    });
+    expect((await upgraded.getExecutionPlan('plan:observation'))?.requestedCapabilities).toBeUndefined();
+    expect((await upgraded.getExecutionDispatch('dispatch:observation'))?.effectiveCapabilities).toBeUndefined();
+    await upgraded.close();
+
+    const database = new Database(databasePath, { readonly: true });
+    expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }]);
+    expect(database.prepare(`
+      SELECT requested_capabilities_version, requested_repository_read
+      FROM execution_plans WHERE id = 'plan:observation'
+    `).get()).toEqual({
+      requested_capabilities_version: null,
+      requested_repository_read: null,
+    });
+    database.close();
+  });
+
   it('migrates a populated v4 chain to v5 and preserves every existing record', async () => {
     const databasePath = path();
     const versionFour = open(databasePath, 4);
@@ -252,7 +302,7 @@ describe('SQLite execution observation persistence', () => {
     expect(() => SqliteAgentOperationsStateStore.open({
       databasePath,
       additionalMigrations: [{
-        version: 7,
+        version: 9,
         name: 'deliberate-observation-rollback',
         up: database => {
           database.exec('CREATE TABLE should_rollback_observation (id TEXT)');
@@ -267,7 +317,7 @@ describe('SQLite execution observation persistence', () => {
     expect(database.prepare('SELECT id FROM execution_observations').get())
       .toEqual({ id: observation().id });
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }]);
     database.close();
   });
 });

@@ -9,6 +9,7 @@ import type {
 import {
   createExecutionDispatchId,
   createExecutionDispatchIdempotencyKey,
+  isRuntimeExecutionCapabilitiesNoBroaderThan,
   isRuntimeExecutionPolicyNoBroaderThan,
 } from '../../agent-operations-contracts/src/index.js';
 import { ExecutionPreflightService } from './execution-preflight-service.js';
@@ -110,8 +111,12 @@ export class ManualDispatchService {
 
     let result: RuntimeDispatchResult;
     try {
-      if (!plan.requestedPolicy || !preflight.effectivePolicy) {
-        throw new Error('Policy-aware Dispatch requires requested and effective preflight policy');
+      if (!plan.requestedPolicy || !preflight.effectivePolicy
+        || !plan.requestedCapabilities || !preflight.effectiveCapabilities) {
+        throw new Error('Dispatch requires requested and effective runtime policy and capabilities');
+      }
+      if (plan.repositoryId && !preflight.executionContext) {
+        throw new Error('Repository-bound Dispatch requires a proven execution working directory');
       }
       result = await this.execution.dispatch({
         dispatchId: submitting.id,
@@ -120,6 +125,10 @@ export class ManualDispatchService {
         executionPlanId: submitting.executionPlanId,
         input: { ...plan.input },
         requestedPolicy: { ...plan.requestedPolicy },
+        requestedCapabilities: { ...plan.requestedCapabilities },
+        ...(preflight.executionContext
+          ? { executionContext: { ...preflight.executionContext } }
+          : {}),
       });
     } catch (error) {
       result = {
@@ -141,6 +150,22 @@ export class ManualDispatchService {
           status: 'uncertain',
           code: 'SUBMISSION_UNCERTAIN',
           message: 'Runtime reported an effective policy broader than the immutable Plan.',
+        };
+      } else if (!result.effectiveCapabilities) {
+        result = {
+          status: 'uncertain',
+          code: 'SUBMISSION_UNCERTAIN',
+          message: 'Runtime accepted execution without reporting its effective tool capabilities.',
+        };
+      } else if (!plan.requestedCapabilities
+        || !isRuntimeExecutionCapabilitiesNoBroaderThan(
+          result.effectiveCapabilities,
+          plan.requestedCapabilities,
+        )) {
+        result = {
+          status: 'uncertain',
+          code: 'SUBMISSION_UNCERTAIN',
+          message: 'Runtime reported tool capabilities broader than the immutable Plan.',
         };
       }
     }
@@ -258,6 +283,9 @@ export class ManualDispatchService {
       status: result.status,
       ...(result.status === 'accepted' && result.effectivePolicy
         ? { effectivePolicy: { ...result.effectivePolicy } }
+        : {}),
+      ...(result.status === 'accepted' && result.effectiveCapabilities
+        ? { effectiveCapabilities: { ...result.effectiveCapabilities } }
         : {}),
       ...(cleanOptional(result.externalReference) ? { externalReference: cleanOptional(result.externalReference) } : {}),
       ...(cleanOptional(result.message) ? { message: cleanOptional(result.message) } : {}),

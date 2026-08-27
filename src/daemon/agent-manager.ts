@@ -7,6 +7,8 @@ import type {
   BusPaths,
   WorkerStatus,
   TelegramMessage,
+  RuntimeExecutionCapabilitiesEnvelope,
+  RuntimeExecutionContextEnvelope,
   RuntimeExecutionPolicyEnvelope,
 } from '../types/index.js';
 import { AgentProcess, type CorrelatedInjectionResult } from './agent-process.js';
@@ -1863,12 +1865,20 @@ export class AgentManager {
     text: string,
     correlationId: string,
     executionPolicy?: RuntimeExecutionPolicyEnvelope,
+    executionContext?: RuntimeExecutionContextEnvelope,
+    executionCapabilities?: RuntimeExecutionCapabilitiesEnvelope,
   ): Promise<CorrelatedInjectionResult | { ok: false; code: 'NOT_FOUND'; message: string }> {
     const entry = this.agents.get(agentName);
     if (!entry) {
       return { ok: false, code: 'NOT_FOUND', message: `agent "${agentName}" not in registry` };
     }
-    return entry.process.injectCorrelatedMessageDetailed(text, correlationId, executionPolicy);
+    return entry.process.injectCorrelatedMessageDetailed(
+      text,
+      correlationId,
+      executionPolicy,
+      executionContext,
+      executionCapabilities,
+    );
   }
 
   /**

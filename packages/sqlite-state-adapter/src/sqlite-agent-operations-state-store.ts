@@ -36,6 +36,7 @@ import type {
 } from '../../agent-operations-contracts/src/index.js';
 import {
   createRepositoryCheckoutBindingId,
+  isRuntimeExecutionCapabilitiesNoBroaderThan,
   isRuntimeExecutionPolicyNoBroaderThan,
 } from '../../agent-operations-contracts/src/index.js';
 import { applyStateMigrations, type SqliteStateMigration } from './migrations.js';
@@ -148,6 +149,8 @@ interface ExecutionPlanRow {
   requested_filesystem?: RuntimeFilesystemPolicy | null;
   requested_network?: RuntimeNetworkPolicy | null;
   requested_environment?: RuntimeEnvironmentPolicy | null;
+  requested_capabilities_version?: 1 | null;
+  requested_repository_read?: number | null;
   job_revision: number;
   attempt_revision: number;
   created_at: string;
@@ -165,6 +168,8 @@ interface ExecutionDispatchRow {
   effective_filesystem?: RuntimeFilesystemPolicy | null;
   effective_network?: RuntimeNetworkPolicy | null;
   effective_environment?: RuntimeEnvironmentPolicy | null;
+  effective_capabilities_version?: 1 | null;
+  effective_repository_read?: number | null;
   external_reference: string | null;
   message: string | null;
   revision: number;
@@ -188,6 +193,14 @@ interface ExecutionObservationRow {
   external_reference: string | null;
   message: string | null;
   output_summary: string | null;
+  execution_working_directory?: string | null;
+  effective_policy_version?: 1 | null;
+  effective_filesystem?: RuntimeFilesystemPolicy | null;
+  effective_network?: RuntimeNetworkPolicy | null;
+  effective_environment?: RuntimeEnvironmentPolicy | null;
+  repository_read_root?: string | null;
+  effective_capabilities_version?: 1 | null;
+  effective_repository_read?: number | null;
   observed_at: string;
   recorded_at: string;
 }
@@ -332,6 +345,15 @@ function toExecutionPlan(row: ExecutionPlanRow): DurableExecutionPlan {
           },
         }
       : {}),
+    ...(row.requested_capabilities_version && row.requested_repository_read !== null
+      && row.requested_repository_read !== undefined
+      ? {
+          requestedCapabilities: {
+            version: row.requested_capabilities_version,
+            repositoryRead: row.requested_repository_read === 1,
+          },
+        }
+      : {}),
     jobRevisionAtPreparation: row.job_revision,
     attemptRevisionAtPreparation: row.attempt_revision,
     createdAt: row.created_at,
@@ -355,6 +377,15 @@ function toExecutionDispatch(row: ExecutionDispatchRow): DurableExecutionDispatc
             filesystem: row.effective_filesystem,
             network: row.effective_network,
             environment: row.effective_environment,
+          },
+        }
+      : {}),
+    ...(row.effective_capabilities_version && row.effective_repository_read !== null
+      && row.effective_repository_read !== undefined
+      ? {
+          effectiveCapabilities: {
+            version: row.effective_capabilities_version,
+            repositoryRead: row.effective_repository_read === 1,
           },
         }
       : {}),
@@ -383,6 +414,34 @@ function toExecutionObservation(row: ExecutionObservationRow): DurableExecutionO
     ...(row.external_reference ? { externalReference: row.external_reference } : {}),
     ...(row.message ? { message: row.message } : {}),
     ...(row.output_summary ? { outputSummary: row.output_summary } : {}),
+    ...(row.execution_working_directory
+      ? {
+          executionContext: {
+            workingDirectory: row.execution_working_directory,
+            ...(row.repository_read_root ? { repositoryReadRoot: row.repository_read_root } : {}),
+          },
+        }
+      : {}),
+    ...(row.effective_policy_version && row.effective_filesystem
+      && row.effective_network && row.effective_environment
+      ? {
+          effectivePolicy: {
+            version: row.effective_policy_version,
+            filesystem: row.effective_filesystem,
+            network: row.effective_network,
+            environment: row.effective_environment,
+          },
+        }
+      : {}),
+    ...(row.effective_capabilities_version && row.effective_repository_read !== null
+      && row.effective_repository_read !== undefined
+      ? {
+          effectiveCapabilities: {
+            version: row.effective_capabilities_version,
+            repositoryRead: row.effective_repository_read === 1,
+          },
+        }
+      : {}),
     observedAt: row.observed_at,
     recordedAt: row.recorded_at,
   };
@@ -413,12 +472,20 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
   private readonly database: Database.Database;
   private closed = false;
   private readonly supportsRuntimePolicies: boolean;
+  private readonly supportsExecutionContextEvidence: boolean;
+  private readonly supportsExecutionCapabilities: boolean;
 
   private constructor(databasePath: string, database: Database.Database) {
     this.databasePath = databasePath;
     this.database = database;
     this.supportsRuntimePolicies = (database.prepare(
       "SELECT 1 FROM pragma_table_info('execution_plans') WHERE name = 'requested_policy_version'",
+    ).get() as unknown) !== undefined;
+    this.supportsExecutionContextEvidence = (database.prepare(
+      "SELECT 1 FROM pragma_table_info('execution_observations') WHERE name = 'execution_working_directory'",
+    ).get() as unknown) !== undefined;
+    this.supportsExecutionCapabilities = (database.prepare(
+      "SELECT 1 FROM pragma_table_info('execution_plans') WHERE name = 'requested_capabilities_version'",
     ).get() as unknown) !== undefined;
   }
 
@@ -877,6 +944,12 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     if (!this.supportsRuntimePolicies && plan.requestedPolicy) {
       throw new Error('Runtime execution policy requires Agent Operations schema v6');
     }
+    if (this.supportsExecutionCapabilities && !plan.requestedCapabilities) {
+      throw new Error('New Execution Plans require explicit runtime tool capabilities');
+    }
+    if (!this.supportsExecutionCapabilities && plan.requestedCapabilities) {
+      throw new Error('Runtime tool capabilities require Agent Operations schema v8');
+    }
     if (plan.jobRevisionAtPreparation < 0 || plan.attemptRevisionAtPreparation < 0) {
       throw new Error('Execution Plan revisions must be non-negative');
     }
@@ -917,7 +990,25 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         plan.attemptRevisionAtPreparation,
         plan.createdAt,
       ] as const;
-      if (this.supportsRuntimePolicies) {
+      if (this.supportsExecutionCapabilities) {
+        this.database.prepare(`
+          INSERT INTO execution_plans
+            (id, attempt_id, job_id, project_id, installation_id, runtime_agent_id,
+             repository_id, checkout_binding_id, input_version, instruction,
+             job_revision, attempt_revision, created_at, requested_policy_version,
+             requested_filesystem, requested_network, requested_environment,
+             requested_capabilities_version, requested_repository_read)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ...common,
+          plan.requestedPolicy!.version,
+          plan.requestedPolicy!.filesystem,
+          plan.requestedPolicy!.network,
+          plan.requestedPolicy!.environment,
+          plan.requestedCapabilities!.version,
+          plan.requestedCapabilities!.repositoryRead ? 1 : 0,
+        );
+      } else if (this.supportsRuntimePolicies) {
         this.database.prepare(`
           INSERT INTO execution_plans
             (id, attempt_id, job_id, project_id, installation_id, runtime_agent_id,
@@ -1040,8 +1131,8 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     if (!isValidDispatchTransition(existing.status, dispatch.status)) {
       throw new Error(`Execution Dispatch cannot transition from ${existing.status} to ${dispatch.status}`);
     }
-    if (dispatch.status !== 'accepted' && dispatch.effectivePolicy) {
-      throw new Error(`Only an accepted Execution Dispatch may record effective policy: ${dispatch.id}`);
+    if (dispatch.status !== 'accepted' && (dispatch.effectivePolicy || dispatch.effectiveCapabilities)) {
+      throw new Error(`Only an accepted Execution Dispatch may record effective policy and capabilities: ${dispatch.id}`);
     }
     if (dispatch.status === 'accepted' && this.supportsRuntimePolicies) {
       const planRow = this.database.prepare('SELECT * FROM execution_plans WHERE id = ?')
@@ -1055,6 +1146,23 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         throw new Error(`Legacy Execution Dispatch cannot invent effective policy: ${dispatch.id}`);
       }
     }
+    if (dispatch.status === 'accepted' && this.supportsExecutionCapabilities) {
+      const planRow = this.database.prepare('SELECT * FROM execution_plans WHERE id = ?')
+        .get(dispatch.executionPlanId) as ExecutionPlanRow | undefined;
+      const requestedCapabilities = planRow
+        ? toExecutionPlan(planRow).requestedCapabilities
+        : undefined;
+      if (requestedCapabilities && (!dispatch.effectiveCapabilities
+        || !isRuntimeExecutionCapabilitiesNoBroaderThan(
+          dispatch.effectiveCapabilities,
+          requestedCapabilities,
+        ))) {
+        throw new Error(`Accepted Execution Dispatch must record non-broader effective capabilities: ${dispatch.id}`);
+      }
+      if (!requestedCapabilities && dispatch.effectiveCapabilities) {
+        throw new Error(`Legacy Execution Dispatch cannot invent effective capabilities: ${dispatch.id}`);
+      }
+    }
     try {
       const common = [
         dispatch.status,
@@ -1066,8 +1174,30 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         dispatch.acceptedAt ?? null,
         dispatch.resolvedAt ?? null,
       ] as const;
-      const result = this.supportsRuntimePolicies
+      const result = this.supportsExecutionCapabilities
         ? this.database.prepare(`
+            UPDATE execution_dispatches SET
+              status = ?, external_reference = ?, message = ?, revision = ?, updated_at = ?,
+              submitted_at = ?, accepted_at = ?, resolved_at = ?,
+              effective_policy_version = ?, effective_filesystem = ?,
+              effective_network = ?, effective_environment = ?,
+              effective_capabilities_version = ?, effective_repository_read = ?
+            WHERE id = ? AND revision = ?
+          `).run(
+            ...common,
+            dispatch.effectivePolicy?.version ?? null,
+            dispatch.effectivePolicy?.filesystem ?? null,
+            dispatch.effectivePolicy?.network ?? null,
+            dispatch.effectivePolicy?.environment ?? null,
+            dispatch.effectiveCapabilities?.version ?? null,
+            dispatch.effectiveCapabilities?.repositoryRead === undefined
+              ? null
+              : dispatch.effectiveCapabilities.repositoryRead ? 1 : 0,
+            dispatch.id,
+            expectedRevision,
+          )
+        : this.supportsRuntimePolicies
+          ? this.database.prepare(`
             UPDATE execution_dispatches SET
               status = ?, external_reference = ?, message = ?, revision = ?, updated_at = ?,
               submitted_at = ?, accepted_at = ?, resolved_at = ?,
@@ -1083,7 +1213,7 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
             dispatch.id,
             expectedRevision,
           )
-        : this.database.prepare(`
+          : this.database.prepare(`
             UPDATE execution_dispatches SET
               status = ?, external_reference = ?, message = ?, revision = ?, updated_at = ?,
               submitted_at = ?, accepted_at = ?, resolved_at = ?
@@ -1111,13 +1241,7 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     );
     if (existing) return false;
     try {
-      this.database.prepare(`
-        INSERT INTO execution_observations
-          (id, dispatch_id, attempt_id, source, source_event_id, kind, correlation,
-           correlated_dispatch_id, runtime_session_id, external_reference, message,
-           output_summary, observed_at, recorded_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
+      const common = [
         observation.id,
         observation.dispatchId,
         observation.attemptId,
@@ -1130,9 +1254,60 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         observation.externalReference ?? null,
         observation.message ?? null,
         observation.outputSummary ?? null,
-        observation.observedAt,
-        observation.recordedAt,
-      );
+      ];
+      if (this.supportsExecutionCapabilities) {
+        this.database.prepare(`
+          INSERT INTO execution_observations
+            (id, dispatch_id, attempt_id, source, source_event_id, kind, correlation,
+             correlated_dispatch_id, runtime_session_id, external_reference, message,
+             output_summary, execution_working_directory, effective_policy_version,
+             effective_filesystem, effective_network, effective_environment,
+             repository_read_root, effective_capabilities_version,
+             effective_repository_read, observed_at, recorded_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ...common,
+          observation.executionContext?.workingDirectory ?? null,
+          observation.effectivePolicy?.version ?? null,
+          observation.effectivePolicy?.filesystem ?? null,
+          observation.effectivePolicy?.network ?? null,
+          observation.effectivePolicy?.environment ?? null,
+          observation.executionContext?.repositoryReadRoot ?? null,
+          observation.effectiveCapabilities?.version ?? null,
+          observation.effectiveCapabilities?.repositoryRead === undefined
+            ? null
+            : observation.effectiveCapabilities.repositoryRead ? 1 : 0,
+          observation.observedAt,
+          observation.recordedAt,
+        );
+      } else if (this.supportsExecutionContextEvidence) {
+        this.database.prepare(`
+          INSERT INTO execution_observations
+            (id, dispatch_id, attempt_id, source, source_event_id, kind, correlation,
+             correlated_dispatch_id, runtime_session_id, external_reference, message,
+             output_summary, execution_working_directory, effective_policy_version,
+             effective_filesystem, effective_network, effective_environment,
+             observed_at, recorded_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ...common,
+          observation.executionContext?.workingDirectory ?? null,
+          observation.effectivePolicy?.version ?? null,
+          observation.effectivePolicy?.filesystem ?? null,
+          observation.effectivePolicy?.network ?? null,
+          observation.effectivePolicy?.environment ?? null,
+          observation.observedAt,
+          observation.recordedAt,
+        );
+      } else {
+        this.database.prepare(`
+          INSERT INTO execution_observations
+            (id, dispatch_id, attempt_id, source, source_event_id, kind, correlation,
+             correlated_dispatch_id, runtime_session_id, external_reference, message,
+             output_summary, observed_at, recorded_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(...common, observation.observedAt, observation.recordedAt);
+      }
       return true;
     } catch (error) {
       const raced = this.database.prepare(`

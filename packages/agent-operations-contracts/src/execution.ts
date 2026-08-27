@@ -20,15 +20,42 @@ export const RUNTIME_ENVIRONMENT_POLICIES = ['empty', 'minimal', 'inherit'] as c
 export type RuntimeEnvironmentPolicy = (typeof RUNTIME_ENVIRONMENT_POLICIES)[number];
 
 /**
- * Provider-neutral authority requested for one immutable Execution Plan.
- * Tool availability is deliberately absent: current Codex app-server cannot
- * prove that shell and every configured integration are disabled per turn.
+ * Provider-neutral sandbox authority requested for one immutable Execution
+ * Plan. Narrow tool capabilities are modeled separately below.
  */
 export interface RuntimeExecutionPolicy {
   readonly version: 1;
   readonly filesystem: RuntimeFilesystemPolicy;
   readonly network: RuntimeNetworkPolicy;
   readonly environment: RuntimeEnvironmentPolicy;
+}
+
+/**
+ * Explicit provider-neutral tools exposed for one immutable Execution Plan.
+ * This remains separate from sandbox policy: repositoryRead grants a bounded
+ * reader, never shell or filesystem write authority.
+ */
+export interface RuntimeExecutionCapabilities {
+  readonly version: 1;
+  readonly repositoryRead: boolean;
+}
+
+export const NO_RUNTIME_EXECUTION_CAPABILITIES: RuntimeExecutionCapabilities = {
+  version: 1,
+  repositoryRead: false,
+};
+
+export const REPOSITORY_READ_EXECUTION_CAPABILITIES: RuntimeExecutionCapabilities = {
+  version: 1,
+  repositoryRead: true,
+};
+
+/** Provider-neutral, per-execution context resolved from durable AO state. */
+export interface RuntimeExecutionContext {
+  /** Canonical absolute checkout root for repository-bound execution. */
+  readonly workingDirectory: string;
+  /** Canonical reader root derived from the same checkout binding, never model input. */
+  readonly repositoryReadRoot?: string;
 }
 
 export const RESTRICTED_TEXT_EXECUTION_POLICY: RuntimeExecutionPolicy = {
@@ -59,6 +86,26 @@ export function createRuntimeExecutionPolicy(
     network: policy.network,
     environment: policy.environment,
   };
+}
+
+export function createRuntimeExecutionCapabilities(
+  capabilities: Omit<RuntimeExecutionCapabilities, 'version'> & { readonly version?: 1 },
+): RuntimeExecutionCapabilities {
+  if (capabilities.version !== undefined && capabilities.version !== 1) {
+    throw new Error(`Unsupported runtime execution capabilities version: ${capabilities.version}`);
+  }
+  if (typeof capabilities.repositoryRead !== 'boolean') {
+    throw new Error('Runtime repository-read capability must be boolean');
+  }
+  return { version: 1, repositoryRead: capabilities.repositoryRead };
+}
+
+export function isRuntimeExecutionCapabilitiesNoBroaderThan(
+  effective: RuntimeExecutionCapabilities,
+  requested: RuntimeExecutionCapabilities,
+): boolean {
+  return effective.version === requested.version
+    && (!effective.repositoryRead || requested.repositoryRead);
 }
 
 /** True when effective authority is equal to or narrower than requested authority. */
@@ -140,6 +187,8 @@ export interface DurableExecutionPlan {
   readonly input: ExecutionInputEnvelope;
   /** Absent only for truthful legacy Plans created before policy schema v6. */
   readonly requestedPolicy?: RuntimeExecutionPolicy;
+  /** Absent only for truthful legacy Plans created before capability schema v8. */
+  readonly requestedCapabilities?: RuntimeExecutionCapabilities;
   readonly jobRevisionAtPreparation: number;
   readonly attemptRevisionAtPreparation: number;
   readonly createdAt: string;
@@ -167,6 +216,8 @@ export type ExecutionPreflightFindingCode =
   | 'runtime-provider-unknown'
   | 'runtime-exact-turn-correlation-supported'
   | 'runtime-exact-turn-correlation-unsupported'
+  | 'runtime-execution-working-directory-supported'
+  | 'runtime-execution-working-directory-unsupported'
   | 'runtime-not-configured'
   | 'runtime-disabled'
   | 'runtime-running'
@@ -177,6 +228,14 @@ export type ExecutionPreflightFindingCode =
   | 'runtime-policy-supported'
   | 'runtime-policy-unspecified'
   | 'runtime-policy-unsupported'
+  | 'runtime-capabilities-unspecified'
+  | 'repository-read-only-policy'
+  | 'repository-policy-unsafe'
+  | 'repository-read-capability-required'
+  | 'repository-read-capability-supported'
+  | 'repository-read-capability-unsupported'
+  | 'repository-read-root-valid'
+  | 'repository-read-root-invalid'
   | 'runtime-working-directory-unavailable'
   | 'runtime-checkout-match'
   | 'runtime-checkout-mismatch'
@@ -188,6 +247,7 @@ export type ExecutionPreflightFindingCode =
   | 'checkout-available'
   | 'checkout-unavailable'
   | 'checkout-not-git'
+  | 'checkout-canonical-path-mismatch'
   | 'repository-observation-unavailable'
   | 'repository-identity-valid'
   | 'repository-identity-mismatch'
@@ -207,6 +267,10 @@ export interface ExecutionPreflightResult {
   readonly dispatchable: boolean;
   readonly requestedPolicy: RuntimeExecutionPolicy | null;
   readonly effectivePolicy: RuntimeExecutionPolicy | null;
+  readonly requestedCapabilities: RuntimeExecutionCapabilities | null;
+  readonly effectiveCapabilities: RuntimeExecutionCapabilities | null;
+  /** Null for repository-free Plans or when repository context cannot be proven. */
+  readonly executionContext: RuntimeExecutionContext | null;
   readonly checks: readonly ExecutionPreflightFinding[];
 }
 

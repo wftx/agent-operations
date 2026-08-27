@@ -9,6 +9,10 @@ function copyRequest(request: RuntimeDispatchRequest): RuntimeDispatchRequest {
     ...request,
     input: { ...request.input },
     requestedPolicy: { ...request.requestedPolicy },
+    requestedCapabilities: { ...request.requestedCapabilities },
+    ...(request.executionContext
+      ? { executionContext: { ...request.executionContext } }
+      : {}),
   };
 }
 
@@ -64,13 +68,24 @@ export class FakeRuntimeExecutionAdapter implements RuntimeExecutionAdapter {
       return { ...this.result };
     }
     this.submitted += 1;
-    if (this.result.status === 'accepted' && !this.result.effectivePolicy) {
-      return { ...this.result, effectivePolicy: { ...request.requestedPolicy } };
+    if (this.result.status === 'accepted') {
+      return {
+        ...this.result,
+        effectivePolicy: this.result.effectivePolicy
+          ? { ...this.result.effectivePolicy }
+          : { ...request.requestedPolicy },
+        effectiveCapabilities: this.result.effectiveCapabilities
+          ? { ...this.result.effectiveCapabilities }
+          : { ...request.requestedCapabilities },
+      };
     }
     return {
       ...this.result,
       ...(this.result.effectivePolicy
         ? { effectivePolicy: { ...this.result.effectivePolicy } }
+        : {}),
+      ...(this.result.effectiveCapabilities
+        ? { effectiveCapabilities: { ...this.result.effectiveCapabilities } }
         : {}),
     };
   }

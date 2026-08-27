@@ -77,6 +77,8 @@ function capabilitiesFor(provider: RuntimeProvider): readonly RuntimeCapability[
     ? [
         'session-resume',
         'exact-turn-correlation',
+        'execution-working-directory',
+        'repository-read-tools',
         'filesystem-read-only',
         'filesystem-workspace-write',
         'network-denial',

@@ -1,7 +1,14 @@
 import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { join, sep } from 'path';
 import { homedir } from 'os';
-import type { AgentConfig, AgentStatus, CtxEnv, RuntimeExecutionPolicyEnvelope } from '../types/index.js';
+import type {
+  AgentConfig,
+  AgentStatus,
+  CtxEnv,
+  RuntimeExecutionCapabilitiesEnvelope,
+  RuntimeExecutionContextEnvelope,
+  RuntimeExecutionPolicyEnvelope,
+} from '../types/index.js';
 import { AgentPTY } from '../pty/agent-pty.js';
 import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
@@ -22,6 +29,8 @@ export type CorrelatedInjectionResult =
       sessionId: string;
       turnId: string;
       effectivePolicy?: RuntimeExecutionPolicyEnvelope;
+      effectiveCapabilities?: RuntimeExecutionCapabilitiesEnvelope;
+      executionContext?: RuntimeExecutionContextEnvelope;
     }
   | {
       ok: false;
@@ -482,6 +491,8 @@ export class AgentProcess {
     content: string,
     correlationId: string,
     executionPolicy?: RuntimeExecutionPolicyEnvelope,
+    executionContext?: RuntimeExecutionContextEnvelope,
+    executionCapabilities?: RuntimeExecutionCapabilitiesEnvelope,
   ): Promise<CorrelatedInjectionResult> {
     if (!this.pty || this.status !== 'running') {
       return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
@@ -504,6 +515,14 @@ export class AgentProcess {
         message: `agent "${this.name}" cannot enforce the requested execution policy`,
       };
     }
+    if (executionCapabilities?.repositoryRead === true
+      && executionContext?.repositoryReadRoot !== executionContext?.workingDirectory) {
+      return {
+        ok: false,
+        code: 'POLICY_UNSUPPORTED',
+        message: `agent "${this.name}" requires repository-read root to match the execution checkout`,
+      };
+    }
     if (this.dedup.isDuplicate(content)) {
       this.log('Dedup: skipping duplicate correlated message');
       return { ok: false, code: 'DEDUPED', message: `inject for "${this.name}" deduped — content matches MessageDedup hash window` };
@@ -518,11 +537,21 @@ export class AgentProcess {
       };
     }
     try {
-      const reference = await this.pty.startCorrelationSafeTurn(content, correlationId, executionPolicy);
+      const reference = await this.pty.startCorrelationSafeTurn(
+        content,
+        correlationId,
+        executionPolicy,
+        executionContext,
+        executionCapabilities,
+      );
       return {
         ok: true,
         ...reference,
         ...(executionPolicy ? { effectivePolicy: { ...executionPolicy } } : {}),
+        ...(executionCapabilities
+          ? { effectiveCapabilities: { ...executionCapabilities } }
+          : {}),
+        ...(executionContext ? { executionContext: { ...executionContext } } : {}),
       };
     } catch (error) {
       if (error instanceof Error && error.message === 'RUNTIME_BUSY') {

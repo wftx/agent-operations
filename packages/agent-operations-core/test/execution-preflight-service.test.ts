@@ -66,6 +66,8 @@ function runtime(
     capabilities: [
       'session-resume',
       'exact-turn-correlation',
+      'execution-working-directory',
+      'repository-read-tools',
       'filesystem-read-only',
       'network-denial',
       'environment-empty',
@@ -120,6 +122,7 @@ async function prepared() {
     attemptId: attempt.id,
     instruction: 'Inspect the failing test.',
     requestedPolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
+    requestedCapabilities: { version: 1, repositoryRead: true },
   });
   return { store, lifecycle, job, attempt, plan };
 }
@@ -147,7 +150,12 @@ describe('ExecutionPreflightService', () => {
     const { store, plan } = await prepared();
     const result = await new ExecutionPreflightService(store, runtime(), repository(), () => new Date(TIME))
       .preflight(plan.id);
-    expect(result).toMatchObject({ status: 'ready', dispatchable: true, checkedAt: TIME });
+    expect(result).toMatchObject({
+      status: 'ready',
+      dispatchable: true,
+      checkedAt: TIME,
+      executionContext: { workingDirectory: PATH },
+    });
     expect(codes(result)).toEqual(expect.arrayContaining([
       'job-ready',
       'attempt-created',
@@ -179,7 +187,7 @@ describe('ExecutionPreflightService', () => {
         provider: 'codex',
         enabled: true,
         configured: true,
-        capabilities: ['session-resume', 'filesystem-read-only', 'network-denial', 'environment-empty'],
+        capabilities: ['session-resume', 'execution-working-directory', 'repository-read-tools', 'filesystem-read-only', 'network-denial', 'environment-empty'],
         health: { state: 'running' },
         observedAt: TIME,
         workingDirectory: PATH,
@@ -222,11 +230,11 @@ describe('ExecutionPreflightService', () => {
       () => new Date(TIME),
     ).preflight(plan.id);
     expect(result).toMatchObject({
-      dispatchable: true,
+      dispatchable: false,
       requestedPolicy: widerPlan.requestedPolicy,
       effectivePolicy: { version: 1, filesystem: 'read-only', network: 'allow', environment: 'empty' },
     });
-    expect(codes(result)).toContain('runtime-policy-supported');
+    expect(codes(result)).toEqual(expect.arrayContaining(['runtime-policy-supported', 'repository-policy-unsafe']));
   });
 
   it('blocks legacy unspecified and unsupported policy without dispatch', async () => {
@@ -261,15 +269,15 @@ describe('ExecutionPreflightService', () => {
     expect(codes(result)).toContain('runtime-policy-unsupported');
   });
 
-  it('blocks repository work when runtime checkout compatibility cannot be proven', async () => {
+  it('uses turn-level checkout context instead of agent-level working directory', async () => {
     const unavailable = await prepared();
     let result = await new ExecutionPreflightService(
       unavailable.store,
       runtime('running', 'codex', null),
       repository(),
     ).preflight(unavailable.plan.id);
-    expect(codes(result)).toContain('runtime-working-directory-unavailable');
-    expect(result.dispatchable).toBe(false);
+    expect(codes(result)).toContain('runtime-execution-working-directory-supported');
+    expect(result).toMatchObject({ dispatchable: true, executionContext: { workingDirectory: PATH } });
 
     const mismatch = await prepared();
     result = await new ExecutionPreflightService(
@@ -277,8 +285,7 @@ describe('ExecutionPreflightService', () => {
       runtime('running', 'codex', '/fixtures/wrong-checkout'),
       repository(),
     ).preflight(mismatch.plan.id);
-    expect(codes(result)).toContain('runtime-checkout-mismatch');
-    expect(result.dispatchable).toBe(false);
+    expect(result).toMatchObject({ dispatchable: true, executionContext: { workingDirectory: PATH } });
   });
 
   it.each(['starting', 'stopped', 'degraded', 'unknown'] as const)(

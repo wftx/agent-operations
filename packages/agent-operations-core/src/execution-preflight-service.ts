@@ -9,6 +9,8 @@ import type {
   ExecutionPreflightFindingSeverity,
   ExecutionPreflightResult,
   RepositoryInventoryAdapter,
+  RuntimeExecutionCapabilities,
+  RuntimeExecutionContext,
   RuntimeExecutionPolicy,
 } from '../../agent-operations-contracts/src/index.js';
 import { resolveRuntimeExecutionPolicy } from '../../agent-operations-contracts/src/index.js';
@@ -34,7 +36,14 @@ export class ExecutionPreflightService {
     await this.checkDurableState(plan, checks);
     const runtime = await this.checkRuntime(plan, checks);
     const effectivePolicy = this.checkRuntimePolicy(plan, runtime, checks);
-    await this.checkRepository(plan, checks, runtime);
+    const effectiveCapabilities = this.checkRuntimeCapabilities(plan, runtime, checks);
+    const executionContext = await this.checkRepository(
+      plan,
+      checks,
+      runtime,
+      effectivePolicy,
+      effectiveCapabilities,
+    );
     const dispatchable = !checks.some(check => check.severity === 'blocking');
     return {
       planId: plan.id,
@@ -45,8 +54,51 @@ export class ExecutionPreflightService {
       dispatchable,
       requestedPolicy: plan.requestedPolicy ? { ...plan.requestedPolicy } : null,
       effectivePolicy,
+      requestedCapabilities: plan.requestedCapabilities ? { ...plan.requestedCapabilities } : null,
+      effectiveCapabilities,
+      executionContext,
       checks,
     };
+  }
+
+  private checkRuntimeCapabilities(
+    plan: DurableExecutionPlan,
+    runtime: AgentRuntimeDetail | null,
+    checks: ExecutionPreflightFinding[],
+  ): RuntimeExecutionCapabilities | null {
+    const requested = plan.requestedCapabilities;
+    if (!requested) {
+      add(
+        checks,
+        plan.repositoryId ? 'repository-read-capability-required' : 'runtime-capabilities-unspecified',
+        'blocking',
+        plan.repositoryId
+          ? 'Repository-bound Plan predates explicit repository-read capability and cannot be dispatched.'
+          : 'Plan predates explicit runtime tool capabilities and cannot be dispatched.',
+      );
+      return null;
+    }
+    if (!requested.repositoryRead) {
+      if (plan.repositoryId) {
+        add(
+          checks,
+          'repository-read-capability-required',
+          'blocking',
+          'Repository-bound execution requires explicit repository-read capability.',
+        );
+      }
+      return { ...requested };
+    }
+    const supported = runtime?.capabilities.includes('repository-read-tools') === true;
+    add(
+      checks,
+      supported ? 'repository-read-capability-supported' : 'repository-read-capability-unsupported',
+      supported ? 'pass' : 'blocking',
+      supported
+        ? `Runtime ${plan.runtimeAgentId} supports bounded repository-read tools.`
+        : `Runtime ${plan.runtimeAgentId} cannot expose bounded repository-read tools.`,
+    );
+    return supported ? { ...requested } : null;
   }
 
   private checkRuntimePolicy(
@@ -190,7 +242,7 @@ export class ExecutionPreflightService {
       if (runtime.provider === 'unknown') {
         add(checks, 'runtime-provider-unknown', 'blocking', `Runtime ${runtime.id} has an unknown provider.`);
       }
-      if (this.options.requireExactTurnCorrelation) {
+      if (this.options.requireExactTurnCorrelation || Boolean(plan.repositoryId)) {
         const exactTurnCorrelation = runtime.capabilities.includes('exact-turn-correlation');
         add(
           checks,
@@ -232,20 +284,32 @@ export class ExecutionPreflightService {
     plan: DurableExecutionPlan,
     checks: ExecutionPreflightFinding[],
     runtime: AgentRuntimeDetail | null,
-  ): Promise<void> {
+    effectivePolicy: RuntimeExecutionPolicy | null,
+    effectiveCapabilities: RuntimeExecutionCapabilities | null,
+  ): Promise<RuntimeExecutionContext | null> {
     if (!plan.repositoryId && !plan.checkoutBindingId) {
       add(checks, 'no-repository-target', 'pass', 'Plan has no repository target.');
-      return;
+      return null;
     }
     if (!plan.repositoryId || !plan.checkoutBindingId) {
       add(checks, 'checkout-missing', 'blocking', 'Plan repository and checkout identities are incomplete.');
-      return;
+      return null;
+    }
+    const repository = await this.store.getRepository(plan.repositoryId).catch(() => null);
+    if (!repository) {
+      add(checks, 'repository-observation-unavailable', 'blocking', `Logical repository ${plan.repositoryId} no longer exists.`);
+      return null;
+    }
+    const repositoryIds = await this.store.listProjectRepositoryIds(plan.projectId)
+      .catch(() => [] as readonly string[]);
+    if (!repositoryIds.includes(plan.repositoryId)) {
+      add(checks, 'repository-identity-mismatch', 'blocking', `Repository ${plan.repositoryId} is no longer associated with project ${plan.projectId}.`);
     }
     const bindings = await this.store.listCheckoutBindings().catch(() => []);
     const binding = bindings.find(candidate => candidate.id === plan.checkoutBindingId);
     if (!binding) {
       add(checks, 'checkout-missing', 'blocking', `Checkout ${plan.checkoutBindingId} is not configured.`);
-      return;
+      return null;
     }
     if (binding.installationId !== plan.installationId) {
       add(
@@ -266,25 +330,28 @@ export class ExecutionPreflightService {
     if (binding.installationId === plan.installationId && binding.repositoryId === plan.repositoryId) {
       add(checks, 'checkout-binding-valid', 'pass', 'Checkout binding matches Plan installation and repository.');
     }
-    if (!runtime?.workingDirectory) {
-      add(
-        checks,
-        'runtime-working-directory-unavailable',
-        'blocking',
-        `Runtime ${plan.runtimeAgentId} does not expose its current working directory.`,
-      );
-    } else {
-      const runtimeDirectory = resolve(runtime.workingDirectory);
-      const checkoutDirectory = resolve(binding.canonicalPath);
-      add(
-        checks,
-        runtimeDirectory === checkoutDirectory ? 'runtime-checkout-match' : 'runtime-checkout-mismatch',
-        runtimeDirectory === checkoutDirectory ? 'pass' : 'blocking',
-        runtimeDirectory === checkoutDirectory
-          ? 'Runtime working directory matches the selected checkout.'
-          : `Runtime working directory ${runtimeDirectory} does not match checkout ${checkoutDirectory}.`,
-      );
-    }
+    const canSelectWorkingDirectory = runtime?.capabilities.includes('execution-working-directory') === true;
+    add(
+      checks,
+      canSelectWorkingDirectory
+        ? 'runtime-execution-working-directory-supported'
+        : 'runtime-execution-working-directory-unsupported',
+      canSelectWorkingDirectory ? 'pass' : 'blocking',
+      canSelectWorkingDirectory
+        ? `Runtime ${plan.runtimeAgentId} can establish a per-execution working directory.`
+        : `Runtime ${plan.runtimeAgentId} cannot establish a proven per-execution working directory.`,
+    );
+    const restrictedRepositoryPolicy = effectivePolicy?.filesystem === 'read-only'
+      && effectivePolicy.network === 'deny'
+      && effectivePolicy.environment === 'empty';
+    add(
+      checks,
+      restrictedRepositoryPolicy ? 'repository-read-only-policy' : 'repository-policy-unsafe',
+      restrictedRepositoryPolicy ? 'pass' : 'blocking',
+      restrictedRepositoryPolicy
+        ? 'Repository execution is restricted to filesystem=read-only, network=deny, environment=empty.'
+        : 'Phase 18 repository execution requires filesystem=read-only, network=deny, environment=empty.',
+    );
     try {
       const observation = await this.repositories.inspectRepository(binding.canonicalPath);
       if (observation.availability === 'unavailable') {
@@ -294,11 +361,11 @@ export class ExecutionPreflightService {
           'blocking',
           observation.reason ?? `Checkout path ${binding.canonicalPath} is unavailable.`,
         );
-        return;
+        return null;
       }
       if (observation.availability === 'not-a-repository') {
         add(checks, 'checkout-not-git', 'blocking', `${binding.canonicalPath} is not a Git repository.`);
-        return;
+        return null;
       }
       if (observation.availability === 'degraded') {
         add(
@@ -307,9 +374,34 @@ export class ExecutionPreflightService {
           'blocking',
           observation.reason ?? `Repository observation for ${binding.canonicalPath} is degraded.`,
         );
-        return;
+        return null;
       }
       add(checks, 'checkout-available', 'pass', `Checkout path ${binding.canonicalPath} is available.`);
+      const canonicalBindingPath = resolve(binding.canonicalPath);
+      const observedRoot = observation.repositoryRoot
+        ? resolve(observation.repositoryRoot)
+        : resolve(observation.checkoutPath);
+      const canonicalPathMatches = canonicalBindingPath === observedRoot
+        && resolve(observation.checkoutPath) === observedRoot;
+      add(
+        checks,
+        canonicalPathMatches ? 'runtime-checkout-match' : 'checkout-canonical-path-mismatch',
+        canonicalPathMatches ? 'pass' : 'blocking',
+        canonicalPathMatches
+          ? `Canonical checkout root is ${observedRoot}.`
+          : `Bound path ${canonicalBindingPath} does not resolve to observed Git root ${observedRoot}.`,
+      );
+      const readerRootValid = effectiveCapabilities?.repositoryRead === true
+        && canonicalPathMatches
+        && resolve(observedRoot) === observedRoot;
+      add(
+        checks,
+        readerRootValid ? 'repository-read-root-valid' : 'repository-read-root-invalid',
+        readerRootValid ? 'pass' : 'blocking',
+        readerRootValid
+          ? `Repository reader root is the canonical bound checkout ${observedRoot}.`
+          : 'Repository reader root could not be proven from the canonical checkout binding.',
+      );
       add(
         checks,
         observation.id === plan.repositoryId ? 'repository-identity-valid' : 'repository-identity-mismatch',
@@ -324,6 +416,14 @@ export class ExecutionPreflightService {
       if (observation.detachedHead) {
         add(checks, 'detached-head', 'warning', 'Checkout is at a detached HEAD.');
       }
+      return canonicalPathMatches && observation.id === plan.repositoryId
+        && binding.installationId === plan.installationId
+        && binding.repositoryId === plan.repositoryId
+        && canSelectWorkingDirectory
+        && restrictedRepositoryPolicy
+        && readerRootValid
+        ? { workingDirectory: observedRoot, repositoryReadRoot: observedRoot }
+        : null;
     } catch (error) {
       add(
         checks,
@@ -331,6 +431,7 @@ export class ExecutionPreflightService {
         'blocking',
         `Repository observation failed: ${message(error)}`,
       );
+      return null;
     }
   }
 }

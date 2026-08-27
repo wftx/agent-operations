@@ -1,3 +1,4 @@
+import { resolve } from 'node:path';
 import type {
   AgentOperationsStateStore,
   DurableAttemptOutcomeDecision,
@@ -18,6 +19,7 @@ const MAX_SOURCE_LENGTH = 100;
 const MAX_REFERENCE_LENGTH = 500;
 const MAX_MESSAGE_LENGTH = 2_000;
 const MAX_OUTPUT_SUMMARY_LENGTH = 4_000;
+const MAX_WORKING_DIRECTORY_LENGTH = 4_096;
 
 export type AttemptExecutionState =
   | 'still-running'
@@ -170,6 +172,48 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
   if (correlation !== 'exact' && correlatedDispatchId) {
     throw new Error('Only exact runtime observations may identify a Dispatch');
   }
+  const executionContext = value.executionContext;
+  if (executionContext !== undefined
+    && (!isRecord(executionContext)
+      || typeof executionContext.workingDirectory !== 'string'
+      || !executionContext.workingDirectory.startsWith('/')
+      || resolve(executionContext.workingDirectory) !== executionContext.workingDirectory
+      || executionContext.workingDirectory.length > MAX_WORKING_DIRECTORY_LENGTH
+      || (executionContext.repositoryReadRoot !== undefined
+        && (typeof executionContext.repositoryReadRoot !== 'string'
+          || !executionContext.repositoryReadRoot.startsWith('/')
+          || resolve(executionContext.repositoryReadRoot) !== executionContext.repositoryReadRoot
+          || executionContext.repositoryReadRoot.length > MAX_WORKING_DIRECTORY_LENGTH)))) {
+    throw new Error('Runtime observer returned an invalid execution working directory');
+  }
+  const effectivePolicy = value.effectivePolicy;
+  if (effectivePolicy !== undefined
+    && (!isRecord(effectivePolicy)
+      || effectivePolicy.version !== 1
+      || !['none', 'read-only', 'workspace-write'].includes(String(effectivePolicy.filesystem))
+      || !['deny', 'allow'].includes(String(effectivePolicy.network))
+      || !['empty', 'minimal', 'inherit'].includes(String(effectivePolicy.environment)))) {
+    throw new Error('Runtime observer returned an invalid effective execution policy');
+  }
+  const effectiveCapabilities = value.effectiveCapabilities;
+  if (effectiveCapabilities !== undefined
+    && (!isRecord(effectiveCapabilities)
+      || effectiveCapabilities.version !== 1
+      || typeof effectiveCapabilities.repositoryRead !== 'boolean')) {
+    throw new Error('Runtime observer returned invalid effective execution capabilities');
+  }
+  if (effectiveCapabilities?.repositoryRead === true
+    && (!executionContext
+      || executionContext.repositoryReadRoot !== executionContext.workingDirectory)) {
+    throw new Error('Repository-read evidence requires an exact reader root matching the execution checkout');
+  }
+  if (effectiveCapabilities?.repositoryRead === false && executionContext?.repositoryReadRoot !== undefined) {
+    throw new Error('Repository-read root cannot be present when repository-read capability is disabled');
+  }
+  if (correlation !== 'exact' && (executionContext !== undefined
+    || effectivePolicy !== undefined || effectiveCapabilities !== undefined)) {
+    throw new Error('Only exact runtime observations may carry execution context evidence');
+  }
   return {
     source,
     sourceEventId,
@@ -188,6 +232,34 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
       : {}),
     ...(boundedOptional(value.outputSummary, MAX_OUTPUT_SUMMARY_LENGTH)
       ? { outputSummary: boundedOptional(value.outputSummary, MAX_OUTPUT_SUMMARY_LENGTH) }
+      : {}),
+    ...(executionContext
+      ? {
+          executionContext: {
+            workingDirectory: String(executionContext.workingDirectory),
+            ...(executionContext.repositoryReadRoot
+              ? { repositoryReadRoot: String(executionContext.repositoryReadRoot) }
+              : {}),
+          },
+        }
+      : {}),
+    ...(effectivePolicy
+      ? {
+          effectivePolicy: {
+            version: 1,
+            filesystem: effectivePolicy.filesystem as 'none' | 'read-only' | 'workspace-write',
+            network: effectivePolicy.network as 'deny' | 'allow',
+            environment: effectivePolicy.environment as 'empty' | 'minimal' | 'inherit',
+          },
+        }
+      : {}),
+    ...(effectiveCapabilities
+      ? {
+          effectiveCapabilities: {
+            version: 1,
+            repositoryRead: Boolean(effectiveCapabilities.repositoryRead),
+          },
+        }
       : {}),
   };
 }

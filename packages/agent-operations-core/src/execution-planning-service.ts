@@ -6,11 +6,14 @@ import type {
   DurableProject,
   DurableRepository,
   RepositoryCheckoutBinding,
+  RuntimeExecutionCapabilities,
   RuntimeExecutionPolicy,
 } from '../../agent-operations-contracts/src/index.js';
 import {
+  NO_RUNTIME_EXECUTION_CAPABILITIES,
   createExecutionInputEnvelope,
   createExecutionPlanId,
+  createRuntimeExecutionCapabilities,
   createRuntimeExecutionPolicy,
 } from '../../agent-operations-contracts/src/index.js';
 
@@ -19,6 +22,7 @@ export interface PrepareExecutionPlanInput {
   readonly attemptId: string;
   readonly instruction: string;
   readonly requestedPolicy: RuntimeExecutionPolicy;
+  readonly requestedCapabilities?: RuntimeExecutionCapabilities;
   readonly checkoutBindingId?: string;
 }
 
@@ -89,6 +93,12 @@ export class ExecutionPlanningService {
       input.checkoutBindingId,
     );
     const requestedPolicy = copyPolicy(input.requestedPolicy);
+    const requestedCapabilities = copyCapabilities(
+      input.requestedCapabilities ?? NO_RUNTIME_EXECUTION_CAPABILITIES,
+    );
+    if (requestedCapabilities.repositoryRead && !job.repositoryId) {
+      throw new Error('Repository-read capability requires a repository-bound Job');
+    }
     const plan: DurableExecutionPlan = {
       id: this.planIdFactory(),
       attemptId: attempt.id,
@@ -100,6 +110,7 @@ export class ExecutionPlanningService {
       ...(checkout ? { checkoutBindingId: checkout.id } : {}),
       input: createExecutionInputEnvelope(input.instruction),
       requestedPolicy,
+      requestedCapabilities,
       jobRevisionAtPreparation: job.revision,
       attemptRevisionAtPreparation: attempt.revision,
       createdAt: this.now().toISOString(),
@@ -166,6 +177,10 @@ export class ExecutionPlanningService {
 function copyPolicy(policy: RuntimeExecutionPolicy): RuntimeExecutionPolicy {
   if (!policy) throw new Error('Requested runtime execution policy is required');
   return createRuntimeExecutionPolicy(policy);
+}
+
+function copyCapabilities(capabilities: RuntimeExecutionCapabilities): RuntimeExecutionCapabilities {
+  return createRuntimeExecutionCapabilities(capabilities);
 }
 
 function required(value: string, field: string): string {

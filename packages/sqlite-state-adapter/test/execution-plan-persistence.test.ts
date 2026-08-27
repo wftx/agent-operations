@@ -89,7 +89,10 @@ function plan(withPolicy = false): DurableExecutionPlan {
     checkoutBindingId: CHECKOUT_ID,
     input: { version: 1, instruction: 'Inspect the failing test.' },
     ...(withPolicy
-      ? { requestedPolicy: { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const } }
+      ? {
+          requestedPolicy: { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const },
+          requestedCapabilities: { version: 1 as const, repositoryRead: true },
+        }
       : {}),
     jobRevisionAtPreparation: 1,
     attemptRevisionAtPreparation: 0,
@@ -168,7 +171,7 @@ describe('SQLite Execution Plan persistence', () => {
     expect(() => SqliteAgentOperationsStateStore.open({
       databasePath,
       additionalMigrations: [{
-        version: 7,
+        version: 9,
         name: 'deliberate-v7-failure',
         up: database => {
           database.exec('CREATE TABLE should_rollback_v5 (id TEXT)');
@@ -181,7 +184,7 @@ describe('SQLite Execution Plan persistence', () => {
     expect(database.prepare("SELECT name FROM sqlite_master WHERE name='should_rollback_v5'").get())
       .toBeUndefined();
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }]);
     expect(database.prepare('SELECT id FROM execution_plans').get()).toEqual({ id: plan().id });
     database.close();
   });

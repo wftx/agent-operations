@@ -17,6 +17,7 @@
     "scripts/execution-observation-demo.ts",
     "scripts/observe-cortextos.ts",
     "scripts/live-rehearsal.ts",
+    "scripts/repository-rehearsal.ts",
     "tests/architecture/agent-operations-boundary.test.ts"
   ],
   "exclude": ["node_modules", "dist", "dashboard"]

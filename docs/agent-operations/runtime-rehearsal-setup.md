@@ -90,9 +90,17 @@ the same local Unix-socket access as the startup. A sandbox-denied socket
 connection can otherwise look identical to a stopped daemon even while its PID
 is alive.
 
-The inventory should be available with exactly one running `agent-operations/rehearsal` Codex runtime. The rehearsal command must be run without `--execute`; it should find the safe candidate, show `repository: none`, report the requested/effective `read-only` + `deny` + `empty` runtime policy, and report `Execution authorized: false`. Do not use the execution flags during environment setup.
+The inventory should be available with exactly one running `agent-operations/rehearsal` Codex runtime. The repository-free rehearsal command must be run without `--execute`; it should find the safe candidate, show `repository: none`, report the requested/effective `read-only` + `deny` + `empty` runtime policy, and report `Execution authorized: false`. Do not use the execution flags during environment setup.
 
-For future policy-aware Dispatches, CortextOS creates a new dedicated Codex thread rather than reusing the agent's legacy `danger-full-access` thread. The restricted thread uses read-only filesystem writes, denies tool-runtime network, disables Codex environment attachment, prevents shell subprocesses from inheriting the app-server environment, and disables configured MCP servers, apps, hooks, goals/automatic continuation, memories, multi-agent tools, login shells, web search, and host dynamic tools. Codex still exposes non-login shell invocation and read access beyond the rehearsal directory; those residual capabilities are documented in ADR 0012 and must not be described as “no tools” or “no filesystem access.”
+For future policy-aware Dispatches, CortextOS creates a new dedicated Codex thread rather than reusing the agent's legacy `danger-full-access` thread. The restricted thread uses a read-only sandbox, denies tool-runtime network, disables Codex environment attachment, and disables configured MCP servers, apps, hooks, goals/automatic continuation, memories, multi-agent tools, code mode, login/non-login shell tools, shell snapshots, and web search. Repository-free turns expose no dynamic tools. An explicitly capable repository Plan exposes only the bounded `repository.list`, `repository.read`, and `repository.search` dynamic tools described in ADR 0017.
+
+After build and deterministic validation, preview repository preparation without execution:
+
+```bash
+npm run dev:repository-rehearsal -- --prepare --confirm REPOSITORY_REHEARSAL
+```
+
+The preview must show repository `remote:github.com/wftx/agent-operations`, the canonical checkout and reader root, `read-only / deny / empty`, repository read enabled, arbitrary shell disabled, writes unavailable, exact correlation available, and `Execution authorized: false`. It may prepare a fresh Attempt and immutable Plan after a prior Attempt is terminal, but it must create no Dispatch and send no runtime instruction.
 
 Fresh-agent admission requires a running runtime, a recent `last_idle.flag`, empty inbox and inflight queues, and either no prior injection flag or an idle timestamp at least as new as the last injection. Do not inject a ping merely to manufacture readiness evidence.
 

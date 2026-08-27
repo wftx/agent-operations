@@ -1,14 +1,25 @@
 import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
-import { join } from 'path';
+import { isAbsolute, join, resolve } from 'path';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
-import type { AgentConfig, CtxEnv, RuntimeExecutionPolicyEnvelope } from '../types/index.js';
+import type {
+  AgentConfig,
+  CtxEnv,
+  RuntimeExecutionCapabilitiesEnvelope,
+  RuntimeExecutionContextEnvelope,
+  RuntimeExecutionPolicyEnvelope,
+} from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
 import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir, atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
 import { logEvent } from '../bus/event.js';
 import { WsUnixJsonRpcClient, type JsonRpcResponse } from '../utils/ws-unix-client.js';
+import {
+  RepositoryReadError,
+  RootScopedRepositoryReader,
+  type RepositoryReadAuditEvent,
+} from './repository-read-capability.js';
 
 interface IPty {
   pid: number;
@@ -73,12 +84,19 @@ interface CorrelatedTurnRecord {
   completedAt?: string;
   durationMs?: number;
   error?: string;
+  workingDirectory?: string;
+  effectivePolicy?: RuntimeExecutionPolicyEnvelope;
+  effectiveCapabilities?: RuntimeExecutionCapabilitiesEnvelope;
+  repositoryReadRoot?: string;
+  repositoryReadOperations?: readonly RepositoryReadAuditEvent[];
 }
 
 export interface CorrelationSafeTurnReference {
   readonly provider: 'codex';
   readonly sessionId: string;
   readonly turnId: string;
+  readonly executionContext?: RuntimeExecutionContextEnvelope;
+  readonly effectiveCapabilities?: RuntimeExecutionCapabilitiesEnvelope;
 }
 
 export interface CodexExecutionPolicyMapping {
@@ -119,6 +137,62 @@ interface GoalResponse {
 interface ConfigReadResponse {
   config: Record<string, unknown>;
 }
+
+interface DynamicToolCallParams {
+  threadId: string;
+  turnId: string;
+  callId: string;
+  namespace: string | null;
+  tool: string;
+  arguments: unknown;
+}
+
+const REPOSITORY_DYNAMIC_TOOLS = [{
+  type: 'namespace',
+  name: 'repository',
+  description: 'Bounded read-only access to the repository authorized by the Execution Plan.',
+  tools: [
+    {
+      type: 'function',
+      name: 'list',
+      description: 'List a bounded set of entries under a repository-relative directory.',
+      inputSchema: {
+        type: 'object',
+        properties: { path: { type: 'string', description: 'Repository-relative directory; defaults to root.' } },
+        additionalProperties: false,
+      },
+    },
+    {
+      type: 'function',
+      name: 'read',
+      description: 'Read bounded UTF-8 text lines from one repository-relative file.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+          startLine: { type: 'integer', minimum: 1 },
+          maxLines: { type: 'integer', minimum: 1, maximum: 500 },
+        },
+        required: ['path'],
+        additionalProperties: false,
+      },
+    },
+    {
+      type: 'function',
+      name: 'search',
+      description: 'Search bounded UTF-8 repository text for a literal query.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string' },
+          path: { type: 'string', description: 'Repository-relative file or directory; defaults to root.' },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+  ],
+}] as const;
 
 const THREAD_PERMISSION_OVERRIDES = {
   approvalPolicy: 'never',
@@ -170,6 +244,8 @@ export class CodexAppServerPTY {
   private _activeTurnId: string | null = null;
   private _protectedTurnId: string | null = null;
   private _protectedThreadId: string | null = null;
+  private _repositoryReader: RootScopedRepositoryReader | null = null;
+  private _repositoryReadOperations: RepositoryReadAuditEvent[] = [];
   private _correlationStartPending = false;
   private _writeBuffer = '';
   private _turnQueue: unknown[][] = [];
@@ -264,6 +340,8 @@ export class CodexAppServerPTY {
     this._activeTurnId = null;
     this._protectedTurnId = null;
     this._protectedThreadId = null;
+    this._repositoryReader = null;
+    this._repositoryReadOperations = [];
     this._correlationStartPending = false;
     this._turnQueue = [];
     this.rejectTurnCompletion(new Error('Codex app-server stopped'));
@@ -318,6 +396,8 @@ export class CodexAppServerPTY {
     content: string,
     correlationId: string,
     executionPolicy?: RuntimeExecutionPolicyEnvelope,
+    executionContext?: RuntimeExecutionContextEnvelope,
+    executionCapabilities?: RuntimeExecutionCapabilitiesEnvelope,
   ): Promise<CorrelationSafeTurnReference> {
     if (!this.canStartCorrelationSafeTurn() || !this._threadId) {
       throw new Error('RUNTIME_BUSY');
@@ -327,19 +407,50 @@ export class CodexAppServerPTY {
       throw new Error('INVALID_CORRELATION_ID');
     }
 
+    if (executionContext && !executionPolicy) {
+      throw new Error('POLICY_UNSUPPORTED: execution context requires a policy-isolated thread');
+    }
+    if (executionCapabilities && !executionPolicy) {
+      throw new Error('POLICY_UNSUPPORTED: execution capabilities require a policy-isolated thread');
+    }
+    const executionWorkingDirectory = executionContext
+      ? normalizeExecutionWorkingDirectory(executionContext.workingDirectory)
+      : this._cwd;
     const policyMapping = executionPolicy
-      ? mapExecutionPolicyToCodex(executionPolicy, this._cwd)
+      ? mapExecutionPolicyToCodex(executionPolicy, executionWorkingDirectory)
       : null;
+    const repositoryReadEnabled = executionCapabilities?.repositoryRead === true;
+    if (executionCapabilities && executionCapabilities.version !== 1) {
+      throw new Error('POLICY_UNSUPPORTED: unsupported execution capabilities version');
+    }
+    if (repositoryReadEnabled
+      && (!executionContext?.repositoryReadRoot
+        || executionContext.repositoryReadRoot !== executionWorkingDirectory)) {
+      throw new Error('POLICY_UNSUPPORTED: repository-read root must match the execution checkout');
+    }
+    if (!repositoryReadEnabled && executionContext?.repositoryReadRoot) {
+      throw new Error('POLICY_UNSUPPORTED: repository-read root supplied without capability');
+    }
     this._executing = true;
     this._correlationStartPending = true;
     let threadId: string;
     try {
+      this._repositoryReader = repositoryReadEnabled
+        ? new RootScopedRepositoryReader(executionWorkingDirectory)
+        : null;
+      this._repositoryReadOperations = [];
       threadId = policyMapping
-        ? await this.startPolicyIsolatedThread(policyMapping)
+        ? await this.startPolicyIsolatedThread(
+            policyMapping,
+            executionWorkingDirectory,
+            repositoryReadEnabled,
+          )
         : this._threadId;
     } catch (error) {
       this._executing = false;
       this._correlationStartPending = false;
+      this._repositoryReader = null;
+      this._repositoryReadOperations = [];
       if (this._alive && this._turnQueue.length > 0) void this.drainQueue();
       throw new Error(`POLICY_THREAD_SETUP_FAILED: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -358,7 +469,7 @@ export class CodexAppServerPTY {
         input: [{ type: 'text', text: content, text_elements: [] }],
         ...(policyMapping
           ? {
-              cwd: this._cwd,
+              cwd: executionWorkingDirectory,
               runtimeWorkspaceRoots: policyMapping.runtimeWorkspaceRoots,
               approvalPolicy: 'never',
               sandboxPolicy: policyMapping.sandboxPolicy,
@@ -380,11 +491,36 @@ export class CodexAppServerPTY {
         this._protectedTurnId = turn.id;
         this._protectedThreadId = threadId;
       }
-      if (!this.writeCorrelatedTurnRecord(threadId, turn, cleanCorrelationId)) {
+      if (!this.writeCorrelatedTurnRecord(
+        threadId,
+        turn,
+        cleanCorrelationId,
+        executionWorkingDirectory,
+        executionPolicy,
+        executionCapabilities,
+        executionContext?.repositoryReadRoot,
+      )) {
         throw new Error('Codex turn started but correlated state could not be persisted');
       }
       void settled;
-      return { provider: 'codex', sessionId: threadId, turnId: turn.id };
+      return {
+        provider: 'codex',
+        sessionId: threadId,
+        turnId: turn.id,
+        ...(executionContext
+          ? {
+              executionContext: {
+                workingDirectory: executionWorkingDirectory,
+                ...(executionContext.repositoryReadRoot
+                  ? { repositoryReadRoot: executionContext.repositoryReadRoot }
+                  : {}),
+              },
+            }
+          : {}),
+        ...(executionCapabilities
+          ? { effectiveCapabilities: { ...executionCapabilities } }
+          : {}),
+      };
     } catch (error) {
       if (turnIdentityKnown) {
         this._correlationStartPending = false;
@@ -407,22 +543,31 @@ export class CodexAppServerPTY {
     }
   }
 
-  private async startPolicyIsolatedThread(mapping: CodexExecutionPolicyMapping): Promise<string> {
-    const mcpServers = await this.readRestrictedMcpServerOverrides();
+  private async startPolicyIsolatedThread(
+    mapping: CodexExecutionPolicyMapping,
+    workingDirectory: string,
+    repositoryReadEnabled: boolean,
+  ): Promise<string> {
+    const mcpServers = await this.readRestrictedMcpServerOverrides(workingDirectory);
     const response = await this.request<ThreadResponse>('thread/start', {
-      cwd: this._cwd,
+      cwd: workingDirectory,
       runtimeWorkspaceRoots: mapping.runtimeWorkspaceRoots,
       approvalPolicy: 'never',
       sandbox: mapping.threadSandbox,
       ...(mapping.environments ? { environments: mapping.environments } : {}),
-      dynamicTools: [],
+      dynamicTools: repositoryReadEnabled ? REPOSITORY_DYNAMIC_TOOLS : [],
       selectedCapabilityRoots: [],
       config: {
         features: {
+          code_mode: false,
+          code_mode_host: false,
           goals: false,
           hooks: false,
           memories: false,
           multi_agent: false,
+          shell_snapshot: false,
+          shell_snapshot_v2: false,
+          shell_tool: false,
         },
         agents: { enabled: false },
         allow_login_shell: false,
@@ -452,9 +597,11 @@ export class CodexAppServerPTY {
     return threadId;
   }
 
-  private async readRestrictedMcpServerOverrides(): Promise<Record<string, { enabled: false }>> {
+  private async readRestrictedMcpServerOverrides(
+    workingDirectory: string,
+  ): Promise<Record<string, { enabled: false }>> {
     const response = await this.request<ConfigReadResponse>('config/read', {
-      cwd: this._cwd,
+      cwd: workingDirectory,
       includeLayers: false,
     });
     const configured = response.result?.config?.mcp_servers;
@@ -933,6 +1080,10 @@ export class CodexAppServerPTY {
     if ('method' in message && 'id' in message) {
       const method = String(message.method);
       const id = message.id as number | string;
+      if (method === 'item/tool/call') {
+        this.handleRepositoryToolCall(id, message.params);
+        return;
+      }
       this._outputBuffer.push(`[codex-app-server] unsupported request: ${method}\n`);
       this.emitUnsupportedRequestEvent(method);
       this._rpc?.respondError(id, -32601, `Unsupported app-server request: ${method}`);
@@ -1065,6 +1216,77 @@ export class CodexAppServerPTY {
     }
   }
 
+  private handleRepositoryToolCall(id: number | string, rawParams: unknown): void {
+    const params = isRecord(rawParams) ? rawParams as unknown as DynamicToolCallParams : null;
+    const operation = params?.tool === 'list' || params?.tool === 'read' || params?.tool === 'search'
+      ? params.tool
+      : null;
+    const args = params && isRecord(params.arguments) ? params.arguments : {};
+    const path = typeof args.path === 'string' ? args.path : '.';
+    const query = typeof args.query === 'string' ? args.query : undefined;
+    const reply = (success: boolean, value: unknown): void => {
+      this._rpc?.respond(id, {
+        success,
+        contentItems: [{
+          type: 'inputText',
+          text: typeof value === 'string' ? value : JSON.stringify(value),
+        }],
+      });
+    };
+
+    if (!params || params.namespace !== 'repository' || !operation
+      || params.threadId !== this._protectedThreadId
+      || params.turnId !== this._protectedTurnId
+      || !this._repositoryReader) {
+      reply(false, { code: 'CAPABILITY_DENIED', message: 'Repository-read capability is unavailable for this exact turn' });
+      return;
+    }
+
+    try {
+      const result = operation === 'list'
+        ? this._repositoryReader.list(path)
+        : operation === 'read'
+          ? this._repositoryReader.read(
+              typeof args.path === 'string' ? args.path : '',
+              typeof args.startLine === 'number' ? args.startLine : 1,
+              typeof args.maxLines === 'number' ? args.maxLines : 200,
+            )
+          : this._repositoryReader.search(
+              typeof args.query === 'string' ? args.query : '',
+              path,
+            );
+      this.recordRepositoryReadOperation({
+        operation,
+        path,
+        ...(query ? { query: query.slice(0, 200) } : {}),
+        success: true,
+        occurredAt: new Date().toISOString(),
+      });
+      reply(true, result);
+    } catch (error) {
+      const code = error instanceof RepositoryReadError ? error.code : 'READ_FAILED';
+      const message = error instanceof Error ? error.message : String(error);
+      this.recordRepositoryReadOperation({
+        operation,
+        path,
+        ...(query ? { query: query.slice(0, 200) } : {}),
+        success: false,
+        errorCode: code,
+        occurredAt: new Date().toISOString(),
+      });
+      reply(false, { code, message });
+    }
+  }
+
+  private recordRepositoryReadOperation(event: RepositoryReadAuditEvent): void {
+    this._repositoryReadOperations = [...this._repositoryReadOperations, event].slice(-100);
+    if (!this._protectedThreadId || !this._protectedTurnId) return;
+    this.writeCorrelatedTurnRecord(
+      this._protectedThreadId,
+      { id: this._protectedTurnId, status: 'inProgress' },
+    );
+  }
+
   private request<T>(method: string, params: unknown): Promise<JsonRpcResponse<T>> {
     if (!this._rpc) throw new Error('Codex app-server RPC is not connected');
     return this._rpc.request<T>(method, params);
@@ -1104,6 +1326,8 @@ export class CodexAppServerPTY {
     this._protectedTurnId = null;
     this._protectedThreadId = null;
     this._correlationStartPending = false;
+    this._repositoryReader = null;
+    this._repositoryReadOperations = [];
     this._executing = false;
     if (this._alive && this._turnQueue.length > 0) {
       this.drainQueue().catch((error) => {
@@ -1126,6 +1350,10 @@ export class CodexAppServerPTY {
     threadId: string,
     turn: CodexTurn,
     correlationId?: string,
+    workingDirectory?: string,
+    effectivePolicy?: RuntimeExecutionPolicyEnvelope,
+    effectiveCapabilities?: RuntimeExecutionCapabilitiesEnvelope,
+    repositoryReadRoot?: string,
   ): boolean {
     const path = this.correlatedTurnRecordPath(threadId, turn.id);
     if (!path) return false;
@@ -1144,6 +1372,12 @@ export class CodexAppServerPTY {
     const completedAt = epochSecondsToIso(turn.completedAt) ?? previous?.completedAt;
     const durationMs = typeof turn.durationMs === 'number' ? turn.durationMs : previous?.durationMs;
     const error = turn.error?.message ?? previous?.error;
+    const recordedPolicy = effectivePolicy ?? previous?.effectivePolicy;
+    const recordedCapabilities = effectiveCapabilities ?? previous?.effectiveCapabilities;
+    const recordedReaderRoot = repositoryReadRoot ?? previous?.repositoryReadRoot;
+    const recordedOperations = this._repositoryReadOperations.length
+      ? this._repositoryReadOperations
+      : previous?.repositoryReadOperations;
     const record: CorrelatedTurnRecord = {
       version: 1,
       provider: 'codex',
@@ -1158,6 +1392,19 @@ export class CodexAppServerPTY {
       ...(completedAt ? { completedAt } : {}),
       ...(durationMs !== undefined ? { durationMs } : {}),
       ...(error ? { error: error.slice(0, 2_000) } : {}),
+      ...((workingDirectory ?? previous?.workingDirectory)
+        ? { workingDirectory: workingDirectory ?? previous!.workingDirectory }
+        : {}),
+      ...(recordedPolicy
+        ? { effectivePolicy: { ...recordedPolicy } }
+        : {}),
+      ...(recordedCapabilities
+        ? { effectiveCapabilities: { ...recordedCapabilities } }
+        : {}),
+      ...(recordedReaderRoot ? { repositoryReadRoot: recordedReaderRoot } : {}),
+      ...(recordedOperations?.length
+        ? { repositoryReadOperations: recordedOperations.map(operation => ({ ...operation })) }
+        : {}),
     };
     try {
       ensureDir(join(this._stateDir, 'codex-turns', threadId));
@@ -1424,6 +1671,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function validCodexId(value: string): boolean {
   return /^[A-Za-z0-9_-]{1,200}$/.test(value);
+}
+
+function normalizeExecutionWorkingDirectory(value: string): string {
+  if (!isAbsolute(value) || value.includes('\0')) throw new Error('INVALID_EXECUTION_CONTEXT');
+  const normalized = resolve(value);
+  if (normalized !== value) throw new Error('INVALID_EXECUTION_CONTEXT');
+  return normalized;
 }
 
 export function mapExecutionPolicyToCodex(

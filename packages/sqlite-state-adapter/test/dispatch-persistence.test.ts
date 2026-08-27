@@ -93,7 +93,10 @@ function plan(suffix: string, withPolicy = true): DurableExecutionPlan {
     checkoutBindingId: CHECKOUT_ID,
     input: { version: 1, instruction: `Dispatch ${suffix}.` },
     ...(withPolicy
-      ? { requestedPolicy: { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const } }
+      ? {
+          requestedPolicy: { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const },
+          requestedCapabilities: { version: 1 as const, repositoryRead: true },
+        }
       : {}),
     jobRevisionAtPreparation: 1,
     attemptRevisionAtPreparation: 0,
@@ -131,7 +134,10 @@ function terminal(
     status,
     ...(status === 'accepted' ? { acceptedAt: TIME } : {}),
     ...(status === 'accepted' && withPolicy
-      ? { effectivePolicy: { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const } }
+      ? {
+          effectivePolicy: { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const },
+          effectiveCapabilities: { version: 1 as const, repositoryRead: true },
+        }
       : {}),
     resolvedAt: TIME,
     revision: 2,
@@ -189,7 +195,7 @@ describe('SQLite Execution Dispatch persistence', () => {
 
     const database = new Database(path, { readonly: true });
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }]);
     expect(database.prepare(`
       SELECT requested_policy_version, requested_filesystem, requested_network, requested_environment
       FROM execution_plans WHERE id = 'plan:legacy-policy'
@@ -301,7 +307,7 @@ describe('SQLite Execution Dispatch persistence', () => {
     expect(() => SqliteAgentOperationsStateStore.open({
       databasePath: path,
       additionalMigrations: [{
-        version: 7,
+        version: 9,
         name: 'deliberate-dispatch-rollback',
         up: database => {
           database.exec('CREATE TABLE should_rollback_dispatch (id TEXT)');
@@ -316,7 +322,7 @@ describe('SQLite Execution Dispatch persistence', () => {
     expect(database.prepare('SELECT id FROM execution_dispatches').get())
       .toEqual({ id: 'dispatch:rollback' });
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }]);
     database.close();
   });
 });
