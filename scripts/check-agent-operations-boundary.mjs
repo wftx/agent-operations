@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 const repositoryRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const packagesRoot = join(repositoryRoot, 'packages');
+const operatorWebRoot = join(repositoryRoot, 'apps', 'ao-web', 'src');
 const failures = [];
 const importPattern = /(?:from\s+|import\s*\(|require\s*\()\s*['"]([^'"]+)['"]/g;
 const coreInternalPattern = /(?:^|\/)src\/(?:daemon|pty|hooks)(?:\/|$)/;
@@ -33,13 +34,27 @@ for (const packageEntry of readdirSync(packagesRoot, { withFileTypes: true })) {
         failures.push(`${relative(repositoryRoot, file)} imports forbidden CortextOS core path: ${specifier}`);
       }
       const isContractOrDomain = packageName === 'agent-operations-contracts'
-        || /^agent-operations-(?:core|domain)$/.test(packageName);
+        || /^agent-operations-(?:core|domain|application)$/.test(packageName);
       if (isContractOrDomain && implementationPackagePattern.test(specifier)) {
         failures.push(`${relative(repositoryRoot, file)} makes AO contracts/domain depend on an implementation adapter: ${specifier}`);
       }
       if (isContractOrDomain && foreignPersistencePattern.test(specifier)) {
         failures.push(`${relative(repositoryRoot, file)} makes AO contracts/domain depend on foreign persistence: ${specifier}`);
       }
+    }
+  }
+}
+
+for (const file of walk(operatorWebRoot)) {
+  if (file === join(operatorWebRoot, 'server.ts')) continue;
+  const source = readFileSync(file, 'utf8');
+  for (const match of source.matchAll(importPattern)) {
+    const specifier = match[1];
+    if (specifier.includes('/packages/') && !specifier.includes('/agent-operations-application/')) {
+      failures.push(`${relative(repositoryRoot, file)} bypasses the AO application boundary: ${specifier}`);
+    }
+    if (coreInternalPattern.test(specifier)) {
+      failures.push(`${relative(repositoryRoot, file)} imports forbidden CortextOS core path: ${specifier}`);
     }
   }
 }

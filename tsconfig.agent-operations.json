@@ -19,6 +19,8 @@
     "scripts/live-rehearsal.ts",
     "scripts/repository-rehearsal.ts",
     "scripts/orchestrate.ts",
+    "scripts/operator.ts",
+    "apps/ao-web/**/*.ts",
     "tests/architecture/agent-operations-boundary.test.ts"
   ],
   "exclude": ["node_modules", "dist", "dashboard"]

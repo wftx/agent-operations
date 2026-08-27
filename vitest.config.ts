@@ -20,6 +20,7 @@ export default defineConfig({
     include: [
       'tests/**/*.test.ts',
       'packages/**/*.test.ts',
+      'apps/**/*.test.ts',
       'dashboard/src/**/__tests__/**/*.test.ts',
     ],
   },

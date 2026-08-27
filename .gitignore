@@ -85,6 +85,7 @@ docs/architecture/*
 !docs/architecture/decisions/**
 !docs/agent-operations/
 !docs/agent-operations/runtime-rehearsal-setup.md
+!docs/agent-operations/operator-mvp.md
 
 # Internal developer/planning notes (not for public repo)
 KNOWN-ISSUES.md

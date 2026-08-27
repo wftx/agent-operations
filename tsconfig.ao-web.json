@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.agent-operations.json",
+  "include": [
+    "packages/agent-operations-application/**/*.ts",
+    "apps/ao-web/**/*.ts"
+  ]
+}
