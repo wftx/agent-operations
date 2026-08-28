@@ -57,6 +57,13 @@ export class OperatorWebApplication {
         const session = await this.application.cancelEscalatedJob(decodeURIComponent(cancel[1]));
         return redirect(`/jobs/${encodeURIComponent(session.jobId)}`);
       }
+      const reconcile = url.pathname.match(/^\/escalations\/([^/]+)\/reconcile$/);
+      if (request.method === 'POST' && reconcile) {
+        const session = await this.application.reconcileTimedOutExecution(
+          decodeURIComponent(reconcile[1]),
+        );
+        return redirect(`/jobs/${encodeURIComponent(session.jobId)}`);
+      }
       return html(renderError('Page not found', 404), 404);
     } catch (error) {
       const status = request.method === 'POST' ? 400 : 500;

@@ -785,17 +785,67 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
       .map(copyEscalation);
   }
 
-  async resolveEscalation(id: string, resolvedAt: string): Promise<DurableEscalation> {
+  async resolveEscalation(
+    id: string,
+    resolvedAt: string,
+    resolutionSummary?: string,
+  ): Promise<DurableEscalation> {
     this.assertAvailable('write-escalation');
     const escalation = this.escalations.get(id);
     if (!escalation) throw new Error(`Escalation not found: ${id}`);
     if (!resolvedAt.trim()) throw new Error('Escalation resolution timestamp is required');
-    if (escalation.resolvedAt && escalation.resolvedAt !== resolvedAt) {
+    if (resolutionSummary !== undefined) requireNonEmpty(resolutionSummary, 'Escalation resolution summary');
+    if (escalation.resolvedAt && (escalation.resolvedAt !== resolvedAt
+      || escalation.resolutionSummary !== resolutionSummary)) {
       throw new Error(`Escalation ${id} is already resolved`);
     }
-    const resolved = { ...escalation, resolvedAt };
+    const resolved = { ...escalation, resolvedAt, ...(resolutionSummary ? { resolutionSummary } : {}) };
     this.escalations.set(id, resolved);
     return copyEscalation(resolved);
+  }
+
+  async resolveEscalationAndResumeOperatorRun(
+    id: string,
+    resolvedAt: string,
+    resolutionSummary: string,
+    run: DurableOperatorRun,
+    expectedRunRevision: number,
+  ): Promise<void> {
+    this.assertAvailable('write-operator-run');
+    const escalation = this.escalations.get(id);
+    const existingRun = this.operatorRuns.get(run.id);
+    requireNonEmpty(resolutionSummary, 'Escalation resolution summary');
+    if (!escalation || escalation.resolvedAt || escalation.jobId !== run.jobId) {
+      throw new Error(`Escalation resolution conflict: ${id}`);
+    }
+    if (!existingRun || existingRun.jobId !== run.jobId
+      || existingRun.revision !== expectedRunRevision || run.revision !== expectedRunRevision + 1
+      || !isValidOperatorRunTransition(existingRun.status, run.status)) {
+      throw new Error(`Operator Run transition conflict: ${run.id}`);
+    }
+    this.escalations.set(id, { ...escalation, resolvedAt, resolutionSummary });
+    this.operatorRuns.set(run.id, copyOperatorRun(run));
+  }
+
+  async resolveEscalationAndCreateEscalation(
+    id: string,
+    resolvedAt: string,
+    resolutionSummary: string,
+    replacement: DurableEscalation,
+  ): Promise<void> {
+    this.assertAvailable('write-escalation');
+    const escalation = this.escalations.get(id);
+    requireNonEmpty(resolutionSummary, 'Escalation resolution summary');
+    requireNonEmpty(replacement.summary, 'Replacement Escalation summary');
+    if (!escalation || escalation.resolvedAt || escalation.jobId !== replacement.jobId
+      || replacement.resolvedAt || !replacement.id.startsWith('escalation:')
+      || (replacement.attemptId
+        && this.attempts.get(replacement.attemptId)?.jobId !== replacement.jobId)
+      || this.escalations.has(replacement.id)) {
+      throw new Error(`Escalation resolution conflict: ${id}`);
+    }
+    this.escalations.set(id, { ...escalation, resolvedAt, resolutionSummary });
+    this.escalations.set(replacement.id, copyEscalation(replacement));
   }
 
   async createOperatorRun(run: DurableOperatorRun): Promise<void> {

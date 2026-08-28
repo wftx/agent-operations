@@ -94,7 +94,7 @@ export interface OperatorRuntimeStatus {
   readonly reason?: string;
 }
 
-export type OperatorEscalationAction = 'provide-guidance' | 'cancel-job';
+export type OperatorEscalationAction = 'provide-guidance' | 'reconcile-execution' | 'cancel-job';
 
 export interface OperatorAttemptStory {
   readonly attempt: DurableJobAttempt;
@@ -130,6 +130,7 @@ export interface OperatorApplication {
   runOperatorJob(input: OperatorTaskInput): Promise<OperatorRunSession>;
   waitForRun(jobId: string): Promise<OperatorRunSession>;
   provideGuidanceAndContinue(escalationId: string, instruction: string): Promise<OperatorRunSession>;
+  reconcileTimedOutExecution(escalationId: string): Promise<OperatorRunSession>;
   cancelEscalatedJob(escalationId: string): Promise<OperatorRunSession>;
   listJobs(filter?: OperatorJobList): Promise<readonly OperatorJobSummary[]>;
   getJobDetail(jobId: string): Promise<OperatorJobDetail>;

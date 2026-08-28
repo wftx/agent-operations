@@ -9,6 +9,7 @@ import {
   REPOSITORY_READ_EXECUTION_CAPABILITIES,
   RESTRICTED_TEXT_EXECUTION_POLICY,
   createHumanGuidanceId,
+  createEscalationId,
   createOperatorRunId,
   isActiveAttemptStatus,
   isExactCompletionObservation,
@@ -18,6 +19,7 @@ import {
   MVP_MAX_WORKER_ATTEMPTS,
   type OrchestrationPreview,
   type OrchestrationReadModel,
+  type TimedOutExecutionReconciliation,
 } from '../../agent-operations-core/src/index.js';
 import type { OperatorNotifier } from './notification.js';
 import { OperatorRunner } from './operator-runner.js';
@@ -40,6 +42,7 @@ import type {
 export interface OperatorOrchestrationPort {
   preview(jobId: string): Promise<OrchestrationPreview>;
   runJob(jobId: string): Promise<OrchestrationReadModel>;
+  reconcileTimedOutExecution(escalationId: string): Promise<TimedOutExecutionReconciliation>;
 }
 
 export interface OperatorApplicationServiceOptions {
@@ -48,6 +51,7 @@ export interface OperatorApplicationServiceOptions {
   readonly notifier?: OperatorNotifier;
   readonly operatorRunIdFactory?: () => string;
   readonly humanGuidanceIdFactory?: () => string;
+  readonly escalationIdFactory?: () => string;
 }
 
 export const OPERATOR_READ_ONLY_DEFAULTS: OperatorPolicyDefaults = {
@@ -70,6 +74,7 @@ export class OperatorApplicationService implements OperatorApplication {
   private readonly runtime?: AgentRuntimeAdapter;
   private readonly operatorRunIdFactory: () => string;
   private readonly humanGuidanceIdFactory: () => string;
+  private readonly escalationIdFactory: () => string;
 
   constructor(
     private readonly store: AgentOperationsStateStore,
@@ -81,6 +86,7 @@ export class OperatorApplicationService implements OperatorApplication {
     this.runtime = options.runtime;
     this.operatorRunIdFactory = options.operatorRunIdFactory ?? (() => createOperatorRunId());
     this.humanGuidanceIdFactory = options.humanGuidanceIdFactory ?? (() => createHumanGuidanceId());
+    this.escalationIdFactory = options.escalationIdFactory ?? (() => createEscalationId());
     this.runner = new OperatorRunner(store, orchestration, {
       now: this.now,
       ...(options.notifier ? { notifier: options.notifier } : {}),
@@ -208,11 +214,11 @@ export class OperatorApplicationService implements OperatorApplication {
     instruction: string,
   ): Promise<OperatorRunSession> {
     const escalation = await this.requireUnresolvedEscalation(escalationId);
-    if (!['human_judgment_required', 'reviewer_uncertain'].includes(escalation.reason)) {
+    const attempts = await this.store.listAttemptsForJob(escalation.jobId);
+    if (!await this.allowsGuidedContinuation(escalation, attempts)) {
       throw new Error(`Escalation ${escalation.id} does not permit guided continuation`);
     }
     const bounded = boundedRequired(instruction, 'Guidance', 4_096);
-    const attempts = await this.store.listAttemptsForJob(escalation.jobId);
     if (attempts.some(attempt => isActiveAttemptStatus(attempt.status))) {
       throw new Error('Guided continuation requires no active Attempt');
     }
@@ -268,6 +274,64 @@ export class OperatorApplicationService implements OperatorApplication {
     };
     await this.store.saveOperatorRunTransition(cancelled, run.revision);
     return toRunSession(cancelled);
+  }
+
+  async reconcileTimedOutExecution(escalationId: string): Promise<OperatorRunSession> {
+    const id = required(escalationId, 'Escalation ID');
+    const escalation = await this.store.getEscalation(id);
+    if (!escalation) throw new Error(`Escalation not found: ${id}`);
+    const existingRun = await this.requireOperatorRun(escalation.jobId);
+    if (escalation.resolvedAt) return toRunSession(existingRun);
+    if (escalation.reason !== 'observation_timeout') {
+      throw new Error(`Escalation ${id} is not an execution observation timeout`);
+    }
+    if (existingRun.status !== 'needs_human') {
+      throw new Error(`Operator Run ${existingRun.id} is ${existingRun.status}`);
+    }
+    const result = await this.orchestration.reconcileTimedOutExecution(escalation.id);
+    if (result.status === 'still-running' || result.status === 'unresolved') {
+      return {
+        ...toRunSession(existingRun),
+        message: result.message,
+      };
+    }
+    const timestamp = this.now().toISOString();
+    if (result.status === 'completed') {
+      const pending: DurableOperatorRun = {
+        ...existingRun,
+        status: 'pending',
+        failureMessage: undefined,
+        revision: existingRun.revision + 1,
+        updatedAt: timestamp,
+        startedAt: undefined,
+        finishedAt: undefined,
+      };
+      await this.store.resolveEscalationAndResumeOperatorRun(
+        escalation.id,
+        timestamp,
+        `Resolved by late exact completion of existing Dispatch ${result.dispatchId}; no task was resent.`,
+        pending,
+        existingRun.revision,
+      );
+      void this.runner.wake();
+      return toRunSession(pending);
+    }
+    if (result.status !== 'failed') throw new Error(`Unsupported reconciliation status: ${result.status}`);
+    await this.store.resolveEscalationAndCreateEscalation(
+      escalation.id,
+      timestamp,
+      `Resolved by exact late failure evidence for existing Dispatch ${result.dispatchId}; no task was resent.`,
+      {
+        id: this.escalationIdFactory(),
+        jobId: escalation.jobId,
+        attemptId: result.attemptId,
+        reason: 'runtime_failure',
+        summary: `The timed-out accepted execution later reported failure: ${result.reason}`,
+        createdAt: timestamp,
+      },
+    );
+    void this.runner.wake();
+    return toRunSession(existingRun);
   }
 
   async listJobs(filter: OperatorJobList = 'all'): Promise<readonly OperatorJobSummary[]> {
@@ -417,17 +481,42 @@ export class OperatorApplicationService implements OperatorApplication {
     escalation: Awaited<ReturnType<AgentOperationsStateStore['getEscalation']>> & {},
     attempts: readonly DurableJobAttempt[],
   ): Promise<readonly OperatorEscalationAction[]> {
-    if (escalation.resolvedAt || attempts.some(attempt => isActiveAttemptStatus(attempt.status))
+    if (escalation.resolvedAt) return [];
+    if (escalation.reason === 'observation_timeout' && escalation.attemptId) {
+      const attempt = attempts.find(candidate => candidate.id === escalation.attemptId);
+      const plan = attempt ? await this.store.getExecutionPlanForAttempt(attempt.id) : null;
+      const dispatch = plan ? await this.store.getExecutionDispatchForPlan(plan.id) : null;
+      const outcome = attempt ? await this.store.getAttemptOutcomeDecision(attempt.id) : null;
+      if (attempt?.executionRole === 'worker'
+        && (attempt.status === 'running' || outcome !== null)
+        && dispatch?.status === 'accepted'
+        && Boolean(dispatch.externalReference)) return ['reconcile-execution'];
+      return [];
+    }
+    if (attempts.some(attempt => isActiveAttemptStatus(attempt.status))
       || await this.hasUncertainDispatch(attempts)) return [];
     const actions: OperatorEscalationAction[] = [];
     const workerCount = attempts.filter(attempt => attempt.executionRole === 'worker').length;
-    if (['human_judgment_required', 'reviewer_uncertain'].includes(escalation.reason)
+    if (await this.allowsGuidedContinuation(escalation, attempts)
       && workerCount < MVP_MAX_WORKER_ATTEMPTS) {
       actions.push('provide-guidance');
     }
     const job = await this.store.getJob(escalation.jobId);
     if (job?.status === 'ready') actions.push('cancel-job');
     return actions;
+  }
+
+  private async allowsGuidedContinuation(
+    escalation: Awaited<ReturnType<AgentOperationsStateStore['getEscalation']>> & {},
+    attempts: readonly DurableJobAttempt[],
+  ): Promise<boolean> {
+    if (['human_judgment_required', 'reviewer_uncertain'].includes(escalation.reason)) return true;
+    if (escalation.reason !== 'policy_blocked' || !escalation.attemptId) return false;
+    const attempt = attempts.find(candidate => candidate.id === escalation.attemptId);
+    if (!attempt || attempt.executionRole !== 'worker' || attempt.status !== 'cancelled') return false;
+    const plan = await this.store.getExecutionPlanForAttempt(attempt.id);
+    if (!plan) return false;
+    return await this.store.getExecutionDispatchForPlan(plan.id) === null;
   }
 
   private async hasUncertainDispatch(attempts: readonly DurableJobAttempt[]): Promise<boolean> {

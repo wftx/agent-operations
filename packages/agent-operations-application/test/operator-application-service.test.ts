@@ -1,12 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import {
+  REPOSITORY_READ_EXECUTION_CAPABILITIES,
+  RESTRICTED_TEXT_EXECUTION_POLICY,
+  createExecutionDispatchIdempotencyKey,
   createRepositoryCheckoutBindingId,
   InMemoryAgentOperationsStateStore,
 } from '../../agent-operations-contracts/src/index.js';
 import {
+  ExecutionPlanningService,
   JobLifecycleService,
   type OrchestrationPreview,
   type OrchestrationReadModel,
+  type TimedOutExecutionReconciliation,
 } from '../../agent-operations-core/src/index.js';
 import {
   OPERATOR_READ_ONLY_DEFAULTS,
@@ -56,6 +61,10 @@ class FakeOrchestration implements OperatorOrchestrationPort {
       eligible: true,
       findings: [],
     };
+  }
+
+  async reconcileTimedOutExecution(): Promise<TimedOutExecutionReconciliation> {
+    throw new Error('No timed-out execution is configured for this test');
   }
 
   async runJob(jobId: string): Promise<OrchestrationReadModel> {
@@ -116,6 +125,48 @@ class RecordingNotifier implements OperatorNotifier {
     this.events.push(event);
     if (this.failure) throw new Error(this.failure);
     return { status: 'sent' as const };
+  }
+}
+
+class LateCompletionOrchestration implements OperatorOrchestrationPort {
+  reconcileCalls = 0;
+  runCalls = 0;
+
+  constructor(private readonly store: InMemoryAgentOperationsStateStore) {}
+
+  async preview(): Promise<OrchestrationPreview> {
+    throw new Error('Preview is not used by the late reconciliation fixture');
+  }
+
+  async reconcileTimedOutExecution(escalationId: string): Promise<TimedOutExecutionReconciliation> {
+    this.reconcileCalls += 1;
+    const escalation = (await this.store.getEscalation(escalationId))!;
+    const attempt = (await this.store.getAttempt(escalation.attemptId!))!;
+    const plan = (await this.store.getExecutionPlanForAttempt(attempt.id))!;
+    const dispatch = (await this.store.getExecutionDispatchForPlan(plan.id))!;
+    await new JobLifecycleService(this.store, { now: () => new Date(TIME) })
+      .completeAttempt(attempt.id, 'Late exact Worker completion was imported.');
+    return {
+      status: 'completed', jobId: attempt.jobId, attemptId: attempt.id,
+      dispatchId: dispatch.id, resultText: 'Bounded late Worker result.',
+      inserted: 1, duplicates: 0, ignoredUnrelated: 0, alreadyReconciled: false,
+    };
+  }
+
+  async runJob(jobId: string): Promise<OrchestrationReadModel> {
+    this.runCalls += 1;
+    const lifecycle = new JobLifecycleService(this.store, { now: () => new Date(TIME) });
+    const job = await lifecycle.completeJob(jobId);
+    return {
+      job,
+      workerAttempts: (await this.store.listAttemptsForJob(jobId))
+        .filter(attempt => attempt.executionRole === 'worker'),
+      reviewerAttempts: [],
+      reviews: [],
+      escalations: await this.store.listEscalations(jobId),
+      needsHuman: false,
+      finalDecision: 'PASS',
+    };
   }
 }
 
@@ -284,6 +335,79 @@ describe('OperatorApplicationService', () => {
     expect(notifier.events.map(event => event.kind)).toEqual(['needs_human', 'job_completed']);
   });
 
+  it('resumes a preflight-only policy block through a fresh Worker Attempt', async () => {
+    const store = await configuredStore();
+    const lifecycle = new JobLifecycleService(store, {
+      now: () => new Date(TIME),
+      jobIdFactory: () => 'job:policy-blocked',
+    });
+    const draft = await lifecycle.createJob({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      preferredRuntimeAgentId: RUNTIME_ID,
+      title: 'Resume after runtime recovery',
+      description: INPUT.task,
+      acceptanceCriteria: INPUT.acceptanceCriteria,
+      automaticReadOnlyCompletion: true,
+    });
+    const job = await lifecycle.markJobReady(draft.id);
+    const blockedAttempt = await lifecycle.createAttempt(job.id, {
+      runtimeAgentId: RUNTIME_ID,
+      executionRole: 'worker',
+    });
+    const plan = await new ExecutionPlanningService(store, {
+      now: () => new Date(TIME),
+      planIdFactory: () => 'plan:policy-blocked',
+    }).prepareExecutionPlan({
+      projectId: PROJECT_ID,
+      attemptId: blockedAttempt.id,
+      instruction: 'Read the repository without mutation.',
+      requestedPolicy: RESTRICTED_TEXT_EXECUTION_POLICY,
+      requestedCapabilities: REPOSITORY_READ_EXECUTION_CAPABILITIES,
+    });
+    await lifecycle.cancelAttempt(blockedAttempt.id);
+    await store.createEscalation({
+      id: 'escalation:policy-blocked',
+      jobId: job.id,
+      attemptId: blockedAttempt.id,
+      reason: 'policy_blocked',
+      summary: 'Runtime was unavailable before Dispatch.',
+      createdAt: TIME,
+    });
+    const pending = {
+      id: 'operator-run:policy-blocked', jobId: job.id, status: 'pending' as const, revision: 0,
+      createdAt: TIME, updatedAt: TIME,
+    };
+    await store.createOperatorRun(pending);
+    await store.saveOperatorRunTransition({
+      ...pending, status: 'running', revision: 1, startedAt: TIME,
+    }, 0);
+    await store.saveOperatorRunTransition({
+      ...pending, status: 'needs_human', revision: 2, startedAt: TIME, finishedAt: TIME,
+    }, 1);
+    const application = new OperatorApplicationService(
+      store,
+      new FakeOrchestration(store),
+      { now: () => new Date(TIME) },
+    );
+
+    expect((await application.getJobDetail(job.id)).escalationActions['escalation:policy-blocked'])
+      .toEqual(['provide-guidance', 'cancel-job']);
+    const continued = await application.provideGuidanceAndContinue(
+      'escalation:policy-blocked',
+      'The runtime is now available. Continue under the original read-only policy.',
+    );
+    expect(continued.status).toBe('pending');
+    expect((await application.waitForRun(job.id)).status).toBe('done');
+
+    const attempts = await store.listAttemptsForJob(job.id);
+    expect(attempts.filter(attempt => attempt.executionRole === 'worker')).toHaveLength(2);
+    expect(attempts[0]).toMatchObject({ id: blockedAttempt.id, status: 'cancelled' });
+    expect(await store.getExecutionPlan(plan.id)).toMatchObject({ id: plan.id, attemptId: blockedAttempt.id });
+    expect(await store.getExecutionDispatchForPlan(plan.id)).toBeNull();
+    expect(await store.getEscalation('escalation:policy-blocked')).toMatchObject({ resolvedAt: TIME });
+  });
+
   it('cancels an eligible Needs Me Job while preserving resolved escalation history', async () => {
     const store = await configuredStore();
     const application = new OperatorApplicationService(
@@ -304,6 +428,87 @@ describe('OperatorApplicationService', () => {
     expect((await application.getJobDetail(started.jobId)).escalationActions[escalation.id]).toEqual([]);
     await expect(application.provideGuidanceAndContinue(escalation.id, 'Too late.'))
       .rejects.toThrow('already resolved');
+  });
+
+  it('atomically resolves a late exact timeout, resumes the same run, and is idempotent', async () => {
+    const store = await configuredStore();
+    const lifecycle = new JobLifecycleService(store, {
+      now: () => new Date(TIME), jobIdFactory: () => 'job:late',
+    });
+    const job = await lifecycle.markJobReady((await lifecycle.createJob({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      preferredRuntimeAgentId: RUNTIME_ID,
+      title: 'Late execution reconciliation',
+      description: INPUT.task,
+      acceptanceCriteria: INPUT.acceptanceCriteria,
+      automaticReadOnlyCompletion: true,
+    })).id);
+    const attempt = await lifecycle.createAttempt(job.id, {
+      runtimeAgentId: RUNTIME_ID, executionRole: 'worker',
+    });
+    const plan = await new ExecutionPlanningService(store, {
+      now: () => new Date(TIME), planIdFactory: () => 'plan:late',
+    }).prepareExecutionPlan({
+      projectId: PROJECT_ID,
+      attemptId: attempt.id,
+      instruction: 'Read the repository.',
+      requestedPolicy: RESTRICTED_TEXT_EXECUTION_POLICY,
+      requestedCapabilities: REPOSITORY_READ_EXECUTION_CAPABILITIES,
+    });
+    await lifecycle.startAttempt(attempt.id);
+    const prepared = {
+      id: 'dispatch:late', executionPlanId: plan.id, attemptId: attempt.id, jobId: job.id,
+      runtimeAgentId: RUNTIME_ID, idempotencyKey: createExecutionDispatchIdempotencyKey(plan.id),
+      status: 'prepared' as const, revision: 0, createdAt: TIME, updatedAt: TIME,
+    };
+    await store.createExecutionDispatch(prepared);
+    const submitting = {
+      ...prepared, status: 'submitting' as const, revision: 1, submittedAt: TIME,
+    };
+    await store.saveExecutionDispatchTransition(submitting, 0);
+    await store.saveExecutionDispatchTransition({
+      ...submitting,
+      status: 'accepted',
+      revision: 2,
+      effectivePolicy: RESTRICTED_TEXT_EXECUTION_POLICY,
+      effectiveCapabilities: REPOSITORY_READ_EXECUTION_CAPABILITIES,
+      externalReference: 'cortextos:codex-turn:v1:thread:turn',
+      acceptedAt: TIME,
+      resolvedAt: TIME,
+    }, 1);
+    await store.createEscalation({
+      id: 'escalation:late', jobId: job.id, attemptId: attempt.id,
+      reason: 'observation_timeout', summary: 'Observation timed out.', createdAt: TIME,
+    });
+    const run = {
+      id: 'operator-run:late', jobId: job.id, status: 'pending' as const, revision: 0,
+      createdAt: TIME, updatedAt: TIME,
+    };
+    await store.createOperatorRun(run);
+    await store.saveOperatorRunTransition({ ...run, status: 'running', revision: 1, startedAt: TIME }, 0);
+    await store.saveOperatorRunTransition({
+      ...run, status: 'needs_human', revision: 2, startedAt: TIME, finishedAt: TIME,
+    }, 1);
+    const orchestration = new LateCompletionOrchestration(store);
+    const application = new OperatorApplicationService(store, orchestration, { now: () => new Date(TIME) });
+
+    expect((await application.getJobDetail(job.id)).escalationActions['escalation:late'])
+      .toEqual(['reconcile-execution']);
+    await application.reconcileTimedOutExecution('escalation:late');
+    expect((await application.waitForRun(job.id)).status).toBe('done');
+    expect(await store.getEscalation('escalation:late')).toMatchObject({
+      resolvedAt: TIME,
+      resolutionSummary: expect.stringContaining('no task was resent'),
+    });
+    expect((await store.listAttemptsForJob(job.id)).filter(value => value.executionRole === 'worker'))
+      .toHaveLength(1);
+    expect(orchestration.reconcileCalls).toBe(1);
+    expect(orchestration.runCalls).toBe(1);
+
+    expect((await application.reconcileTimedOutExecution('escalation:late')).status).toBe('done');
+    expect(orchestration.reconcileCalls).toBe(1);
+    expect(orchestration.runCalls).toBe(1);
   });
 
   it('records notification failure without changing successful Job truth', async () => {

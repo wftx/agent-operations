@@ -16,7 +16,8 @@ export const EXECUTION_CONTEXT_EVIDENCE_SCHEMA_VERSION = 7;
 export const EXECUTION_CAPABILITY_SCHEMA_VERSION = 8;
 export const ORCHESTRATION_SCHEMA_VERSION = 9;
 export const DAILY_OPERATOR_SCHEMA_VERSION = 10;
-export const CURRENT_SCHEMA_VERSION = DAILY_OPERATOR_SCHEMA_VERSION;
+export const LATE_EXECUTION_RECONCILIATION_SCHEMA_VERSION = 11;
+export const CURRENT_SCHEMA_VERSION = LATE_EXECUTION_RECONCILIATION_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -535,6 +536,11 @@ const DAILY_OPERATOR_SCHEMA_SQL = `
     ON operator_notification_deliveries(job_id, created_at, id);
 `;
 
+const LATE_EXECUTION_RECONCILIATION_SCHEMA_SQL = `
+  ALTER TABLE escalations ADD COLUMN resolution_summary TEXT
+    CHECK (resolution_summary IS NULL OR length(trim(resolution_summary)) > 0);
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -585,6 +591,11 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: DAILY_OPERATOR_SCHEMA_VERSION,
     name: 'daily-operator-runs-guidance-and-notifications',
     up: database => database.exec(DAILY_OPERATOR_SCHEMA_SQL),
+  },
+  {
+    version: LATE_EXECUTION_RECONCILIATION_SCHEMA_VERSION,
+    name: 'late-execution-reconciliation',
+    up: database => database.exec(LATE_EXECUTION_RECONCILIATION_SCHEMA_SQL),
   },
 ];
 

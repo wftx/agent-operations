@@ -71,6 +71,41 @@ async function seed(store: SqliteAgentOperationsStateStore) {
 }
 
 describe('daily Operator persistence', () => {
+  it('atomically records a late-completion resolution and resumes the same Operator Run', async () => {
+    const store = open(path());
+    const job = await seed(store);
+    const run = {
+      id: 'operator-run:late', jobId: job.id, status: 'pending' as const, revision: 0,
+      createdAt: TIME, updatedAt: TIME,
+    };
+    await store.createOperatorRun(run);
+    await store.saveOperatorRunTransition({
+      ...run, status: 'running', revision: 1, startedAt: TIME,
+    }, 0);
+    await store.saveOperatorRunTransition({
+      ...run, status: 'needs_human', revision: 2, startedAt: TIME, finishedAt: TIME,
+    }, 1);
+    await store.createEscalation({
+      id: 'escalation:late', jobId: job.id, reason: 'observation_timeout',
+      summary: 'Observation timed out; provider outcome remained unknown.', createdAt: TIME,
+    });
+
+    await store.resolveEscalationAndResumeOperatorRun(
+      'escalation:late',
+      TIME,
+      'Resolved by late exact completion; no task was resent.',
+      { ...run, status: 'pending', revision: 3 },
+      2,
+    );
+
+    expect(await store.getEscalation('escalation:late')).toMatchObject({
+      resolvedAt: TIME,
+      resolutionSummary: 'Resolved by late exact completion; no task was resent.',
+    });
+    expect(await store.getOperatorRun(run.id)).toMatchObject({ status: 'pending', revision: 3 });
+    await store.close();
+  });
+
   it('persists runs, resolved guidance history, and at-most-once notification claims', async () => {
     const databasePath = path();
     const store = open(databasePath);

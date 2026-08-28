@@ -16,7 +16,12 @@ import {
   InMemoryAgentOperationsStateStore,
   createRepositoryCheckoutBindingId,
 } from '../../agent-operations-contracts/src/index.js';
-import { JobLifecycleService, OrchestrationService, parseReviewerResult } from '../src/index.js';
+import {
+  JobLifecycleService,
+  MVP_OBSERVATION_TIMEOUT_MS,
+  OrchestrationService,
+  parseReviewerResult,
+} from '../src/index.js';
 
 const TIME = '2026-08-27T03:00:00.000Z';
 const PROJECT_ID = 'orchestration-fixture';
@@ -40,7 +45,19 @@ const PASS = JSON.stringify({
 });
 
 type ObservationFixture =
-  | { readonly kind: 'completed'; readonly resultText: string }
+  | {
+      readonly kind: 'completed';
+      readonly resultText?: string;
+      readonly correlatedDispatchId?: string;
+      readonly externalReference?: string;
+      readonly workingDirectory?: string;
+      readonly policy?: typeof POLICY | {
+        readonly version: 1;
+        readonly filesystem: 'workspace-write';
+        readonly network: 'deny';
+        readonly environment: 'empty';
+      };
+    }
   | { readonly kind: 'runtime-failure' }
   | { readonly kind: 'missing-correlation' };
 
@@ -86,6 +103,9 @@ class ScriptedObservationAdapter implements RuntimeExecutionObservationAdapter {
         externalReference: request.externalReference,
         observedAt: TIME,
         message: 'Fixture runtime failed.',
+        executionContext: { workingDirectory: CHECKOUT, repositoryReadRoot: CHECKOUT },
+        effectivePolicy: POLICY,
+        effectiveCapabilities: CAPABILITIES,
       }];
     }
     if (fixture.kind === 'missing-correlation') {
@@ -103,14 +123,17 @@ class ScriptedObservationAdapter implements RuntimeExecutionObservationAdapter {
       sourceEventId: `completed:${request.dispatchId}`,
       kind: 'turn-completed',
       correlation: 'exact',
-      correlatedDispatchId: request.dispatchId,
-      externalReference: request.externalReference,
+      correlatedDispatchId: fixture.correlatedDispatchId ?? request.dispatchId,
+      externalReference: fixture.externalReference ?? request.externalReference,
       runtimeSessionId: `session:${request.dispatchId}`,
       observedAt: TIME,
-      executionContext: { workingDirectory: CHECKOUT, repositoryReadRoot: CHECKOUT },
-      effectivePolicy: POLICY,
+      executionContext: {
+        workingDirectory: fixture.workingDirectory ?? CHECKOUT,
+        repositoryReadRoot: fixture.workingDirectory ?? CHECKOUT,
+      },
+      effectivePolicy: fixture.policy ?? POLICY,
       effectiveCapabilities: CAPABILITIES,
-      resultText: fixture.resultText,
+      ...(fixture.resultText ? { resultText: fixture.resultText } : {}),
     }];
   }
 }
@@ -265,6 +288,10 @@ function resumedService(setup: Awaited<ReturnType<typeof harness>>): Orchestrati
 }
 
 describe('OrchestrationService', () => {
+  it('allows a bounded repository-read turn up to five minutes by default', () => {
+    expect(MVP_OBSERVATION_TIMEOUT_MS).toBe(300_000);
+  });
+
   it('completes a correct Worker result only after a distinct exact Reviewer PASS', async () => {
     const setup = await harness([
       { kind: 'completed', resultText: CORRECT_RESULT },
@@ -508,6 +535,145 @@ describe('OrchestrationService', () => {
     expect(setup.observer.requests).toHaveLength(1);
   });
 
+  it('imports late exact completion into the same timed-out Worker without redispatch', async () => {
+    const setup = await harness([]);
+    const timedOut = await setup.service.runJob(JOB_ID);
+    const escalation = timedOut.escalations[0];
+    const worker = timedOut.workerAttempts[0];
+    const dispatch = await setup.store.getExecutionDispatchForPlan(
+      (await setup.store.getExecutionPlanForAttempt(worker.id))!.id,
+    );
+    const lateObserver = new ScriptedObservationAdapter([{ kind: 'completed', resultText: CORRECT_RESULT }]);
+    const reconciler = new OrchestrationService(
+      setup.store, setup.runtimes, setup.repositories, setup.execution, lateObserver,
+      { now: () => new Date(TIME), outcomeDecisionIdFactory: () => 'outcome:late-completion' },
+    );
+
+    const first = await reconciler.reconcileTimedOutExecution(escalation.id);
+    const second = await reconciler.reconcileTimedOutExecution(escalation.id);
+
+    expect(first).toMatchObject({
+      status: 'completed', attemptId: worker.id, dispatchId: dispatch!.id,
+      resultText: CORRECT_RESULT, alreadyReconciled: false,
+    });
+    expect(second).toMatchObject({ status: 'completed', alreadyReconciled: true });
+    expect(await setup.store.getAttempt(worker.id)).toMatchObject({ status: 'completed' });
+    expect(await setup.store.getAttemptOutcomeDecision(worker.id)).toMatchObject({
+      outcome: 'completed', source: 'runtime-evidence', dispatchId: dispatch!.id,
+    });
+    expect(setup.execution.requests).toHaveLength(1);
+    expect(lateObserver.requests).toHaveLength(1);
+    expect(lateObserver.requests[0].externalReference).toBe(dispatch!.externalReference);
+  });
+
+  it('continues a reconciled Worker through exactly one fresh Reviewer submission', async () => {
+    const setup = await harness([]);
+    const timedOut = await setup.service.runJob(JOB_ID);
+    const escalation = timedOut.escalations[0];
+    const worker = timedOut.workerAttempts[0];
+    const lateObserver = new ScriptedObservationAdapter([
+      { kind: 'completed', resultText: CORRECT_RESULT },
+      { kind: 'completed', resultText: PASS },
+    ]);
+    const reconciler = new OrchestrationService(
+      setup.store, setup.runtimes, setup.repositories, setup.execution, lateObserver,
+      {
+        now: () => new Date(TIME),
+        outcomeDecisionIdFactory: (() => { let value = 0; return () => `outcome:late-${++value}`; })(),
+        attemptReviewIdFactory: () => 'review:late',
+      },
+    );
+
+    await reconciler.reconcileTimedOutExecution(escalation.id);
+    await setup.store.resolveEscalation(
+      escalation.id,
+      TIME,
+      'Resolved by late exact completion; no task was resent.',
+    );
+    const result = await reconciler.runJob(JOB_ID);
+
+    expect(result.finalDecision).toBe('PASS');
+    expect(result.workerAttempts).toEqual([expect.objectContaining({ id: worker.id, status: 'completed' })]);
+    expect(result.reviewerAttempts).toHaveLength(1);
+    expect(result.reviews).toEqual([expect.objectContaining({ decision: 'PASS' })]);
+    expect(setup.execution.requests).toHaveLength(2);
+    expect(setup.execution.requests[0].executionPlanId).toBe(timedOut.workerAttempts.length
+      ? (await setup.store.getExecutionPlanForAttempt(worker.id))!.id
+      : 'unreachable');
+    expect(setup.execution.requests[1].input.instruction).toContain(CORRECT_RESULT);
+    expect(lateObserver.requests).toHaveLength(2);
+  });
+
+  it('imports exact late runtime failure into the same Attempt and never redispatches', async () => {
+    const setup = await harness([]);
+    const timedOut = await setup.service.runJob(JOB_ID);
+    const escalation = timedOut.escalations[0];
+    const worker = timedOut.workerAttempts[0];
+    const lateObserver = new ScriptedObservationAdapter([{ kind: 'runtime-failure' }]);
+    const reconciler = new OrchestrationService(
+      setup.store, setup.runtimes, setup.repositories, setup.execution, lateObserver,
+      { now: () => new Date(TIME), outcomeDecisionIdFactory: () => 'outcome:late-failure' },
+    );
+
+    const result = await reconciler.reconcileTimedOutExecution(escalation.id);
+
+    expect(result).toMatchObject({ status: 'failed', attemptId: worker.id, reason: 'Fixture runtime failed.' });
+    expect(await setup.store.getAttempt(worker.id)).toMatchObject({ status: 'failed' });
+    expect(await setup.store.getAttemptOutcomeDecision(worker.id)).toMatchObject({ outcome: 'failed' });
+    expect(setup.execution.requests).toHaveLength(1);
+    expect(lateObserver.requests).toHaveLength(1);
+  });
+
+  it('retains the timeout when late observation has no trustworthy terminal evidence', async () => {
+    const setup = await harness([]);
+    const timedOut = await setup.service.runJob(JOB_ID);
+    const escalation = timedOut.escalations[0];
+    const worker = timedOut.workerAttempts[0];
+    const lateObserver = new ScriptedObservationAdapter([{ kind: 'missing-correlation' }]);
+    const reconciler = new OrchestrationService(
+      setup.store, setup.runtimes, setup.repositories, setup.execution, lateObserver,
+      { now: () => new Date(TIME) },
+    );
+
+    const result = await reconciler.reconcileTimedOutExecution(escalation.id);
+
+    expect(result).toMatchObject({ status: 'unresolved', attemptId: worker.id });
+    expect(await setup.store.getAttempt(worker.id)).toMatchObject({ status: 'running' });
+    expect(await setup.store.getAttemptOutcomeDecision(worker.id)).toBeNull();
+    expect((await setup.store.getEscalation(escalation.id))?.resolvedAt).toBeUndefined();
+    expect(setup.execution.requests).toHaveLength(1);
+  });
+
+  it.each([
+    ['wrong Dispatch correlation', { kind: 'completed' as const, resultText: CORRECT_RESULT, correlatedDispatchId: 'dispatch:other' }],
+    ['wrong external turn', { kind: 'completed' as const, resultText: CORRECT_RESULT, externalReference: 'cortextos:codex-turn:v1:other:turn' }],
+    ['repository root escape', { kind: 'completed' as const, resultText: CORRECT_RESULT, workingDirectory: '/fixtures/outside' }],
+    ['broader filesystem policy', {
+      kind: 'completed' as const,
+      resultText: CORRECT_RESULT,
+      policy: { version: 1 as const, filesystem: 'workspace-write' as const, network: 'deny' as const, environment: 'empty' as const },
+    }],
+    ['missing bounded result', { kind: 'completed' as const }],
+  ])('fails closed for late %s evidence', async (_label, fixture) => {
+    const setup = await harness([]);
+    const timedOut = await setup.service.runJob(JOB_ID);
+    const escalation = timedOut.escalations[0];
+    const worker = timedOut.workerAttempts[0];
+    const lateObserver = new ScriptedObservationAdapter([fixture]);
+    const reconciler = new OrchestrationService(
+      setup.store, setup.runtimes, setup.repositories, setup.execution, lateObserver,
+      { now: () => new Date(TIME) },
+    );
+
+    const result = await reconciler.reconcileTimedOutExecution(escalation.id);
+
+    expect(result.status).toBe('unresolved');
+    expect(await setup.store.getAttempt(worker.id)).toMatchObject({ status: 'running' });
+    expect(await setup.store.getAttemptOutcomeDecision(worker.id)).toBeNull();
+    expect((await setup.store.getEscalation(escalation.id))?.resolvedAt).toBeUndefined();
+    expect(setup.execution.requests).toHaveLength(1);
+  });
+
   it('escalates non-exact completion evidence', async () => {
     const setup = await harness([{ kind: 'missing-correlation' }]);
     const result = await setup.service.runJob(JOB_ID);
@@ -521,6 +687,76 @@ describe('OrchestrationService', () => {
     expect(result.escalations).toEqual([expect.objectContaining({ reason: 'policy_blocked' })]);
     expect(result.workerAttempts[0].status).toBe('cancelled');
     expect(setup.execution.requests).toHaveLength(0);
+  });
+
+  it('uses policy-blocked guidance to create a fresh Worker after runtime recovery', async () => {
+    const setup = await harness([
+      { kind: 'completed', resultText: CORRECT_RESULT },
+      { kind: 'completed', resultText: PASS },
+    ], [], false);
+    const blocked = await setup.service.runJob(JOB_ID);
+    const blockedAttempt = blocked.workerAttempts[0];
+    const blockedPlan = await setup.store.getExecutionPlanForAttempt(blockedAttempt.id);
+    const escalation = blocked.escalations[0];
+    expect(blockedAttempt.status).toBe('cancelled');
+    expect(blockedPlan).not.toBeNull();
+    expect(await setup.store.getExecutionDispatchForPlan(blockedPlan!.id)).toBeNull();
+    expect(setup.execution.requests).toHaveLength(0);
+
+    await setup.store.createHumanGuidanceAndResolveEscalation({
+      id: 'guidance:runtime-recovered',
+      jobId: JOB_ID,
+      escalationId: escalation.id,
+      instruction: 'The runtime is now available. Continue under the original read-only policy.',
+      createdAt: TIME,
+    }, TIME);
+    const healthyRuntime = new FakeAgentRuntimeAdapter([{
+      id: RUNTIME_ID,
+      name: 'rehearsal',
+      organization: 'agent-operations',
+      provider: 'codex',
+      enabled: true,
+      configured: true,
+      capabilities: [
+        'session-resume',
+        'exact-turn-correlation',
+        'execution-working-directory',
+        'repository-read-tools',
+        'filesystem-read-only',
+        'network-denial',
+        'environment-empty',
+      ],
+      health: { state: 'running' },
+      observedAt: TIME,
+    }]);
+    const resumed = new OrchestrationService(
+      setup.store,
+      healthyRuntime,
+      setup.repositories,
+      setup.execution,
+      setup.observer,
+      {
+        now: () => new Date(TIME),
+        observationIntervalMs: 0,
+        observationTimeoutMs: 0,
+        sleep: async () => undefined,
+      },
+    );
+
+    const result = await resumed.runJob(JOB_ID);
+    expect(result.finalDecision).toBe('PASS');
+    expect(result.job.status).toBe('completed');
+    expect(result.workerAttempts).toHaveLength(2);
+    expect(result.workerAttempts.map(attempt => attempt.status)).toEqual(['cancelled', 'completed']);
+    expect(result.workerAttempts[1].id).not.toBe(blockedAttempt.id);
+    expect(result.reviewerAttempts).toHaveLength(1);
+    expect(setup.execution.requests).toHaveLength(2);
+    expect(setup.execution.requests[0].input.instruction).toContain(
+      '<human_guidance>\nThe runtime is now available. Continue under the original read-only policy.\n</human_guidance>',
+    );
+    expect(new Set(setup.execution.requests.map(request => request.executionPlanId)).size).toBe(2);
+    expect(await setup.store.getExecutionPlan(blockedPlan!.id)).toMatchObject({ attemptId: blockedAttempt.id });
+    expect(await setup.store.getExecutionDispatchForPlan(blockedPlan!.id)).toBeNull();
   });
 
   it('previews without creating Attempts, Plans, Dispatches, Reviews, or Escalations', async () => {

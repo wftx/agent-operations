@@ -42,6 +42,8 @@ export interface DurableEscalation {
   readonly summary: string;
   readonly createdAt: string;
   readonly resolvedAt?: string;
+  /** Durable operator-facing explanation of how an ambiguity was resolved. */
+  readonly resolutionSummary?: string;
 }
 
 export interface NeedsHumanItem {

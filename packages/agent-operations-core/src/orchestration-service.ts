@@ -6,6 +6,7 @@ import type {
   DurableEscalation,
   DurableExecutionDispatch,
   DurableExecutionObservation,
+  DurableExecutionPlan,
   DurableJob,
   DurableJobAttempt,
   EscalationReason,
@@ -21,6 +22,7 @@ import {
   createAttemptOutcomeDecisionId,
   createAttemptReviewId,
   createEscalationId,
+  isBoundedExecutionResult,
   isExactCompletionObservation,
 } from '../../agent-operations-contracts/src/index.js';
 import { ExecutionObservationService, type AttemptExecutionDetail } from './execution-observation-service.js';
@@ -31,6 +33,7 @@ import { ManualDispatchService, type ManualDispatchOutcome } from './manual-disp
 
 export const MVP_MAX_WORKER_ATTEMPTS = 2;
 export const MVP_MAX_REVIEWER_PASSES_PER_ATTEMPT = 1;
+export const MVP_OBSERVATION_TIMEOUT_MS = 5 * 60_000;
 
 export interface OrchestrationServiceOptions {
   readonly now?: () => Date;
@@ -69,6 +72,40 @@ export interface OrchestrationReadModel {
   readonly needsHuman: boolean;
   readonly finalDecision: 'PASS' | 'ESCALATED';
 }
+
+export type TimedOutExecutionReconciliation =
+  | {
+      readonly status: 'completed';
+      readonly jobId: string;
+      readonly attemptId: string;
+      readonly dispatchId: string;
+      readonly resultText: string;
+      readonly inserted: number;
+      readonly duplicates: number;
+      readonly ignoredUnrelated: number;
+      readonly alreadyReconciled: boolean;
+    }
+  | {
+      readonly status: 'failed';
+      readonly jobId: string;
+      readonly attemptId: string;
+      readonly dispatchId: string;
+      readonly reason: string;
+      readonly inserted: number;
+      readonly duplicates: number;
+      readonly ignoredUnrelated: number;
+      readonly alreadyReconciled: boolean;
+    }
+  | {
+      readonly status: 'still-running' | 'unresolved';
+      readonly jobId: string;
+      readonly attemptId: string;
+      readonly dispatchId: string;
+      readonly message: string;
+      readonly inserted: number;
+      readonly duplicates: number;
+      readonly ignoredUnrelated: number;
+    };
 
 interface ExactExecutionResult {
   readonly detail: AttemptExecutionDetail;
@@ -124,7 +161,10 @@ export class OrchestrationService {
     this.workerRuntimeAgentId = cleanOptional(options.workerRuntimeAgentId);
     this.reviewerRuntimeAgentId = cleanOptional(options.reviewerRuntimeAgentId);
     this.observationIntervalMs = boundedDuration(options.observationIntervalMs ?? 1_000, 'Observation interval');
-    this.observationTimeoutMs = boundedDuration(options.observationTimeoutMs ?? 60_000, 'Observation timeout');
+    this.observationTimeoutMs = boundedDuration(
+      options.observationTimeoutMs ?? MVP_OBSERVATION_TIMEOUT_MS,
+      'Observation timeout',
+    );
     this.sleep = options.sleep ?? (milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)));
     this.attemptReviewIdFactory = options.attemptReviewIdFactory ?? (() => createAttemptReviewId());
     this.escalationIdFactory = options.escalationIdFactory ?? (() => createEscalationId());
@@ -208,6 +248,15 @@ export class OrchestrationService {
         continue;
       }
       if (latestWorker.status !== 'completed') {
+        const guidance = await this.policyBlockedGuidanceFor(job.id, latestWorker.id);
+        if (latestWorker.status === 'cancelled' && guidance
+          && workers.length < MVP_MAX_WORKER_ATTEMPTS) {
+          await this.lifecycle.createAttempt(job.id, {
+            runtimeAgentId: workerRuntimeAgentId,
+            executionRole: 'worker',
+          });
+          continue;
+        }
         await this.escalate(
           job.id,
           'runtime_failure',
@@ -271,7 +320,9 @@ export class OrchestrationService {
         continue;
       }
 
-      const reviewer = reviewers.find(candidate => candidate.roleSequence === latestWorker.roleSequence);
+      const reviewedReviewerIds = new Set(reviews.map(candidate => candidate.reviewerAttemptId));
+      const reviewer = reviewers.find(candidate => candidate.sequence > latestWorker.sequence
+        && !reviewedReviewerIds.has(candidate.id));
       if (!reviewer) {
         await this.lifecycle.createAttempt(job.id, {
           runtimeAgentId: reviewerRuntimeAgentId,
@@ -352,6 +403,172 @@ export class OrchestrationService {
       });
     }
     return items;
+  }
+
+  /**
+   * Re-observes one already accepted execution after an observation timeout.
+   * This path deliberately has no call to RuntimeExecutionAdapter.dispatch.
+   */
+  async reconcileTimedOutExecution(
+    escalationId: string,
+  ): Promise<TimedOutExecutionReconciliation> {
+    const escalation = await this.store.getEscalation(required(escalationId, 'Escalation ID'));
+    if (!escalation) throw new Error(`Escalation not found: ${escalationId}`);
+    if (escalation.reason !== 'observation_timeout' || !escalation.attemptId) {
+      throw new Error(`Escalation ${escalation.id} is not an execution observation timeout`);
+    }
+    const attempt = await this.store.getAttempt(escalation.attemptId);
+    if (!attempt || attempt.jobId !== escalation.jobId || attempt.executionRole !== 'worker') {
+      throw new Error(`Escalation ${escalation.id} does not identify its timed-out Worker Attempt`);
+    }
+    const plan = await this.store.getExecutionPlanForAttempt(attempt.id);
+    const dispatch = plan ? await this.store.getExecutionDispatchForPlan(plan.id) : null;
+    if (!plan || !dispatch || dispatch.status !== 'accepted' || !dispatch.externalReference) {
+      throw new Error(`Escalation ${escalation.id} has no accepted, exactly addressable Dispatch`);
+    }
+    const existing = await this.store.getAttemptOutcomeDecision(attempt.id);
+    if (existing) {
+      const observations = await this.store.listExecutionObservationsForDispatch(dispatch.id);
+      const evidence = existing.evidenceObservationId
+        ? observations.find(candidate => candidate.id === existing.evidenceObservationId)
+        : undefined;
+      if (!evidence || !await this.trustedLateEvidence(plan, dispatch, evidence)) {
+        throw new Error(`Attempt ${attempt.id} has an Outcome Decision without trusted late evidence`);
+      }
+      if (existing.outcome === 'completed' && isExactCompletionObservation(evidence)
+        && evidence.resultText && isBoundedExecutionResult(evidence.resultText)) {
+        await this.resolveAttempt(attempt, evidence, 'completed', existing.summary!);
+        return {
+          status: 'completed', jobId: attempt.jobId, attemptId: attempt.id,
+          dispatchId: dispatch.id, resultText: evidence.resultText,
+          inserted: 0, duplicates: 0, ignoredUnrelated: 0, alreadyReconciled: true,
+        };
+      }
+      if (existing.outcome === 'failed' && evidence.kind === 'runtime-crashed') {
+        await this.resolveAttempt(attempt, evidence, 'failed', undefined, existing.reason!);
+        return {
+          status: 'failed', jobId: attempt.jobId, attemptId: attempt.id,
+          dispatchId: dispatch.id, reason: existing.reason!,
+          inserted: 0, duplicates: 0, ignoredUnrelated: 0, alreadyReconciled: true,
+        };
+      }
+      throw new Error(`Attempt ${attempt.id} has a conflicting late reconciliation outcome`);
+    }
+    if (escalation.resolvedAt) {
+      throw new Error(`Escalation ${escalation.id} is resolved without a reconciled Attempt outcome`);
+    }
+    if (attempt.status !== 'running') {
+      throw new Error(`Timed-out Attempt ${attempt.id} is ${attempt.status}, not running`);
+    }
+
+    let observed;
+    try {
+      observed = await this.observations.observeAttemptExecution(attempt.id);
+    } catch (error) {
+      return {
+        status: 'unresolved', jobId: attempt.jobId, attemptId: attempt.id,
+        dispatchId: dispatch.id, message: `The existing execution could not be observed: ${message(error)}`,
+        inserted: 0, duplicates: 0, ignoredUnrelated: 0,
+      };
+    }
+    const exactCompletion = observed.detail.observations.find(candidate =>
+      isExactCompletionObservation(candidate)
+      && candidate.externalReference === dispatch.externalReference);
+    if (exactCompletion) {
+      if (!exactCompletion.resultText || !isBoundedExecutionResult(exactCompletion.resultText)
+        || !await this.trustedLateEvidence(plan, dispatch, exactCompletion)) {
+        return {
+          status: 'unresolved', jobId: attempt.jobId, attemptId: attempt.id,
+          dispatchId: dispatch.id,
+          message: 'Late completion evidence did not satisfy the exact repository, policy, capability, and result boundary.',
+          inserted: observed.inserted, duplicates: observed.duplicates,
+          ignoredUnrelated: observed.ignoredUnrelated,
+        };
+      }
+      await this.resolveAttempt(
+        attempt,
+        exactCompletion,
+        'completed',
+        'Worker execution completed with a bounded exact result after the observation timeout.',
+      );
+      return {
+        status: 'completed', jobId: attempt.jobId, attemptId: attempt.id,
+        dispatchId: dispatch.id, resultText: exactCompletion.resultText,
+        inserted: observed.inserted, duplicates: observed.duplicates,
+        ignoredUnrelated: observed.ignoredUnrelated, alreadyReconciled: false,
+      };
+    }
+    const exactFailure = observed.detail.observations.find(candidate =>
+      candidate.kind === 'runtime-crashed'
+      && candidate.correlation === 'exact'
+      && candidate.correlatedDispatchId === dispatch.id
+      && candidate.externalReference === dispatch.externalReference);
+    if (exactFailure) {
+      if (!await this.trustedLateEvidence(plan, dispatch, exactFailure)) {
+        return {
+          status: 'unresolved', jobId: attempt.jobId, attemptId: attempt.id,
+          dispatchId: dispatch.id,
+          message: 'Late failure evidence did not satisfy the exact repository, policy, and capability boundary.',
+          inserted: observed.inserted, duplicates: observed.duplicates,
+          ignoredUnrelated: observed.ignoredUnrelated,
+        };
+      }
+      const reason = exactFailure.message ?? 'The exact accepted runtime execution failed after observation timed out.';
+      await this.resolveAttempt(attempt, exactFailure, 'failed', undefined, reason);
+      return {
+        status: 'failed', jobId: attempt.jobId, attemptId: attempt.id,
+        dispatchId: dispatch.id, reason,
+        inserted: observed.inserted, duplicates: observed.duplicates,
+        ignoredUnrelated: observed.ignoredUnrelated, alreadyReconciled: false,
+      };
+    }
+    const stillRunning = observed.detail.observations.some(candidate =>
+      candidate.kind === 'runtime-running'
+      && (candidate.correlation !== 'exact'
+        || candidate.correlatedDispatchId === dispatch.id));
+    return {
+      status: stillRunning ? 'still-running' : 'unresolved',
+      jobId: attempt.jobId,
+      attemptId: attempt.id,
+      dispatchId: dispatch.id,
+      message: stillRunning
+        ? 'The existing accepted execution is still running; nothing was resent.'
+        : 'No trustworthy terminal evidence exists for the exact accepted execution; nothing was resent.',
+      inserted: observed.inserted,
+      duplicates: observed.duplicates,
+      ignoredUnrelated: observed.ignoredUnrelated,
+    };
+  }
+
+  private async trustedLateEvidence(
+    plan: DurableExecutionPlan,
+    dispatch: DurableExecutionDispatch,
+    evidence: DurableExecutionObservation,
+  ): Promise<boolean> {
+    if (!plan.repositoryId || !plan.checkoutBindingId || !plan.requestedPolicy
+      || !plan.requestedCapabilities || !dispatch.effectivePolicy
+      || !dispatch.effectiveCapabilities || !evidence.executionContext
+      || !evidence.effectivePolicy || !evidence.effectiveCapabilities) return false;
+    const binding = (await this.store.listCheckoutBindings(plan.repositoryId))
+      .find(candidate => candidate.id === plan.checkoutBindingId);
+    return Boolean(binding)
+      && evidence.correlation === 'exact'
+      && evidence.correlatedDispatchId === dispatch.id
+      && evidence.externalReference === dispatch.externalReference
+      && evidence.executionContext.workingDirectory === binding!.canonicalPath
+      && evidence.executionContext.repositoryReadRoot === binding!.canonicalPath
+      && plan.requestedPolicy.filesystem === 'read-only'
+      && plan.requestedPolicy.network === 'deny'
+      && plan.requestedPolicy.environment === 'empty'
+      && dispatch.effectivePolicy.filesystem === 'read-only'
+      && dispatch.effectivePolicy.network === 'deny'
+      && dispatch.effectivePolicy.environment === 'empty'
+      && evidence.effectivePolicy.filesystem === 'read-only'
+      && evidence.effectivePolicy.network === 'deny'
+      && evidence.effectivePolicy.environment === 'empty'
+      && plan.requestedCapabilities.repositoryRead === true
+      && dispatch.effectiveCapabilities.repositoryRead === true
+      && evidence.effectiveCapabilities.repositoryRead === true;
   }
 
   private async resumeActiveAttempt(
@@ -660,6 +877,18 @@ export class OrchestrationService {
       const escalation = escalations.find(candidate => candidate.id === item.escalationId);
       return escalation?.attemptId === attemptId
         && (!reviewId || escalation.reviewId === reviewId);
+    })?.instruction;
+  }
+
+  private async policyBlockedGuidanceFor(
+    jobId: string,
+    attemptId: string,
+  ): Promise<string | undefined> {
+    const escalations = await this.store.listEscalations(jobId);
+    const guidance = await this.store.listHumanGuidance(jobId);
+    return [...guidance].reverse().find(item => {
+      const escalation = escalations.find(candidate => candidate.id === item.escalationId);
+      return escalation?.reason === 'policy_blocked' && escalation.attemptId === attemptId;
     })?.instruction;
   }
 

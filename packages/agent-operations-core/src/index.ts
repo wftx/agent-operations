@@ -47,9 +47,11 @@ export {
 export {
   MVP_MAX_REVIEWER_PASSES_PER_ATTEMPT,
   MVP_MAX_WORKER_ATTEMPTS,
+  MVP_OBSERVATION_TIMEOUT_MS,
   OrchestrationService,
   parseReviewerResult,
   type OrchestrationPreview,
   type OrchestrationReadModel,
   type OrchestrationServiceOptions,
+  type TimedOutExecutionReconciliation,
 } from './orchestration-service.js';

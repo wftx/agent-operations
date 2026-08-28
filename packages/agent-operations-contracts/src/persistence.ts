@@ -136,7 +136,24 @@ export interface AgentOperationsStateStore {
   createEscalation(escalation: DurableEscalation): Promise<void>;
   getEscalation(id: string): Promise<DurableEscalation | null>;
   listEscalations(jobId?: string, unresolvedOnly?: boolean): Promise<readonly DurableEscalation[]>;
-  resolveEscalation(id: string, resolvedAt: string): Promise<DurableEscalation>;
+  resolveEscalation(
+    id: string,
+    resolvedAt: string,
+    resolutionSummary?: string,
+  ): Promise<DurableEscalation>;
+  resolveEscalationAndResumeOperatorRun(
+    id: string,
+    resolvedAt: string,
+    resolutionSummary: string,
+    run: DurableOperatorRun,
+    expectedRunRevision: number,
+  ): Promise<void>;
+  resolveEscalationAndCreateEscalation(
+    id: string,
+    resolvedAt: string,
+    resolutionSummary: string,
+    replacement: DurableEscalation,
+  ): Promise<void>;
   createOperatorRun(run: DurableOperatorRun): Promise<void>;
   getOperatorRun(id: string): Promise<DurableOperatorRun | null>;
   getOperatorRunForJob(jobId: string): Promise<DurableOperatorRun | null>;

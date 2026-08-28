@@ -23,6 +23,7 @@ class StubOperatorApplication implements OperatorApplication {
   runCalls = 0;
   guidanceCalls = 0;
   cancelCalls = 0;
+  reconcileCalls = 0;
 
   constructor(private readonly runtimeReady = true) {}
 
@@ -68,6 +69,11 @@ class StubOperatorApplication implements OperatorApplication {
   async cancelEscalatedJob(): Promise<OperatorRunSession> {
     this.cancelCalls += 1;
     return { jobId: SUMMARY_ESCALATED.job.id, status: 'cancelled', startedAt: TIME, finishedAt: TIME };
+  }
+
+  async reconcileTimedOutExecution(): Promise<OperatorRunSession> {
+    this.reconcileCalls += 1;
+    return { jobId: SUMMARY_ESCALATED.job.id, status: 'pending', startedAt: TIME };
   }
 
   async listJobs(filter: OperatorJobList = 'all'): Promise<readonly OperatorJobSummary[]> {
@@ -121,6 +127,26 @@ describe('OperatorWebApplication', () => {
     expect(service.runCalls).toBe(0);
   });
 
+  it('renders late observation reconciliation as a no-resend explicit action', async () => {
+    const service = new StubOperatorApplication();
+    const detail: OperatorJobDetail = {
+      ...ESCALATED_DETAIL,
+      escalations: [{
+        ...ESCALATED_DETAIL.escalations[0],
+        reason: 'observation_timeout',
+        summary: 'The accepted Worker turn exceeded the observation window.',
+      }],
+      escalationActions: { 'escalation:1': ['reconcile-execution'] },
+    };
+    service.getJobDetail = async () => detail;
+    const response = await new OperatorWebApplication(service)
+      .handle(new Request('http://127.0.0.1/needs-me'));
+    const body = await response.text();
+    expect(body).toContain('Check Execution Again');
+    expect(body).toContain('does not resend the task');
+    expect(body).toContain('/escalations/escalation%3A1/reconcile');
+  });
+
   it('maps explicit Needs Me actions to application commands and never from GET', async () => {
     const service = new StubOperatorApplication();
     const app = new OperatorWebApplication(service);
@@ -145,6 +171,13 @@ describe('OperatorWebApplication', () => {
     ));
     expect(cancel.status).toBe(303);
     expect(service.cancelCalls).toBe(1);
+
+    const reconcile = await app.handle(new Request(
+      `http://127.0.0.1/escalations/${encodeURIComponent('escalation:1')}/reconcile`,
+      { method: 'POST' },
+    ));
+    expect(reconcile.status).toBe(303);
+    expect(service.reconcileCalls).toBe(1);
   });
 
   it('shows an offline runtime without starting it and rejects invalid action requests', async () => {

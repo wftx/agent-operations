@@ -243,6 +243,7 @@ interface EscalationRow {
   summary: string;
   created_at: string;
   resolved_at: string | null;
+  resolution_summary?: string | null;
 }
 
 interface AttemptOutcomeDecisionRow {
@@ -552,6 +553,7 @@ function toEscalation(row: EscalationRow): DurableEscalation {
     summary: row.summary,
     createdAt: row.created_at,
     ...(row.resolved_at ? { resolvedAt: row.resolved_at } : {}),
+    ...(row.resolution_summary ? { resolutionSummary: row.resolution_summary } : {}),
   };
 }
 
@@ -632,6 +634,7 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
   private readonly supportsExecutionCapabilities: boolean;
   private readonly supportsOrchestration: boolean;
   private readonly supportsDailyOperator: boolean;
+  private readonly supportsLateExecutionReconciliation: boolean;
 
   private constructor(databasePath: string, database: Database.Database) {
     this.databasePath = databasePath;
@@ -650,6 +653,9 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     ).get() as unknown) !== undefined;
     this.supportsDailyOperator = (database.prepare(
       "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'operator_runs'",
+    ).get() as unknown) !== undefined;
+    this.supportsLateExecutionReconciliation = (database.prepare(
+      "SELECT 1 FROM pragma_table_info('escalations') WHERE name = 'resolution_summary'",
     ).get() as unknown) !== undefined;
   }
 
@@ -1757,22 +1763,119 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     ).all(...parameters) as EscalationRow[]).map(toEscalation);
   }
 
-  async resolveEscalation(id: string, resolvedAt: string): Promise<DurableEscalation> {
+  async resolveEscalation(
+    id: string,
+    resolvedAt: string,
+    resolutionSummary?: string,
+  ): Promise<DurableEscalation> {
     this.assertOpen();
     if (!this.supportsDailyOperator) throw new Error('Escalation resolution requires Agent Operations schema v10');
     requireNonEmpty(id, 'Escalation ID');
     requireNonEmpty(resolvedAt, 'Escalation resolution timestamp');
+    if (resolutionSummary !== undefined) requireNonEmpty(resolutionSummary, 'Escalation resolution summary');
+    if (resolutionSummary !== undefined && !this.supportsLateExecutionReconciliation) {
+      throw new Error('Escalation resolution summaries require Agent Operations schema v11');
+    }
     const existing = await this.getEscalation(id);
     if (!existing) throw new Error(`Escalation not found: ${id}`);
     if (existing.resolvedAt) {
-      if (existing.resolvedAt !== resolvedAt) throw new Error(`Escalation ${id} is already resolved`);
+      if (existing.resolvedAt !== resolvedAt
+        || existing.resolutionSummary !== resolutionSummary) {
+        throw new Error(`Escalation ${id} is already resolved`);
+      }
       return existing;
     }
-    const result = this.database.prepare(
-      'UPDATE escalations SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL',
-    ).run(resolvedAt, id);
+    const result = this.supportsLateExecutionReconciliation
+      ? this.database.prepare(
+        'UPDATE escalations SET resolved_at = ?, resolution_summary = ? WHERE id = ? AND resolved_at IS NULL',
+      ).run(resolvedAt, resolutionSummary ?? null, id)
+      : this.database.prepare(
+        'UPDATE escalations SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL',
+      ).run(resolvedAt, id);
     if (result.changes !== 1) throw new Error(`Escalation resolution conflict: ${id}`);
-    return { ...existing, resolvedAt };
+    return { ...existing, resolvedAt, ...(resolutionSummary ? { resolutionSummary } : {}) };
+  }
+
+  async resolveEscalationAndResumeOperatorRun(
+    id: string,
+    resolvedAt: string,
+    resolutionSummary: string,
+    run: DurableOperatorRun,
+    expectedRunRevision: number,
+  ): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsLateExecutionReconciliation) throw new Error('Late execution reconciliation requires Agent Operations schema v11');
+    requireNonEmpty(resolutionSummary, 'Escalation resolution summary');
+    const persist = this.database.transaction(() => {
+      const escalation = this.database.prepare('SELECT job_id, resolved_at FROM escalations WHERE id = ?')
+        .get(id) as { job_id: string; resolved_at: string | null } | undefined;
+      const existingRun = this.database.prepare('SELECT * FROM operator_runs WHERE id = ?')
+        .get(run.id) as OperatorRunRow | undefined;
+      if (!escalation || escalation.resolved_at || escalation.job_id !== run.jobId) {
+        throw new Error(`Escalation resolution conflict: ${id}`);
+      }
+      if (!existingRun || existingRun.revision !== expectedRunRevision
+        || run.revision !== expectedRunRevision + 1
+        || existingRun.job_id !== run.jobId
+        || !isValidOperatorRunTransition(existingRun.status, run.status)) {
+        throw new Error(`Operator Run transition conflict: ${run.id}`);
+      }
+      const resolution = this.database.prepare(
+        'UPDATE escalations SET resolved_at = ?, resolution_summary = ? WHERE id = ? AND resolved_at IS NULL',
+      ).run(resolvedAt, resolutionSummary, id);
+      if (resolution.changes !== 1) throw new Error(`Escalation resolution conflict: ${id}`);
+      const transition = this.database.prepare(`
+        UPDATE operator_runs
+        SET status = ?, failure_message = ?, revision = ?, updated_at = ?, started_at = ?, finished_at = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        run.status, run.failureMessage ?? null, run.revision, run.updatedAt,
+        run.startedAt ?? null, run.finishedAt ?? null, run.id, expectedRunRevision,
+      );
+      if (transition.changes !== 1) throw new Error(`Operator Run transition conflict: ${run.id}`);
+    });
+    persist();
+  }
+
+  async resolveEscalationAndCreateEscalation(
+    id: string,
+    resolvedAt: string,
+    resolutionSummary: string,
+    replacement: DurableEscalation,
+  ): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsLateExecutionReconciliation) throw new Error('Late execution reconciliation requires Agent Operations schema v11');
+    requireNonEmpty(resolutionSummary, 'Escalation resolution summary');
+    requireNonEmpty(replacement.summary, 'Replacement Escalation summary');
+    if (!replacement.id.startsWith('escalation:')) {
+      throw new Error(`Invalid replacement Escalation ID: ${replacement.id}`);
+    }
+    const persist = this.database.transaction(() => {
+      const existing = this.database.prepare('SELECT job_id, resolved_at FROM escalations WHERE id = ?')
+        .get(id) as { job_id: string; resolved_at: string | null } | undefined;
+      if (!existing || existing.resolved_at || existing.job_id !== replacement.jobId
+        || replacement.resolvedAt) throw new Error(`Escalation resolution conflict: ${id}`);
+      if (replacement.attemptId) {
+        const attempt = this.database.prepare('SELECT job_id FROM job_attempts WHERE id = ?')
+          .get(replacement.attemptId) as { job_id: string } | undefined;
+        if (attempt?.job_id !== replacement.jobId) {
+          throw new Error(`Invalid replacement Escalation Attempt association: ${replacement.id}`);
+        }
+      }
+      const resolution = this.database.prepare(
+        'UPDATE escalations SET resolved_at = ?, resolution_summary = ? WHERE id = ? AND resolved_at IS NULL',
+      ).run(resolvedAt, resolutionSummary, id);
+      if (resolution.changes !== 1) throw new Error(`Escalation resolution conflict: ${id}`);
+      this.database.prepare(`
+        INSERT INTO escalations
+          (id, job_id, attempt_id, review_id, reason, summary, created_at, resolved_at, resolution_summary)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+      `).run(
+        replacement.id, replacement.jobId, replacement.attemptId ?? null,
+        replacement.reviewId ?? null, replacement.reason, replacement.summary, replacement.createdAt,
+      );
+    });
+    persist();
   }
 
   async createOperatorRun(run: DurableOperatorRun): Promise<void> {
