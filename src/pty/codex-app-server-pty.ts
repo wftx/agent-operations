@@ -850,6 +850,21 @@ export class CodexAppServerPTY {
 
   private startAppServer(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      let startupReady = false;
+      let settled = false;
+      let startupOutput = '';
+      const resolveStartup = () => {
+        if (settled) return;
+        settled = true;
+        startupReady = true;
+        resolve();
+      };
+      const rejectStartup = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+
       if (!this._spawnFn) {
         const nodePty = require('node-pty');
         this._spawnFn = nodePty.spawn;
@@ -871,19 +886,31 @@ export class CodexAppServerPTY {
       this._appServerPty = pty;
       pty.onData((data) => {
         this._outputBuffer.push(data);
+        startupOutput = `${startupOutput}${data}`.slice(-4000);
         if (data.includes('Error:')) {
-          reject(new Error(data.trim()));
+          rejectStartup(new Error(data.trim()));
         }
       });
       pty.onExit(({ exitCode, signal }) => {
         if (this._appServerPty !== pty) return;
         this._appServerPty = null;
+        if (!startupReady) {
+          const detail = startupOutput
+            .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          rejectStartup(new Error(
+            `Codex app-server exited before creating socket (exit code ${exitCode}, signal ${signal || 'none'})`
+            + (detail ? `: ${detail}` : ''),
+          ));
+          return;
+        }
         this._alive = false;
         this.rejectTurnCompletion(new Error('Codex app-server exited'));
         this._onExitHandler?.(exitCode, signal);
       });
 
-      this.waitForSocket().then(resolve, reject);
+      this.waitForSocket().then(resolveStartup, rejectStartup);
     });
   }
 

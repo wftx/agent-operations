@@ -121,6 +121,82 @@ describe('CodexAppServerPTY socket path policy', () => {
       'utf-8',
     );
   });
+
+  it('reports an early child exit immediately without triggering outer lifecycle recovery', async () => {
+    const outerExit = vi.fn();
+    const spawnFn = vi.fn().mockReturnValue({
+      pid: 1,
+      write: vi.fn(),
+      onData: vi.fn(() => ({ dispose: vi.fn() })),
+      onExit: vi.fn((handler) => {
+        queueMicrotask(() => handler({ exitCode: 1, signal: 0 }));
+        return { dispose: vi.fn() };
+      }),
+      kill: vi.fn(),
+      resize: vi.fn(),
+      clear: vi.fn(),
+      pause: vi.fn(),
+      resume: vi.fn(),
+      process: 'codex',
+    });
+
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _alive: boolean })._alive = true;
+    (pty as unknown as { _spawnFn: typeof spawnFn })._spawnFn = spawnFn;
+    pty.onExit(outerExit);
+
+    await expect(
+      (pty as unknown as { startAppServer(): Promise<void> }).startAppServer(),
+    ).rejects.toThrow(
+      'Codex app-server exited before creating socket (exit code 1, signal none)',
+    );
+    expect(outerExit).not.toHaveBeenCalled();
+    expect(pty.isAlive()).toBe(true);
+  });
+
+  it('accepts a PATH-resolved child that creates its socket and preserves normal exit recovery', async () => {
+    const outerExit = vi.fn();
+    let childExit: ((event: { exitCode: number; signal: number }) => void) | null = null;
+    const spawnFn = vi.fn().mockReturnValue({
+      pid: 88,
+      write: vi.fn(),
+      onData: vi.fn(() => ({ dispose: vi.fn() })),
+      onExit: vi.fn((handler) => {
+        childExit = handler;
+        return { dispose: vi.fn() };
+      }),
+      kill: vi.fn(),
+      resize: vi.fn(),
+      clear: vi.fn(),
+      pause: vi.fn(),
+      resume: vi.fn(),
+      process: 'codex',
+    });
+    fsMocks.existsSync.mockImplementation((path) => path === '/tmp/ctx/state/codex-app-agent/codex.sock');
+
+    const pty = new CodexAppServerPTY(mockEnv, {});
+    (pty as unknown as { _alive: boolean })._alive = true;
+    (pty as unknown as { _spawnFn: typeof spawnFn })._spawnFn = spawnFn;
+    pty.onExit(outerExit);
+
+    await expect(
+      (pty as unknown as { startAppServer(): Promise<void> }).startAppServer(),
+    ).resolves.toBeUndefined();
+    expect(spawnFn).toHaveBeenCalledWith(
+      'codex',
+      ['app-server', '--enable', 'goals', '--listen', 'unix://./codex.sock'],
+      expect.objectContaining({
+        cwd: '/tmp/ctx/state/codex-app-agent',
+        env: expect.objectContaining({ PATH: process.env.PATH }),
+      }),
+    );
+    expect(outerExit).not.toHaveBeenCalled();
+
+    expect(childExit).not.toBeNull();
+    childExit!({ exitCode: 0, signal: 0 });
+    expect(outerExit).toHaveBeenCalledWith(0, 0);
+    expect(pty.isAlive()).toBe(false);
+  });
 });
 
 describe('Codex execution policy mapping', () => {
