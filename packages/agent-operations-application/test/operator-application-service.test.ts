@@ -232,6 +232,7 @@ describe('OperatorApplicationService', () => {
     expect((await application.listJobs('done'))[0]).toMatchObject({
       orchestrationState: 'Completed',
       workerAttemptCount: 1,
+      workerExecutionCount: 0,
       latestReviewDecision: 'PASS',
       needsHuman: false,
     });
@@ -335,7 +336,7 @@ describe('OperatorApplicationService', () => {
     expect(notifier.events.map(event => event.kind)).toEqual(['needs_human', 'job_completed']);
   });
 
-  it('resumes a preflight-only policy block through a fresh Worker Attempt', async () => {
+  it('does not charge two preflight-only policy blocks and resumes through a fresh Worker Attempt', async () => {
     const store = await configuredStore();
     const lifecycle = new JobLifecycleService(store, {
       now: () => new Date(TIME),
@@ -351,25 +352,38 @@ describe('OperatorApplicationService', () => {
       automaticReadOnlyCompletion: true,
     });
     const job = await lifecycle.markJobReady(draft.id);
-    const blockedAttempt = await lifecycle.createAttempt(job.id, {
+    const firstBlockedAttempt = await lifecycle.createAttempt(job.id, {
       runtimeAgentId: RUNTIME_ID,
       executionRole: 'worker',
     });
-    const plan = await new ExecutionPlanningService(store, {
+    const planning = new ExecutionPlanningService(store, {
       now: () => new Date(TIME),
-      planIdFactory: () => 'plan:policy-blocked',
-    }).prepareExecutionPlan({
+      planIdFactory: (() => { let sequence = 0; return () => `plan:policy-blocked:${++sequence}`; })(),
+    });
+    const firstPlan = await planning.prepareExecutionPlan({
       projectId: PROJECT_ID,
-      attemptId: blockedAttempt.id,
+      attemptId: firstBlockedAttempt.id,
       instruction: 'Read the repository without mutation.',
       requestedPolicy: RESTRICTED_TEXT_EXECUTION_POLICY,
       requestedCapabilities: REPOSITORY_READ_EXECUTION_CAPABILITIES,
     });
-    await lifecycle.cancelAttempt(blockedAttempt.id);
+    await lifecycle.cancelAttempt(firstBlockedAttempt.id);
+    const secondBlockedAttempt = await lifecycle.createAttempt(job.id, {
+      runtimeAgentId: RUNTIME_ID,
+      executionRole: 'worker',
+    });
+    const secondPlan = await planning.prepareExecutionPlan({
+      projectId: PROJECT_ID,
+      attemptId: secondBlockedAttempt.id,
+      instruction: 'Read the repository without mutation.',
+      requestedPolicy: RESTRICTED_TEXT_EXECUTION_POLICY,
+      requestedCapabilities: REPOSITORY_READ_EXECUTION_CAPABILITIES,
+    });
+    await lifecycle.cancelAttempt(secondBlockedAttempt.id);
     await store.createEscalation({
       id: 'escalation:policy-blocked',
       jobId: job.id,
-      attemptId: blockedAttempt.id,
+      attemptId: secondBlockedAttempt.id,
       reason: 'policy_blocked',
       summary: 'Runtime was unavailable before Dispatch.',
       createdAt: TIME,
@@ -391,7 +405,14 @@ describe('OperatorApplicationService', () => {
       { now: () => new Date(TIME) },
     );
 
-    expect((await application.getJobDetail(job.id)).escalationActions['escalation:policy-blocked'])
+    const blockedDetail = await application.getJobDetail(job.id);
+    expect(blockedDetail.summary).toMatchObject({
+      workerAttemptCount: 2,
+      workerExecutionCount: 0,
+    });
+    expect(blockedDetail.workerAttempts.map(story => story.attempt.id))
+      .toEqual([firstBlockedAttempt.id, secondBlockedAttempt.id]);
+    expect(blockedDetail.escalationActions['escalation:policy-blocked'])
       .toEqual(['provide-guidance', 'cancel-job']);
     const continued = await application.provideGuidanceAndContinue(
       'escalation:policy-blocked',
@@ -401,10 +422,19 @@ describe('OperatorApplicationService', () => {
     expect((await application.waitForRun(job.id)).status).toBe('done');
 
     const attempts = await store.listAttemptsForJob(job.id);
-    expect(attempts.filter(attempt => attempt.executionRole === 'worker')).toHaveLength(2);
-    expect(attempts[0]).toMatchObject({ id: blockedAttempt.id, status: 'cancelled' });
-    expect(await store.getExecutionPlan(plan.id)).toMatchObject({ id: plan.id, attemptId: blockedAttempt.id });
-    expect(await store.getExecutionDispatchForPlan(plan.id)).toBeNull();
+    expect(attempts.filter(attempt => attempt.executionRole === 'worker')).toHaveLength(3);
+    expect(attempts[0]).toMatchObject({ id: firstBlockedAttempt.id, status: 'cancelled' });
+    expect(attempts[1]).toMatchObject({ id: secondBlockedAttempt.id, status: 'cancelled' });
+    expect(await store.getExecutionPlan(firstPlan.id)).toMatchObject({
+      id: firstPlan.id,
+      attemptId: firstBlockedAttempt.id,
+    });
+    expect(await store.getExecutionPlan(secondPlan.id)).toMatchObject({
+      id: secondPlan.id,
+      attemptId: secondBlockedAttempt.id,
+    });
+    expect(await store.getExecutionDispatchForPlan(firstPlan.id)).toBeNull();
+    expect(await store.getExecutionDispatchForPlan(secondPlan.id)).toBeNull();
     expect(await store.getEscalation('escalation:policy-blocked')).toMatchObject({ resolvedAt: TIME });
   });
 
@@ -540,6 +570,26 @@ describe('OperatorApplicationService', () => {
     expect(await store.listOperatorNotificationDeliveries(started.jobId)).toEqual([
       expect.objectContaining({ kind: 'needs_human', status: 'failed', message: 'Telegram offline' }),
     ]);
+  });
+
+  it('does not duplicate a claimed completion notification after application restart', async () => {
+    const store = await configuredStore();
+    const firstNotifier = new RecordingNotifier();
+    const first = new OperatorApplicationService(store, new FakeOrchestration(store), {
+      now: () => new Date(TIME), notifier: firstNotifier,
+    });
+    const started = await first.runOperatorJob(INPUT);
+    expect((await first.waitForRun(started.jobId)).status).toBe('done');
+    expect(firstNotifier.events.map(event => event.kind)).toEqual(['job_completed']);
+
+    const restartedNotifier = new RecordingNotifier();
+    const restarted = new OperatorApplicationService(store, new FakeOrchestration(store), {
+      now: () => new Date(TIME), notifier: restartedNotifier,
+    });
+    restarted.startRunner();
+    expect((await restarted.waitForRun(started.jobId)).status).toBe('done');
+    expect(restartedNotifier.events).toEqual([]);
+    expect(await store.listOperatorNotificationDeliveries(started.jobId)).toHaveLength(1);
   });
 
   it('resumes a durably accepted pending Operator Run when a new application instance starts', async () => {

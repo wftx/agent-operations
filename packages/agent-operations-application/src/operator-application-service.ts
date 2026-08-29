@@ -17,6 +17,7 @@ import {
 import {
   JobLifecycleService,
   MVP_MAX_WORKER_ATTEMPTS,
+  readWorkerExecutionBudget,
   type OrchestrationPreview,
   type OrchestrationReadModel,
   type TimedOutExecutionReconciliation,
@@ -222,8 +223,13 @@ export class OperatorApplicationService implements OperatorApplication {
     if (attempts.some(attempt => isActiveAttemptStatus(attempt.status))) {
       throw new Error('Guided continuation requires no active Attempt');
     }
-    if (attempts.filter(attempt => attempt.executionRole === 'worker').length >= MVP_MAX_WORKER_ATTEMPTS) {
-      throw new Error(`Worker Attempt budget of ${MVP_MAX_WORKER_ATTEMPTS} is exhausted`);
+    const workerBudget = await readWorkerExecutionBudget(
+      this.store,
+      attempts,
+      MVP_MAX_WORKER_ATTEMPTS,
+    );
+    if (workerBudget.exhausted) {
+      throw new Error(`Worker execution budget of ${MVP_MAX_WORKER_ATTEMPTS} is exhausted`);
     }
     if (await this.hasUncertainDispatch(attempts)) {
       throw new Error('Guided continuation is forbidden while a Dispatch is uncertain');
@@ -391,6 +397,11 @@ export class OperatorApplicationService implements OperatorApplication {
     const latestAttempt = attempts.at(-1) ?? null;
     const activeAttempt = [...attempts].reverse().find(attempt => isActiveAttemptStatus(attempt.status));
     const operatorRun = await this.store.getOperatorRunForJob(job.id);
+    const workerBudget = await readWorkerExecutionBudget(
+      this.store,
+      attempts,
+      MVP_MAX_WORKER_ATTEMPTS,
+    );
     const currentRole = activeAttempt?.executionRole ?? null;
     const currentStage = await this.deriveStage(job, attempts, reviews, unresolved.length > 0, operatorRun);
     const startedAt = operatorRun?.startedAt;
@@ -403,6 +414,7 @@ export class OperatorApplicationService implements OperatorApplication {
       currentRole,
       orchestrationState: currentStage,
       workerAttemptCount: attempts.filter(attempt => attempt.executionRole === 'worker').length,
+      workerExecutionCount: workerBudget.consumed,
       latestReviewDecision: reviews.at(-1)?.decision ?? null,
       needsHuman: unresolved.length > 0,
       operatorRun,
@@ -445,17 +457,22 @@ export class OperatorApplicationService implements OperatorApplication {
     if (run?.status === 'pending') return 'Accepted';
     const active = [...attempts].reverse().find(attempt => isActiveAttemptStatus(attempt.status));
     if (active) {
+      const workerBudget = await readWorkerExecutionBudget(
+        this.store,
+        attempts,
+        MVP_MAX_WORKER_ATTEMPTS,
+      );
       const plan = await this.store.getExecutionPlanForAttempt(active.id);
       if (!plan) {
         return active.executionRole === 'reviewer'
           ? 'Preparing Reviewer'
-          : active.roleSequence > 1 ? 'Preparing Revision' : 'Preparing Worker';
+          : workerBudget.consumed > 0 ? 'Preparing Revision' : 'Preparing Worker';
       }
       const dispatch = await this.store.getExecutionDispatchForPlan(plan.id);
       if (!dispatch || dispatch.status === 'prepared') {
         return active.executionRole === 'reviewer'
           ? 'Preparing Reviewer'
-          : active.roleSequence > 1 ? 'Preparing Revision' : 'Preparing Worker';
+          : workerBudget.consumed > 0 ? 'Preparing Revision' : 'Preparing Worker';
       }
       if (dispatch.status === 'accepted') {
         const observations = await this.store.listExecutionObservationsForDispatch(dispatch.id);
@@ -496,9 +513,13 @@ export class OperatorApplicationService implements OperatorApplication {
     if (attempts.some(attempt => isActiveAttemptStatus(attempt.status))
       || await this.hasUncertainDispatch(attempts)) return [];
     const actions: OperatorEscalationAction[] = [];
-    const workerCount = attempts.filter(attempt => attempt.executionRole === 'worker').length;
+    const workerBudget = await readWorkerExecutionBudget(
+      this.store,
+      attempts,
+      MVP_MAX_WORKER_ATTEMPTS,
+    );
     if (await this.allowsGuidedContinuation(escalation, attempts)
-      && workerCount < MVP_MAX_WORKER_ATTEMPTS) {
+      && !workerBudget.exhausted) {
       actions.push('provide-guidance');
     }
     const job = await this.store.getJob(escalation.jobId);

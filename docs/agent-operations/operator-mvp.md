@@ -96,17 +96,55 @@ The Telegram adapter is notification-only. It sends once for a newly unresolved
 Needs Me escalation and once when an operator-submitted Job completes. Worker,
 Reviewer, observation, repository-read, and turn-ID events are never sent.
 
-Configure dedicated Operator credentials outside Git:
+Configure dedicated Operator credentials in the ignored local file
+`.agent-operations/telegram.env`:
 
-```text
-AO_TELEGRAM_BOT_TOKEN
-AO_TELEGRAM_CHAT_ID
+```dotenv
+AO_TELEGRAM_BOT_TOKEN=<dedicated AO bot token>
+AO_TELEGRAM_CHAT_ID=<dedicated AO chat ID>
 ```
 
-Both values are required; if neither is set, delivery is recorded as skipped.
-A failure is recorded for operator visibility and never changes Job or
-Escalation truth. Phase 22 does not send interactive Telegram actions and does
-not reuse an agent's inbound bot configuration implicitly.
+Create the directory/file locally and restrict access before adding values:
+
+```bash
+mkdir -p .agent-operations
+chmod 700 .agent-operations
+touch .agent-operations/telegram.env
+chmod 600 .agent-operations/telegram.env
+```
+
+Do not reuse an unrelated agent's bot configuration. Both dedicated values are
+required. Existing shell variables take precedence over the local file, and no
+credential value is shown by the health/test command or AO Web.
+
+Preview configuration and the exact harmless message without network traffic:
+
+```bash
+npm run ao:telegram:test
+```
+
+A real connectivity check is deliberately separate and requires both gates:
+
+```bash
+npm run ao:telegram:test -- --send --confirm TELEGRAM_TEST
+```
+
+The test performs at most one request and never retries. It creates no Job,
+Attempt, Plan, Dispatch, Review, or Escalation. Immutable, credential-redacted
+test receipts are stored under the local Agent Operations state directory in
+`notification-tests/`; they are not replayed on restart. Restart AO Web after
+adding or changing credentials so its process receives the new configuration.
+
+Normal notifications occur only for Job completion and newly created Needs Me
+escalations. Intermediate Worker/Reviewer activity, previews, runtime health,
+reconciliation checks, and the Telegram dry-run do not notify. Durable delivery
+event keys allow one completion notification per completed Job and one Needs Me
+notification per escalation, including across reload/restart.
+
+Telegram failure is delivery truth only: it is recorded as failed, is not
+automatically retried, creates no Needs Me item, and never changes Job,
+Escalation, Review, or orchestration truth. AO durable state remains
+authoritative whether Telegram is configured, unavailable, or rejected.
 
 ## Fixed MVP safety defaults
 

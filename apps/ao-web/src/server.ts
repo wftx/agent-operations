@@ -8,6 +8,7 @@ import { NoopOperatorNotifier } from '../../../packages/agent-operations-applica
 import { SqliteAgentOperationsStateStore } from '../../../packages/sqlite-state-adapter/src/index.js';
 import {
   TelegramOperatorNotifier,
+  loadAgentOperationsTelegramEnvironmentFile,
   loadTelegramOperatorNotificationConfig,
 } from '../../../packages/telegram-notification-adapter/src/index.js';
 import { OperatorWebApplication } from './app.js';
@@ -24,12 +25,15 @@ const orchestration = new OrchestrationService(
   new CortextOSExecutionAdapter(),
   new CortextOSExecutionObserver(),
 );
+const notification = loadNotifier();
 const application = new OperatorApplicationService(store, orchestration, {
   runtime,
-  notifier: loadNotifier(),
+  notifier: notification.notifier,
 });
 application.startRunner();
-const app = new OperatorWebApplication(application);
+const app = new OperatorWebApplication(application, {
+  telegramConfigured: notification.configured,
+});
 
 const server = createOperatorHttpServer(app, { host, port });
 
@@ -56,10 +60,14 @@ function parsePort(value: string): number {
 
 function loadNotifier() {
   try {
+    loadAgentOperationsTelegramEnvironmentFile();
     const config = loadTelegramOperatorNotificationConfig();
-    return config ? new TelegramOperatorNotifier(config) : new NoopOperatorNotifier();
+    return {
+      notifier: config ? new TelegramOperatorNotifier(config) : new NoopOperatorNotifier(),
+      configured: config !== null,
+    };
   } catch (error) {
     console.warn(`Agent Operations Telegram notifications disabled: ${error instanceof Error ? error.message : String(error)}`);
-    return new NoopOperatorNotifier();
+    return { notifier: new NoopOperatorNotifier(), configured: false };
   }
 }

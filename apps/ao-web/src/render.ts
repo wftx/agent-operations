@@ -11,7 +11,12 @@ export function renderDashboard(
   projects: readonly OperatorProjectOption[],
   jobs: readonly OperatorJobSummary[],
   runtime: OperatorRuntimeStatus,
-  options: { readonly error?: string; readonly preview?: OperatorTaskPreview; readonly input?: Partial<OperatorTaskInput> } = {},
+  options: {
+    readonly error?: string;
+    readonly preview?: OperatorTaskPreview;
+    readonly input?: Partial<OperatorTaskInput>;
+    readonly telegramConfigured?: boolean;
+  } = {},
 ): string {
   const runnable = projects.filter(project => project.runnable);
   const selectedProject = options.input?.projectId ?? runnable[0]?.project.id ?? '';
@@ -25,6 +30,7 @@ export function renderDashboard(
   const form = `
     <section class="mission-summary">
       <div class="runtime ${runtime.state}"><span class="runtime-dot"></span><div><p class="eyebrow">Runtime</p><strong>${escapeHtml(runtime.label)}</strong>${runtime.reason ? `<small>${escapeHtml(runtime.reason)}</small>` : ''}</div></div>
+      <div><p class="eyebrow">Notifications</p><strong>Telegram: ${options.telegramConfigured ? 'Configured' : 'Not configured'}</strong></div>
       <div><span>${running}</span><small>Running</small></div><div><span>${needsMe}</span><small>Needs Me</small></div><div><span>${doneToday}</span><small>Done Today</small></div>
     </section>
     <section class="hero">
@@ -48,7 +54,7 @@ export function renderDashboard(
         <label>Acceptance criteria
           <textarea name="acceptanceCriteria" rows="3" required placeholder="Identify the authoritative contract file and its three dimensions.">${escapeHtml(options.input?.acceptanceCriteria ?? '')}</textarea>
         </label>
-        <div class="defaults"><span>Repository <strong>read-only</strong></span><span>Network <strong>deny</strong></span><span>Environment <strong>empty</strong></span><span>Worker Attempts <strong>max 2</strong></span><span>Reviewer <strong>on</strong></span><span>Auto-complete <strong>after PASS</strong></span></div>
+        <div class="defaults"><span>Repository <strong>read-only</strong></span><span>Network <strong>deny</strong></span><span>Environment <strong>empty</strong></span><span>Worker executions <strong>max 2</strong></span><span>Reviewer <strong>on</strong></span><span>Auto-complete <strong>after PASS</strong></span></div>
         <div class="actions"><button class="secondary" name="intent" value="preview">Preview</button><button name="intent" value="run" ${runnable.length ? '' : 'disabled'}>Run Job</button></div>
       </form>
     </section>
@@ -82,7 +88,7 @@ export function renderNeedsMe(jobs: readonly OperatorJobDetail[]): string {
 export function renderDone(jobs: readonly OperatorJobDetail[]): string {
   const content = jobs.length ? jobs.map(detail => `<article class="card done-card">
     <div class="card-head"><div><span class="status done">Done</span><h2><a href="/jobs/${encodeURIComponent(detail.summary.job.id)}">${escapeHtml(detail.summary.job.title)}</a></h2><p>${escapeHtml(detail.summary.projectName)} · ${escapeHtml(detail.summary.repositoryName)}</p></div><time>${formatTime(detail.completedAt ?? detail.summary.job.updatedAt)}</time></div>
-    <div class="done-grid"><div><p class="eyebrow">Final Worker result</p><div class="result">${escapeHtml(detail.finalWorkerResult ?? 'No bounded final result is available.')}</div></div><div><p class="eyebrow">Reviewer PASS</p><p>${escapeHtml(detail.finalReview?.summary ?? 'No final review summary is available.')}</p><p class="muted">${detail.summary.workerAttemptCount} Worker ${detail.summary.workerAttemptCount === 1 ? 'Attempt' : 'Attempts'}${detail.summary.durationMs !== undefined ? ` · ${formatDuration(detail.summary.durationMs)}` : ''}</p></div></div>
+    <div class="done-grid"><div><p class="eyebrow">Final Worker result</p><div class="result">${escapeHtml(detail.finalWorkerResult ?? 'No bounded final result is available.')}</div></div><div><p class="eyebrow">Reviewer PASS</p><p>${escapeHtml(detail.finalReview?.summary ?? 'No final review summary is available.')}</p><p class="muted">${detail.summary.workerExecutionCount} Worker ${detail.summary.workerExecutionCount === 1 ? 'execution' : 'executions'} · ${detail.summary.workerAttemptCount} historical ${detail.summary.workerAttemptCount === 1 ? 'Attempt' : 'Attempts'}${detail.summary.durationMs !== undefined ? ` · ${formatDuration(detail.summary.durationMs)}` : ''}</p></div></div>
   </article>`).join('') : '<div class="empty"><h2>No completed Jobs</h2><p>Reviewed read-only results will appear here.</p></div>';
   return layout('Done', `<header class="page-head"><div><p class="eyebrow">Reviewed results</p><h1>Done</h1><p>Jobs completed only after an independent Reviewer PASS.</p></div><a class="refresh" href="/done">Refresh</a></header><section class="stack">${content}</section>`, 'done');
 }
@@ -93,7 +99,7 @@ export function renderJobDetail(detail: OperatorJobDetail): string {
     const review = worker.review;
     return `<article class="story-step">
       <div class="step-number">${index + 1}</div><div class="step-body">
-        <p class="eyebrow">Worker Attempt ${worker.attempt.roleSequence}</p>
+        <p class="eyebrow">Historical Worker Attempt ${worker.attempt.roleSequence}</p>
         <h2>${escapeHtml(worker.attempt.status)}</h2>
         <div class="result">${escapeHtml(worker.resultText ?? worker.attempt.failureReason ?? 'No bounded result recorded yet.')}</div>
         ${review ? `<section class="review ${review.decision.toLowerCase()}"><p class="eyebrow">Independent review</p><h3>${escapeHtml(review.decision)}</h3><p>${escapeHtml(review.summary)}</p>${review.feedback ? `<p><strong>Feedback:</strong> ${escapeHtml(review.feedback)}</p>` : ''}</section>` : '<p class="muted">Reviewer decision pending or unavailable.</p>'}
@@ -104,6 +110,7 @@ export function renderJobDetail(detail: OperatorJobDetail): string {
   const escalations = detail.escalations.map(escalation => `<div class="alert ${escalation.resolvedAt ? 'preview' : 'error'}"><strong>${escapeHtml(humanize(escalation.reason))}</strong><br>${escapeHtml(escalation.summary)}${escalation.resolvedAt ? `<br><small>Resolved ${formatTime(escalation.resolvedAt)}${escalation.resolutionSummary ? ` — ${escapeHtml(escalation.resolutionSummary)}` : ''}</small>` : ''}${!escalation.resolvedAt ? renderEscalationActions(detail, escalation.id) : ''}</div>`).join('');
   const guidance = detail.guidance.map(item => `<article class="story-step"><div class="step-number">H</div><div class="step-body"><p class="eyebrow">Human guidance</p><div class="result">${escapeHtml(item.instruction)}</div><p class="muted">Applied only to the next fresh Worker Attempt · ${formatTime(item.createdAt)}</p></div></article>`).join('');
   const content = `<a class="back" href="/">← All Jobs</a><header class="detail-head"><div><span class="status ${statusClass(summary)}">${escapeHtml(summary.orchestrationState)}</span><h1>${escapeHtml(summary.job.title)}</h1><p>${escapeHtml(summary.projectName)} · ${escapeHtml(summary.repositoryName)}</p></div><time>Created ${formatTime(summary.job.createdAt)}</time></header>
+    <section class="criteria"><p class="eyebrow">Worker execution budget</p><p><strong>${summary.workerExecutionCount} of 2 consumed</strong> · ${summary.workerAttemptCount} historical Worker ${summary.workerAttemptCount === 1 ? 'Attempt' : 'Attempts'} retained for audit.</p></section>
     <section class="criteria"><p class="eyebrow">Acceptance criteria</p><p>${escapeHtml(detail.acceptanceCriteria)}</p></section>
     ${escalations}<section class="story">${story || '<div class="empty"><h2>Accepted</h2><p>Agent Operations will prepare the first Worker Attempt.</p></div>'}${guidance}</section>
     <section class="final"><p class="eyebrow">Final state</p><h2>${escapeHtml(summary.orchestrationState)}</h2>
@@ -118,14 +125,14 @@ export function renderError(message: string, status = 500): string {
 }
 
 function renderPreview(preview: OperatorTaskPreview): string {
-  return `<div class="alert preview"><strong>Safe preview — no Job or Dispatch created.</strong><br>${escapeHtml(preview.project.name)} / ${escapeHtml(preview.repository.name)} · ${escapeHtml(preview.runtimeAgentId)} · read-only / deny / empty · 2 Worker Attempts · Reviewer enabled</div>`;
+  return `<div class="alert preview"><strong>Safe preview — no Job or Dispatch created.</strong><br>${escapeHtml(preview.project.name)} / ${escapeHtml(preview.repository.name)} · ${escapeHtml(preview.runtimeAgentId)} · read-only / deny / empty · 2 Worker executions · Reviewer enabled</div>`;
 }
 
 function renderJobTable(jobs: readonly OperatorJobSummary[], title: string): string {
   if (!jobs.length) return `<section class="panel"><h2>${escapeHtml(title)}</h2><div class="empty"><p>No matching Jobs.</p></div></section>`;
   return `<section class="panel"><div class="panel-title"><h2>${escapeHtml(title)}</h2><span>${jobs.length}</span></div><div class="job-list">${jobs.map(job => `<a class="job-row" href="/jobs/${encodeURIComponent(job.job.id)}">
     <div><span class="status ${statusClass(job)}">${escapeHtml(job.orchestrationState)}</span><h3>${escapeHtml(job.job.title)}</h3><p>${escapeHtml(job.projectName)} · ${escapeHtml(job.repositoryName)}</p></div>
-    <div class="job-meta"><span>${job.currentRole ? humanize(job.currentRole) : '—'}</span><span>${job.latestAttempt?.executionRole === 'worker' ? `Worker ${job.latestAttempt.roleSequence} of 2` : job.latestAttempt ? `Reviewer ${job.latestAttempt.roleSequence}` : 'Preparing'}</span><span>${escapeHtml(job.currentStage)}</span><time>${formatTime(job.startedAt ?? job.job.createdAt)}</time></div>
+    <div class="job-meta"><span>${job.currentRole ? humanize(job.currentRole) : '—'}</span><span>${job.latestAttempt ? `Worker execution ${job.workerExecutionCount} of 2` : 'Preparing'}</span><span>${escapeHtml(job.currentStage)}</span><time>${formatTime(job.startedAt ?? job.job.createdAt)}</time></div>
   </a>`).join('')}</div></section>`;
 }
 

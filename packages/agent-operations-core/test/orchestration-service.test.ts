@@ -21,6 +21,7 @@ import {
   MVP_OBSERVATION_TIMEOUT_MS,
   OrchestrationService,
   parseReviewerResult,
+  readWorkerExecutionBudget,
 } from '../src/index.js';
 
 const TIME = '2026-08-27T03:00:00.000Z';
@@ -343,6 +344,11 @@ describe('OrchestrationService', () => {
       && request.requestedPolicy.network === 'deny'
       && request.requestedPolicy.environment === 'empty'
       && request.requestedCapabilities.repositoryRead)).toBe(true);
+    expect(await readWorkerExecutionBudget(setup.store, result.workerAttempts, 2)).toMatchObject({
+      consumed: 2,
+      remaining: 0,
+      exhausted: true,
+    });
   });
 
   it('stops after two Worker Attempts and persists a needs-human escalation', async () => {
@@ -366,6 +372,11 @@ describe('OrchestrationService', () => {
       }),
     ]);
     expect(setup.execution.requests).toHaveLength(4);
+    expect(await readWorkerExecutionBudget(setup.store, result.workerAttempts, 2)).toMatchObject({
+      consumed: 2,
+      remaining: 0,
+      exhausted: true,
+    });
   });
 
   it('escalates malformed Reviewer output instead of guessing', async () => {
@@ -457,6 +468,11 @@ describe('OrchestrationService', () => {
     const plan = await setup.store.getExecutionPlanForAttempt(attempt.id);
     expect(plan).not.toBeNull();
     expect(await setup.store.getExecutionDispatchForPlan(plan!.id)).toMatchObject({ status });
+    expect(await readWorkerExecutionBudget(setup.store, result.workerAttempts, 2)).toMatchObject({
+      consumed: 1,
+      remaining: 1,
+      exhausted: false,
+    });
     await setup.service.runJob(JOB_ID);
     expect(setup.execution.requests).toHaveLength(1);
   });
@@ -689,24 +705,48 @@ describe('OrchestrationService', () => {
     expect(setup.execution.requests).toHaveLength(0);
   });
 
-  it('uses policy-blocked guidance to create a fresh Worker after runtime recovery', async () => {
+  it('uses no budget for two policy-blocked preflight Attempts and then executes a fresh Worker', async () => {
     const setup = await harness([
       { kind: 'completed', resultText: CORRECT_RESULT },
       { kind: 'completed', resultText: PASS },
     ], [], false);
     const blocked = await setup.service.runJob(JOB_ID);
-    const blockedAttempt = blocked.workerAttempts[0];
-    const blockedPlan = await setup.store.getExecutionPlanForAttempt(blockedAttempt.id);
-    const escalation = blocked.escalations[0];
-    expect(blockedAttempt.status).toBe('cancelled');
-    expect(blockedPlan).not.toBeNull();
-    expect(await setup.store.getExecutionDispatchForPlan(blockedPlan!.id)).toBeNull();
+    const firstBlockedAttempt = blocked.workerAttempts[0];
+    const firstBlockedPlan = await setup.store.getExecutionPlanForAttempt(firstBlockedAttempt.id);
+    const firstEscalation = blocked.escalations[0];
+    expect(firstBlockedAttempt.status).toBe('cancelled');
+    expect(firstBlockedPlan).not.toBeNull();
+    expect(await setup.store.getExecutionDispatchForPlan(firstBlockedPlan!.id)).toBeNull();
+    expect(setup.execution.requests).toHaveLength(0);
+
+    await setup.store.createHumanGuidanceAndResolveEscalation({
+      id: 'guidance:retry-preflight',
+      jobId: JOB_ID,
+      escalationId: firstEscalation.id,
+      instruction: 'Try a fresh preflight after infrastructure repair.',
+      createdAt: TIME,
+    }, TIME);
+    const blockedAgain = await setup.service.runJob(JOB_ID);
+    const secondBlockedAttempt = blockedAgain.workerAttempts[1];
+    const secondBlockedPlan = await setup.store.getExecutionPlanForAttempt(secondBlockedAttempt.id);
+    const secondEscalation = blockedAgain.escalations.find(candidate => !candidate.resolvedAt)!;
+    expect(blockedAgain.workerAttempts).toHaveLength(2);
+    expect(secondBlockedAttempt).toMatchObject({ roleSequence: 2, status: 'cancelled' });
+    expect(secondBlockedAttempt.id).not.toBe(firstBlockedAttempt.id);
+    expect(secondBlockedPlan).not.toBeNull();
+    expect(secondBlockedPlan!.id).not.toBe(firstBlockedPlan!.id);
+    expect(await setup.store.getExecutionDispatchForPlan(secondBlockedPlan!.id)).toBeNull();
+    expect(await readWorkerExecutionBudget(setup.store, blockedAgain.workerAttempts, 2)).toMatchObject({
+      consumed: 0,
+      remaining: 2,
+      exhausted: false,
+    });
     expect(setup.execution.requests).toHaveLength(0);
 
     await setup.store.createHumanGuidanceAndResolveEscalation({
       id: 'guidance:runtime-recovered',
       jobId: JOB_ID,
-      escalationId: escalation.id,
+      escalationId: secondEscalation.id,
       instruction: 'The runtime is now available. Continue under the original read-only policy.',
       createdAt: TIME,
     }, TIME);
@@ -746,17 +786,104 @@ describe('OrchestrationService', () => {
     const result = await resumed.runJob(JOB_ID);
     expect(result.finalDecision).toBe('PASS');
     expect(result.job.status).toBe('completed');
-    expect(result.workerAttempts).toHaveLength(2);
-    expect(result.workerAttempts.map(attempt => attempt.status)).toEqual(['cancelled', 'completed']);
-    expect(result.workerAttempts[1].id).not.toBe(blockedAttempt.id);
+    expect(result.workerAttempts).toHaveLength(3);
+    expect(result.workerAttempts.map(attempt => attempt.status)).toEqual(['cancelled', 'cancelled', 'completed']);
+    expect(result.workerAttempts[2].id).not.toBe(firstBlockedAttempt.id);
+    expect(result.workerAttempts[2].id).not.toBe(secondBlockedAttempt.id);
     expect(result.reviewerAttempts).toHaveLength(1);
     expect(setup.execution.requests).toHaveLength(2);
     expect(setup.execution.requests[0].input.instruction).toContain(
       '<human_guidance>\nThe runtime is now available. Continue under the original read-only policy.\n</human_guidance>',
     );
     expect(new Set(setup.execution.requests.map(request => request.executionPlanId)).size).toBe(2);
-    expect(await setup.store.getExecutionPlan(blockedPlan!.id)).toMatchObject({ attemptId: blockedAttempt.id });
+    expect(await setup.store.getExecutionPlan(firstBlockedPlan!.id)).toMatchObject({
+      attemptId: firstBlockedAttempt.id,
+    });
+    expect(await setup.store.getExecutionPlan(secondBlockedPlan!.id)).toMatchObject({
+      attemptId: secondBlockedAttempt.id,
+    });
+    expect(await setup.store.getExecutionDispatchForPlan(firstBlockedPlan!.id)).toBeNull();
+    expect(await setup.store.getExecutionDispatchForPlan(secondBlockedPlan!.id)).toBeNull();
+    expect(await readWorkerExecutionBudget(setup.store, result.workerAttempts, 2)).toMatchObject({
+      consumed: 1,
+      remaining: 1,
+      exhausted: false,
+    });
+  });
+
+  it('returns a human-guided continuation to Needs Me after Reviewer revision without another Worker', async () => {
+    const setup = await harness([
+      { kind: 'completed', resultText: WRONG_RESULT },
+      { kind: 'completed', resultText: REVISION },
+    ], [], false);
+    const blocked = await setup.service.runJob(JOB_ID);
+    const blockedWorker = blocked.workerAttempts[0];
+    const blockedPlan = await setup.store.getExecutionPlanForAttempt(blockedWorker.id);
+    await setup.store.createHumanGuidanceAndResolveEscalation({
+      id: 'guidance:single-worker-continuation',
+      jobId: JOB_ID,
+      escalationId: blocked.escalations[0].id,
+      instruction: 'The runtime is healthy. Execute exactly one fresh Worker and review it.',
+      createdAt: TIME,
+    }, TIME);
+    const healthyRuntime = new FakeAgentRuntimeAdapter([{
+      id: RUNTIME_ID,
+      name: 'rehearsal',
+      organization: 'agent-operations',
+      provider: 'codex',
+      enabled: true,
+      configured: true,
+      capabilities: [
+        'session-resume',
+        'exact-turn-correlation',
+        'execution-working-directory',
+        'repository-read-tools',
+        'filesystem-read-only',
+        'network-denial',
+        'environment-empty',
+      ],
+      health: { state: 'running' },
+      observedAt: TIME,
+    }]);
+    const resumed = new OrchestrationService(
+      setup.store,
+      healthyRuntime,
+      setup.repositories,
+      setup.execution,
+      setup.observer,
+      {
+        now: () => new Date(TIME),
+        observationIntervalMs: 0,
+        observationTimeoutMs: 0,
+        sleep: async () => undefined,
+      },
+    );
+
+    const result = await resumed.runJob(JOB_ID);
+
+    expect(result.finalDecision).toBe('ESCALATED');
+    expect(result.workerAttempts).toHaveLength(2);
+    expect(result.workerAttempts.map(attempt => attempt.status)).toEqual(['cancelled', 'completed']);
+    expect(result.reviewerAttempts).toHaveLength(1);
+    expect(result.reviews).toEqual([expect.objectContaining({ decision: 'REVISION_REQUIRED' })]);
+    expect(result.escalations.filter(escalation => !escalation.resolvedAt)).toEqual([
+      expect.objectContaining({
+        reason: 'human_judgment_required',
+        attemptId: result.workerAttempts[1].id,
+        reviewId: result.reviews[0].id,
+        summary: expect.stringContaining('one Worker execution authorized by Human Guidance'),
+      }),
+    ]);
+    expect(setup.execution.requests).toHaveLength(2);
+    expect(result.workerAttempts[1].id).not.toBe(blockedWorker.id);
+    expect((await setup.store.getExecutionPlanForAttempt(result.workerAttempts[1].id))!.id)
+      .not.toBe(blockedPlan!.id);
     expect(await setup.store.getExecutionDispatchForPlan(blockedPlan!.id)).toBeNull();
+    expect(await readWorkerExecutionBudget(setup.store, result.workerAttempts, 2)).toMatchObject({
+      consumed: 1,
+      remaining: 1,
+      exhausted: false,
+    });
   });
 
   it('previews without creating Attempts, Plans, Dispatches, Reviews, or Escalations', async () => {

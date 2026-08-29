@@ -30,6 +30,7 @@ import { ExecutionPlanningService } from './execution-planning-service.js';
 import { ExecutionPreflightService } from './execution-preflight-service.js';
 import { JobLifecycleService } from './job-lifecycle-service.js';
 import { ManualDispatchService, type ManualDispatchOutcome } from './manual-dispatch-service.js';
+import { readWorkerExecutionBudget } from './worker-execution-budget.js';
 
 export const MVP_MAX_WORKER_ATTEMPTS = 2;
 export const MVP_MAX_REVIEWER_PASSES_PER_ATTEMPT = 1;
@@ -238,6 +239,11 @@ export class OrchestrationService {
       }
 
       const workers = attempts.filter(attempt => attempt.executionRole === 'worker');
+      const workerBudget = await readWorkerExecutionBudget(
+        this.store,
+        attempts,
+        MVP_MAX_WORKER_ATTEMPTS,
+      );
       const reviewers = attempts.filter(attempt => attempt.executionRole === 'reviewer');
       const latestWorker = workers.at(-1);
       if (!latestWorker) {
@@ -250,7 +256,7 @@ export class OrchestrationService {
       if (latestWorker.status !== 'completed') {
         const guidance = await this.policyBlockedGuidanceFor(job.id, latestWorker.id);
         if (latestWorker.status === 'cancelled' && guidance
-          && workers.length < MVP_MAX_WORKER_ATTEMPTS) {
+          && !workerBudget.exhausted) {
           await this.lifecycle.createAttempt(job.id, {
             runtimeAgentId: workerRuntimeAgentId,
             executionRole: 'worker',
@@ -303,11 +309,22 @@ export class OrchestrationService {
           );
           return this.readModel(job.id, 'ESCALATED');
         }
-        if (workers.length >= MVP_MAX_WORKER_ATTEMPTS) {
+        if (review.decision === 'REVISION_REQUIRED'
+          && await this.isHumanGuidedWorkerAttempt(job.id, latestWorker)) {
+          await this.escalate(
+            job.id,
+            'human_judgment_required',
+            `Reviewer requested revision after the one Worker execution authorized by Human Guidance: ${review.feedback ?? review.summary}`,
+            latestWorker.id,
+            review.id,
+          );
+          return this.readModel(job.id, 'ESCALATED');
+        }
+        if (workerBudget.exhausted) {
           await this.escalate(
             job.id,
             'review_failed_after_budget',
-            `Worker Attempt budget of ${MVP_MAX_WORKER_ATTEMPTS} is exhausted.`,
+            `Worker execution budget of ${MVP_MAX_WORKER_ATTEMPTS} is exhausted.`,
             latestWorker.id,
             review.id,
           );
@@ -332,7 +349,7 @@ export class OrchestrationService {
       }
       if (reviewer.status !== 'completed') {
         const guidance = await this.guidanceFor(job.id, reviewer.id);
-        if (guidance && workers.length < MVP_MAX_WORKER_ATTEMPTS) {
+        if (guidance && !workerBudget.exhausted) {
           await this.lifecycle.createAttempt(job.id, {
             runtimeAgentId: workerRuntimeAgentId,
             executionRole: 'worker',
@@ -880,6 +897,29 @@ export class OrchestrationService {
     })?.instruction;
   }
 
+  private async isHumanGuidedWorkerAttempt(
+    jobId: string,
+    attempt: DurableJobAttempt,
+  ): Promise<boolean> {
+    if (attempt.executionRole !== 'worker') return false;
+    const [attempts, escalations, guidance] = await Promise.all([
+      this.store.listAttemptsForJob(jobId),
+      this.store.listEscalations(jobId),
+      this.store.listHumanGuidance(jobId),
+    ]);
+    for (const item of guidance) {
+      const escalation = escalations.find(candidate => candidate.id === item.escalationId);
+      const sourceAttempt = escalation?.attemptId
+        ? attempts.find(candidate => candidate.id === escalation.attemptId)
+        : undefined;
+      if (!sourceAttempt) continue;
+      const nextWorker = attempts.find(candidate => candidate.executionRole === 'worker'
+        && candidate.sequence > sourceAttempt.sequence);
+      if (nextWorker?.id === attempt.id) return true;
+    }
+    return false;
+  }
+
   private async policyBlockedGuidanceFor(
     jobId: string,
     attemptId: string,
@@ -933,8 +973,13 @@ export class OrchestrationService {
     if (attempts.some(attempt => attempt.status === 'created' || attempt.status === 'running')) {
       findings.push('Job already has active execution state requiring reconciliation');
     }
-    if (attempts.filter(attempt => attempt.executionRole === 'worker').length >= MVP_MAX_WORKER_ATTEMPTS) {
-      findings.push('Worker Attempt budget is already exhausted');
+    const workerBudget = await readWorkerExecutionBudget(
+      this.store,
+      attempts,
+      MVP_MAX_WORKER_ATTEMPTS,
+    );
+    if (workerBudget.exhausted) {
+      findings.push('Worker execution budget is already exhausted');
     }
     if ((await this.store.listEscalations(job.id, true)).length > 0) {
       findings.push('Job already has an unresolved Escalation');

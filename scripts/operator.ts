@@ -8,6 +8,11 @@ import {
   type OperatorJobList,
 } from '../packages/agent-operations-application/src/index.js';
 import { SqliteAgentOperationsStateStore } from '../packages/sqlite-state-adapter/src/index.js';
+import {
+  TelegramOperatorNotifier,
+  loadAgentOperationsTelegramEnvironmentFile,
+  loadTelegramOperatorNotificationConfig,
+} from '../packages/telegram-notification-adapter/src/index.js';
 
 async function main(): Promise<void> {
   const store = SqliteAgentOperationsStateStore.open();
@@ -20,7 +25,10 @@ async function main(): Promise<void> {
       new CortextOSExecutionAdapter(),
       new CortextOSExecutionObserver(),
     );
-    const application = new OperatorApplicationService(store, orchestration, { runtime });
+    const application = new OperatorApplicationService(store, orchestration, {
+      runtime,
+      notifier: loadNotifier(),
+    });
     const [command = 'help', ...args] = process.argv.slice(2);
     if (command === 'projects') {
       const projects = await application.listProjects();
@@ -182,6 +190,17 @@ function printHelp(): void {
 
 Run is preview-only by default. Live execution additionally requires:
   --execute --confirm ORCHESTRATE`);
+}
+
+function loadNotifier() {
+  try {
+    loadAgentOperationsTelegramEnvironmentFile();
+    const config = loadTelegramOperatorNotificationConfig();
+    return config ? new TelegramOperatorNotifier(config) : undefined;
+  } catch (error) {
+    console.warn(`Agent Operations Telegram notifications disabled: ${error instanceof Error ? error.message : String(error)}`);
+    return undefined;
+  }
 }
 
 main().catch(error => {

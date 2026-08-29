@@ -65,6 +65,8 @@ export interface OperatorJobSummary {
   readonly currentRole: ExecutionRole | null;
   readonly orchestrationState: string;
   readonly workerAttemptCount: number;
+  /** Worker Attempts that crossed, or may have crossed, provider submission. */
+  readonly workerExecutionCount: number;
   readonly latestReviewDecision: AttemptReviewDecision | null;
   readonly needsHuman: boolean;
   readonly operatorRun: DurableOperatorRun | null;

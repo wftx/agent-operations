@@ -116,15 +116,46 @@ describe('OperatorWebApplication', () => {
     expect(bodies[2]).toContain('Cancel Job');
     expect(bodies[3]).toContain('Final answer: PASS / REVISION_REQUIRED / ESCALATE');
     expect(bodies[3]).toContain('All acceptance criteria are satisfied.');
-    expect(bodies[3]).toContain('2 Worker Attempts');
-    expect(bodies[4]).toContain('Worker Attempt 1');
+    expect(bodies[3]).toContain('2 Worker executions');
+    expect(bodies[3]).toContain('2 historical Attempts');
+    expect(bodies[4]).toContain('2 of 2 consumed');
+    expect(bodies[4]).toContain('Historical Worker Attempt 1');
     expect(bodies[4]).toContain('REVISION_REQUIRED');
-    expect(bodies[4]).toContain('Worker Attempt 2');
+    expect(bodies[4]).toContain('Historical Worker Attempt 2');
     expect(bodies[4]).toContain('PASS');
     const escalationDetail = await app.handle(new Request(`http://127.0.0.1/jobs/${encodeURIComponent(SUMMARY_ESCALATED.job.id)}`));
     expect(await escalationDetail.text()).toContain('Choose whether to revise the task.');
     expect(service.previewCalls).toBe(0);
     expect(service.runCalls).toBe(0);
+  });
+
+  it('shows retained preflight history separately from the Worker execution budget', async () => {
+    const service = new StubOperatorApplication();
+    const cancelledOne = { ...WORKER_ONE, status: 'cancelled' as const, summary: undefined };
+    const cancelledTwo = { ...WORKER_TWO, status: 'cancelled' as const, summary: undefined };
+    service.getJobDetail = async () => ({
+      ...ESCALATED_DETAIL,
+      summary: {
+        ...SUMMARY_ESCALATED,
+        latestAttempt: cancelledTwo,
+        workerAttemptCount: 2,
+        workerExecutionCount: 0,
+      },
+      workerAttempts: [
+        { attempt: cancelledOne, executionPlanId: 'plan:preflight-1' },
+        { attempt: cancelledTwo, executionPlanId: 'plan:preflight-2' },
+      ],
+    });
+
+    const response = await new OperatorWebApplication(service)
+      .handle(new Request(`http://127.0.0.1/jobs/${encodeURIComponent(SUMMARY_ESCALATED.job.id)}`));
+    const body = await response.text();
+
+    expect(body).toContain('0 of 2 consumed');
+    expect(body).toContain('2 historical Worker Attempts retained for audit');
+    expect(body).toContain('Historical Worker Attempt 1');
+    expect(body).toContain('Historical Worker Attempt 2');
+    expect(body).toContain('Provide Guidance + Continue');
   });
 
   it('renders late observation reconciliation as a no-resend explicit action', async () => {
@@ -224,6 +255,17 @@ describe('OperatorWebApplication', () => {
     }
   });
 
+  it('shows Telegram configuration status without exposing configuration values', async () => {
+    const service = new StubOperatorApplication();
+    const response = await new OperatorWebApplication(service, { telegramConfigured: true })
+      .handle(new Request('http://127.0.0.1/'));
+    const body = await response.text();
+    expect(body).toContain('Notifications');
+    expect(body).toContain('Telegram: Configured');
+    expect(body).not.toContain('AO_TELEGRAM_BOT_TOKEN');
+    expect(body).not.toContain('AO_TELEGRAM_CHAT_ID');
+  });
+
   it('keeps preview non-executing and makes Run the only execution entry', async () => {
     const service = new StubOperatorApplication();
     const app = new OperatorWebApplication(service);
@@ -302,6 +344,7 @@ function summary(
     currentRole: state.includes('Reviewer') ? 'reviewer' : state.includes('Worker') ? 'worker' : null,
     orchestrationState: state,
     workerAttemptCount: status === 'completed' ? 2 : 0,
+    workerExecutionCount: status === 'completed' ? 2 : 0,
     latestReviewDecision: status === 'completed' ? 'PASS' : null,
     needsHuman,
     operatorRun: {

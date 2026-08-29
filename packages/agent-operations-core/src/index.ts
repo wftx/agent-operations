@@ -55,3 +55,8 @@ export {
   type OrchestrationServiceOptions,
   type TimedOutExecutionReconciliation,
 } from './orchestration-service.js';
+export {
+  dispatchConsumesWorkerExecutionBudget,
+  readWorkerExecutionBudget,
+  type WorkerExecutionBudget,
+} from './worker-execution-budget.js';

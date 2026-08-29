@@ -5,10 +5,17 @@ import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { DurableProjectConfiguration } from '../../agent-operations-contracts/src/index.js';
 import {
+  REPOSITORY_READ_EXECUTION_CAPABILITIES,
+  RESTRICTED_TEXT_EXECUTION_POLICY,
   createExecutionDispatchIdempotencyKey,
   createExecutionObservationId,
   createRepositoryCheckoutBindingId,
 } from '../../agent-operations-contracts/src/index.js';
+import {
+  ExecutionPlanningService,
+  JobLifecycleService,
+  readWorkerExecutionBudget,
+} from '../../agent-operations-core/src/index.js';
 import { SqliteAgentOperationsStateStore } from '../src/index.js';
 
 const TIME = '2026-08-27T04:00:00.000Z';
@@ -63,6 +70,71 @@ function configuration(): DurableProjectConfiguration {
 }
 
 describe('SQLite orchestration persistence', () => {
+  it('reopens historical cancelled preflight Attempts without rewriting or charging them', async () => {
+    const path = databasePath();
+    const initial = open(path);
+    await initial.applyProjectConfiguration(configuration());
+    const lifecycle = new JobLifecycleService(initial, {
+      now: () => new Date(TIME),
+      jobIdFactory: () => 'job:cancelled-preflight-history',
+      attemptIdFactory: (() => {
+        let sequence = 0;
+        return () => `attempt:cancelled-preflight:${++sequence}`;
+      })(),
+    });
+    const draft = await lifecycle.createJob({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      preferredRuntimeAgentId: RUNTIME_ID,
+      title: 'Historical preflight failures',
+      acceptanceCriteria: 'Read-only result required.',
+      automaticReadOnlyCompletion: true,
+    });
+    await lifecycle.markJobReady(draft.id);
+    const planning = new ExecutionPlanningService(initial, {
+      now: () => new Date(TIME),
+      planIdFactory: (() => {
+        let sequence = 0;
+        return () => `plan:cancelled-preflight:${++sequence}`;
+      })(),
+    });
+    for (let index = 0; index < 2; index += 1) {
+      const attempt = await lifecycle.createAttempt(draft.id, {
+        runtimeAgentId: RUNTIME_ID,
+        executionRole: 'worker',
+      });
+      await planning.prepareExecutionPlan({
+        projectId: PROJECT_ID,
+        attemptId: attempt.id,
+        instruction: 'Read only.',
+        requestedPolicy: RESTRICTED_TEXT_EXECUTION_POLICY,
+        requestedCapabilities: REPOSITORY_READ_EXECUTION_CAPABILITIES,
+      });
+      await lifecycle.cancelAttempt(attempt.id);
+    }
+    const originalAttempts = await initial.listAttemptsForJob(draft.id);
+    await initial.close();
+
+    const reopened = open(path);
+    const reopenedAttempts = await reopened.listAttemptsForJob(draft.id);
+    expect(reopenedAttempts).toEqual(originalAttempts);
+    expect(reopenedAttempts).toEqual([
+      expect.objectContaining({ roleSequence: 1, status: 'cancelled' }),
+      expect.objectContaining({ roleSequence: 2, status: 'cancelled' }),
+    ]);
+    expect(await readWorkerExecutionBudget(reopened, reopenedAttempts, 2)).toMatchObject({
+      consumed: 0,
+      remaining: 2,
+      exhausted: false,
+    });
+    for (const attempt of reopenedAttempts) {
+      const plan = await reopened.getExecutionPlanForAttempt(attempt.id);
+      expect(plan).not.toBeNull();
+      expect(await reopened.getExecutionDispatchForPlan(plan!.id)).toBeNull();
+    }
+    await reopened.close();
+  });
+
   it('migrates populated v8 history to v9 without inventing reviews or escalations', async () => {
     const path = databasePath();
     const v8 = open(path, 8);

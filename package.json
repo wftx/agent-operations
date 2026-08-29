@@ -35,6 +35,7 @@
     "dev:repository-rehearsal": "node --import tsx scripts/repository-rehearsal.ts",
     "dev:orchestrate": "node --import tsx scripts/orchestrate.ts",
     "ao": "node --import tsx scripts/operator.ts",
+    "ao:telegram:test": "node --import tsx scripts/telegram-notification-test.ts",
     "ao:web": "node --import tsx apps/ao-web/src/server.ts",
     "dev:ao-web": "npm run ao:web",
     "build:ao-web": "tsc --project tsconfig.ao-web.json --noEmit",

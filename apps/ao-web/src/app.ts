@@ -13,7 +13,10 @@ import {
 } from './render.js';
 
 export class OperatorWebApplication {
-  constructor(private readonly application: OperatorApplication) {}
+  constructor(
+    private readonly application: OperatorApplication,
+    private readonly options: { readonly telegramConfigured?: boolean } = {},
+  ) {}
 
   async handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -23,6 +26,7 @@ export class OperatorWebApplication {
           await this.application.listProjects(),
           await this.application.listJobs('all'),
           await this.application.getRuntimeStatus(),
+          { telegramConfigured: this.options.telegramConfigured ?? false },
         ));
       }
       if (request.method === 'GET' && url.pathname === '/running') {
@@ -87,7 +91,7 @@ export class OperatorWebApplication {
           await this.application.listProjects(),
           await this.application.listJobs('all'),
           await this.application.getRuntimeStatus(),
-          { preview, input },
+          { preview, input, telegramConfigured: this.options.telegramConfigured ?? false },
         ));
       }
       if (textValue(form, 'intent') !== 'run') throw new Error('Unsupported Job submission intent');
@@ -98,7 +102,7 @@ export class OperatorWebApplication {
         await this.application.listProjects(),
         await this.application.listJobs('all'),
         await this.application.getRuntimeStatus(),
-        { error: message(error), input },
+        { error: message(error), input, telegramConfigured: this.options.telegramConfigured ?? false },
       ), 400);
     }
   }
