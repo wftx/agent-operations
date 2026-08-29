@@ -570,7 +570,10 @@ export class OrchestrationService {
           inserted: 0, duplicates: 0, ignoredUnrelated: 0, alreadyReconciled: true,
         };
       }
-      if (existing.outcome === 'failed' && evidence.kind === 'runtime-crashed') {
+      if (existing.outcome === 'failed'
+        && (evidence.kind === 'runtime-crashed'
+          || (isExactCompletionObservation(evidence)
+            && (!evidence.resultText || !isBoundedExecutionResult(evidence.resultText))))) {
         await this.resolveAttempt(attempt, evidence, 'failed', undefined, existing.reason!);
         return {
           status: 'failed', jobId: attempt.jobId, attemptId: attempt.id,
@@ -601,14 +604,23 @@ export class OrchestrationService {
       isExactCompletionObservation(candidate)
       && candidate.externalReference === dispatch.externalReference);
     if (exactCompletion) {
-      if (!exactCompletion.resultText || !isBoundedExecutionResult(exactCompletion.resultText)
-        || !await this.trustedLateEvidence(plan, dispatch, exactCompletion)) {
+      if (!await this.trustedLateEvidence(plan, dispatch, exactCompletion)) {
         return {
           status: 'unresolved', jobId: attempt.jobId, attemptId: attempt.id,
           dispatchId: dispatch.id,
-          message: 'Late completion evidence did not satisfy the exact repository, policy, capability, and result boundary.',
+          message: 'Late completion evidence did not satisfy the exact repository, policy, and capability boundary.',
           inserted: observed.inserted, duplicates: observed.duplicates,
           ignoredUnrelated: observed.ignoredUnrelated,
+        };
+      }
+      if (!exactCompletion.resultText || !isBoundedExecutionResult(exactCompletion.resultText)) {
+        const reason = 'The exact accepted execution terminated without a valid bounded result.';
+        await this.resolveAttempt(attempt, exactCompletion, 'failed', undefined, reason);
+        return {
+          status: 'failed', jobId: attempt.jobId, attemptId: attempt.id,
+          dispatchId: dispatch.id, reason,
+          inserted: observed.inserted, duplicates: observed.duplicates,
+          ignoredUnrelated: observed.ignoredUnrelated, alreadyReconciled: false,
         };
       }
       await this.resolveAttempt(

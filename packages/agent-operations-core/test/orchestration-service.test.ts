@@ -998,7 +998,6 @@ describe('OrchestrationService', () => {
       resultText: CORRECT_RESULT,
       policy: { version: 1 as const, filesystem: 'workspace-write' as const, network: 'deny' as const, environment: 'empty' as const },
     }],
-    ['missing bounded result', { kind: 'completed' as const }],
   ])('fails closed for late %s evidence', async (_label, fixture) => {
     const setup = await harness([]);
     const timedOut = await setup.service.runJob(JOB_ID);
@@ -1016,6 +1015,36 @@ describe('OrchestrationService', () => {
     expect(await setup.store.getAttempt(worker.id)).toMatchObject({ status: 'running' });
     expect(await setup.store.getAttemptOutcomeDecision(worker.id)).toBeNull();
     expect((await setup.store.getEscalation(escalation.id))?.resolvedAt).toBeUndefined();
+    expect(setup.execution.requests).toHaveLength(1);
+  });
+
+  it('fails a timed-out Attempt when exact terminal evidence has no bounded result', async () => {
+    const setup = await harness([]);
+    const timedOut = await setup.service.runJob(JOB_ID);
+    const escalation = timedOut.escalations[0];
+    const worker = timedOut.workerAttempts[0];
+    const lateObserver = new ScriptedObservationAdapter([{ kind: 'completed' }]);
+    const reconciler = new OrchestrationService(
+      setup.store, setup.runtimes, setup.repositories, setup.execution, lateObserver,
+      { now: () => new Date(TIME), outcomeDecisionIdFactory: () => 'outcome:missing-result' },
+    );
+
+    const result = await reconciler.reconcileTimedOutExecution(escalation.id);
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      attemptId: worker.id,
+      reason: 'The exact accepted execution terminated without a valid bounded result.',
+    });
+    expect(await setup.store.getAttempt(worker.id)).toMatchObject({ status: 'failed' });
+    expect(await setup.store.getAttemptOutcomeDecision(worker.id)).toMatchObject({
+      outcome: 'failed',
+      evidenceObservationId: expect.any(String),
+    });
+    expect(setup.execution.requests).toHaveLength(1);
+
+    const repeated = await reconciler.reconcileTimedOutExecution(escalation.id);
+    expect(repeated).toMatchObject({ status: 'failed', alreadyReconciled: true });
     expect(setup.execution.requests).toHaveLength(1);
   });
 
