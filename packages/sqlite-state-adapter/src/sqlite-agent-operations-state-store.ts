@@ -44,6 +44,10 @@ import type {
   OperatorNotificationDeliveryStatus,
   OperatorNotificationKind,
   OperatorRunStatus,
+  DurableRepositoryWorkspace,
+  JobExecutionMode,
+  RepositoryWorkspaceState,
+  RuntimeToolOperation,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   createRepositoryCheckoutBindingId,
@@ -125,6 +129,7 @@ interface JobRow {
   description: string | null;
   acceptance_criteria?: string | null;
   automatic_read_only_completion?: number;
+  execution_mode?: JobExecutionMode;
   status: JobStatus;
   repository_id: string | null;
   preferred_runtime_agent_id: string | null;
@@ -159,6 +164,7 @@ interface ExecutionPlanRow {
   runtime_agent_id: string;
   repository_id: string | null;
   checkout_binding_id: string | null;
+  repository_workspace_id?: string | null;
   input_version: 1;
   instruction: string;
   requested_policy_version?: 1 | null;
@@ -167,6 +173,9 @@ interface ExecutionPlanRow {
   requested_environment?: RuntimeEnvironmentPolicy | null;
   requested_capabilities_version?: 1 | null;
   requested_repository_read?: number | null;
+  requested_repository_patch?: number | null;
+  requested_test_run?: number | null;
+  requested_git_inspect?: number | null;
   job_revision: number;
   attempt_revision: number;
   created_at: string;
@@ -186,6 +195,9 @@ interface ExecutionDispatchRow {
   effective_environment?: RuntimeEnvironmentPolicy | null;
   effective_capabilities_version?: 1 | null;
   effective_repository_read?: number | null;
+  effective_repository_patch?: number | null;
+  effective_test_run?: number | null;
+  effective_git_inspect?: number | null;
   external_reference: string | null;
   message: string | null;
   revision: number;
@@ -216,10 +228,33 @@ interface ExecutionObservationRow {
   effective_network?: RuntimeNetworkPolicy | null;
   effective_environment?: RuntimeEnvironmentPolicy | null;
   repository_read_root?: string | null;
+  repository_write_root?: string | null;
   effective_capabilities_version?: 1 | null;
   effective_repository_read?: number | null;
+  effective_repository_patch?: number | null;
+  effective_test_run?: number | null;
+  effective_git_inspect?: number | null;
+  tool_operations_json?: string | null;
   observed_at: string;
   recorded_at: string;
+}
+
+interface RepositoryWorkspaceRow {
+  id: string;
+  job_id: string;
+  project_id: string;
+  repository_id: string;
+  source_checkout_binding_id: string;
+  base_revision: string;
+  base_branch: string | null;
+  branch_name: string;
+  canonical_path: string;
+  state: RepositoryWorkspaceState;
+  evidence_json: string | null;
+  failure_reason: string | null;
+  revision: number;
+  created_at: string;
+  updated_at: string;
 }
 
 interface AttemptReviewRow {
@@ -374,6 +409,9 @@ function toJob(row: JobRow): DurableJob {
     ...(row.automatic_read_only_completion === 1
       ? { automaticReadOnlyCompletion: true }
       : {}),
+    ...(row.execution_mode === 'repository-write-isolated'
+      ? { executionMode: row.execution_mode }
+      : {}),
     status: row.status,
     ...(row.repository_id ? { repositoryId: row.repository_id } : {}),
     ...(row.preferred_runtime_agent_id
@@ -414,6 +452,9 @@ function toExecutionPlan(row: ExecutionPlanRow): DurableExecutionPlan {
     runtimeAgentId: row.runtime_agent_id,
     ...(row.repository_id ? { repositoryId: row.repository_id } : {}),
     ...(row.checkout_binding_id ? { checkoutBindingId: row.checkout_binding_id } : {}),
+    ...(row.repository_workspace_id
+      ? { repositoryWorkspaceId: row.repository_workspace_id }
+      : {}),
     input: { version: row.input_version, instruction: row.instruction },
     ...(row.requested_policy_version && row.requested_filesystem
       && row.requested_network && row.requested_environment
@@ -432,6 +473,9 @@ function toExecutionPlan(row: ExecutionPlanRow): DurableExecutionPlan {
           requestedCapabilities: {
             version: row.requested_capabilities_version,
             repositoryRead: row.requested_repository_read === 1,
+            ...(row.requested_repository_patch === 1 ? { repositoryPatch: true } : {}),
+            ...(row.requested_test_run === 1 ? { testRun: true } : {}),
+            ...(row.requested_git_inspect === 1 ? { gitInspect: true } : {}),
           },
         }
       : {}),
@@ -467,6 +511,9 @@ function toExecutionDispatch(row: ExecutionDispatchRow): DurableExecutionDispatc
           effectiveCapabilities: {
             version: row.effective_capabilities_version,
             repositoryRead: row.effective_repository_read === 1,
+            ...(row.effective_repository_patch === 1 ? { repositoryPatch: true } : {}),
+            ...(row.effective_test_run === 1 ? { testRun: true } : {}),
+            ...(row.effective_git_inspect === 1 ? { gitInspect: true } : {}),
           },
         }
       : {}),
@@ -501,6 +548,7 @@ function toExecutionObservation(row: ExecutionObservationRow): DurableExecutionO
           executionContext: {
             workingDirectory: row.execution_working_directory,
             ...(row.repository_read_root ? { repositoryReadRoot: row.repository_read_root } : {}),
+            ...(row.repository_write_root ? { repositoryWriteRoot: row.repository_write_root } : {}),
           },
         }
       : {}),
@@ -521,11 +569,39 @@ function toExecutionObservation(row: ExecutionObservationRow): DurableExecutionO
           effectiveCapabilities: {
             version: row.effective_capabilities_version,
             repositoryRead: row.effective_repository_read === 1,
+            ...(row.effective_repository_patch === 1 ? { repositoryPatch: true } : {}),
+            ...(row.effective_test_run === 1 ? { testRun: true } : {}),
+            ...(row.effective_git_inspect === 1 ? { gitInspect: true } : {}),
           },
         }
       : {}),
+    ...(row.tool_operations_json
+      ? { toolOperations: JSON.parse(row.tool_operations_json) as RuntimeToolOperation[] }
+      : {}),
     observedAt: row.observed_at,
     recordedAt: row.recorded_at,
+  };
+}
+
+function toRepositoryWorkspace(row: RepositoryWorkspaceRow): DurableRepositoryWorkspace {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    projectId: row.project_id,
+    repositoryId: row.repository_id,
+    sourceCheckoutBindingId: row.source_checkout_binding_id,
+    baseRevision: row.base_revision,
+    ...(row.base_branch ? { baseBranch: row.base_branch } : {}),
+    branchName: row.branch_name,
+    canonicalPath: row.canonical_path,
+    state: row.state,
+    ...(row.evidence_json
+      ? { evidence: JSON.parse(row.evidence_json) as DurableRepositoryWorkspace['evidence'] }
+      : {}),
+    ...(row.failure_reason ? { failureReason: row.failure_reason } : {}),
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -625,6 +701,19 @@ function isValidOperatorRunTransition(from: OperatorRunStatus, to: OperatorRunSt
     || from === 'needs_human' && (to === 'pending' || to === 'cancelled');
 }
 
+function isValidRepositoryWorkspaceTransition(
+  from: RepositoryWorkspaceState,
+  to: RepositoryWorkspaceState,
+): boolean {
+  return from === 'preparing' && (to === 'active' || to === 'failed' || to === 'cancelled')
+    || from === 'active' && (to === 'reviewing' || to === 'failed' || to === 'cancelled')
+    || from === 'reviewing' && (to === 'active' || to === 'ready_for_approval' || to === 'failed' || to === 'cleanup_pending' || to === 'cancelled')
+    || from === 'ready_for_approval' && (to === 'failed' || to === 'cleanup_pending' || to === 'cancelled')
+    || from === 'failed' && (to === 'cleanup_pending' || to === 'cancelled')
+    || from === 'cancelled' && to === 'cleanup_pending'
+    || from === 'cleanup_pending' && (to === 'cleaned' || to === 'failed');
+}
+
 export class SqliteAgentOperationsStateStore implements AgentOperationsStateStore {
   readonly databasePath: string;
   private readonly database: Database.Database;
@@ -635,6 +724,7 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
   private readonly supportsOrchestration: boolean;
   private readonly supportsDailyOperator: boolean;
   private readonly supportsLateExecutionReconciliation: boolean;
+  private readonly supportsIsolatedWriteWorkspaces: boolean;
 
   private constructor(databasePath: string, database: Database.Database) {
     this.databasePath = databasePath;
@@ -656,6 +746,9 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     ).get() as unknown) !== undefined;
     this.supportsLateExecutionReconciliation = (database.prepare(
       "SELECT 1 FROM pragma_table_info('escalations') WHERE name = 'resolution_summary'",
+    ).get() as unknown) !== undefined;
+    this.supportsIsolatedWriteWorkspaces = (database.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'repository_workspaces'",
     ).get() as unknown) !== undefined;
   }
 
@@ -915,6 +1008,112 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     return row ? toRuntimeObservation(row) : null;
   }
 
+  async createRepositoryWorkspace(workspace: DurableRepositoryWorkspace): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsIsolatedWriteWorkspaces) {
+      throw new Error('Repository Workspaces require Agent Operations schema v12');
+    }
+    if (!workspace.id.startsWith('workspace:') || workspace.state !== 'preparing'
+      || workspace.revision !== 0 || workspace.evidence || workspace.failureReason) {
+      throw new Error(`Invalid new Repository Workspace: ${workspace.id}`);
+    }
+    const job = this.database.prepare(
+      'SELECT project_id, repository_id, execution_mode FROM jobs WHERE id = ?',
+    ).get(workspace.jobId) as {
+      project_id: string;
+      repository_id: string | null;
+      execution_mode: JobExecutionMode;
+    } | undefined;
+    const binding = this.database.prepare(
+      'SELECT repository_id FROM repository_checkouts WHERE id = ?',
+    ).get(workspace.sourceCheckoutBindingId) as { repository_id: string } | undefined;
+    if (!job || job.project_id !== workspace.projectId
+      || job.repository_id !== workspace.repositoryId
+      || job.execution_mode !== 'repository-write-isolated'
+      || binding?.repository_id !== workspace.repositoryId) {
+      throw new Error(`Invalid Repository Workspace associations: ${workspace.id}`);
+    }
+    try {
+      this.database.prepare(`
+        INSERT INTO repository_workspaces
+          (id, job_id, project_id, repository_id, source_checkout_binding_id,
+           base_revision, base_branch, branch_name, canonical_path, state,
+           evidence_json, failure_reason, revision, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        workspace.id, workspace.jobId, workspace.projectId, workspace.repositoryId,
+        workspace.sourceCheckoutBindingId, workspace.baseRevision, workspace.baseBranch ?? null,
+        workspace.branchName, workspace.canonicalPath, workspace.state, null, null,
+        workspace.revision, workspace.createdAt, workspace.updatedAt,
+      );
+    } catch (error) {
+      throw new Error(`Could not create Repository Workspace ${workspace.id}: ${(error as Error).message}`);
+    }
+  }
+
+  async getRepositoryWorkspace(id: string): Promise<DurableRepositoryWorkspace | null> {
+    this.assertOpen();
+    if (!this.supportsIsolatedWriteWorkspaces) return null;
+    const row = this.database.prepare('SELECT * FROM repository_workspaces WHERE id = ?')
+      .get(id) as RepositoryWorkspaceRow | undefined;
+    return row ? toRepositoryWorkspace(row) : null;
+  }
+
+  async getRepositoryWorkspaceForJob(jobId: string): Promise<DurableRepositoryWorkspace | null> {
+    this.assertOpen();
+    if (!this.supportsIsolatedWriteWorkspaces) return null;
+    const row = this.database.prepare('SELECT * FROM repository_workspaces WHERE job_id = ?')
+      .get(jobId) as RepositoryWorkspaceRow | undefined;
+    return row ? toRepositoryWorkspace(row) : null;
+  }
+
+  async listRepositoryWorkspaces(): Promise<readonly DurableRepositoryWorkspace[]> {
+    this.assertOpen();
+    if (!this.supportsIsolatedWriteWorkspaces) return [];
+    return (this.database.prepare('SELECT * FROM repository_workspaces ORDER BY created_at, id')
+      .all() as RepositoryWorkspaceRow[]).map(toRepositoryWorkspace);
+  }
+
+  async saveRepositoryWorkspaceTransition(
+    workspace: DurableRepositoryWorkspace,
+    expectedRevision: number,
+  ): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsIsolatedWriteWorkspaces) {
+      throw new Error('Repository Workspaces require Agent Operations schema v12');
+    }
+    const existing = await this.getRepositoryWorkspace(workspace.id);
+    if (!existing || existing.revision !== expectedRevision
+      || workspace.revision !== expectedRevision + 1
+      || existing.jobId !== workspace.jobId
+      || existing.projectId !== workspace.projectId
+      || existing.repositoryId !== workspace.repositoryId
+      || existing.sourceCheckoutBindingId !== workspace.sourceCheckoutBindingId
+      || existing.baseRevision !== workspace.baseRevision
+      || existing.baseBranch !== workspace.baseBranch
+      || existing.branchName !== workspace.branchName
+      || existing.canonicalPath !== workspace.canonicalPath
+      || existing.createdAt !== workspace.createdAt
+      || !isValidRepositoryWorkspaceTransition(existing.state, workspace.state)) {
+      throw new Error(`Invalid Repository Workspace transition: ${workspace.id}`);
+    }
+    if ((workspace.state === 'failed') !== Boolean(workspace.failureReason)) {
+      throw new Error(`Failed Repository Workspace must record exactly one failure reason: ${workspace.id}`);
+    }
+    const result = this.database.prepare(`
+      UPDATE repository_workspaces SET
+        state = ?, evidence_json = ?, failure_reason = ?, revision = ?, updated_at = ?
+      WHERE id = ? AND revision = ?
+    `).run(
+      workspace.state, workspace.evidence ? JSON.stringify(workspace.evidence) : null,
+      workspace.failureReason ?? null, workspace.revision, workspace.updatedAt,
+      workspace.id, expectedRevision,
+    );
+    if (result.changes !== 1) {
+      throw new Error(`Repository Workspace transition conflict: ${workspace.id}`);
+    }
+  }
+
   async createJob(job: DurableJob): Promise<void> {
     this.assertOpen();
     requireNonEmpty(job.title, 'Job title');
@@ -926,6 +1125,10 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     if (!this.supportsOrchestration
       && (job.acceptanceCriteria !== undefined || job.automaticReadOnlyCompletion === true)) {
       throw new Error('Job orchestration fields require Agent Operations schema v9');
+    }
+    const executionMode = job.executionMode ?? 'repository-read-only';
+    if (!this.supportsIsolatedWriteWorkspaces && executionMode !== 'repository-read-only') {
+      throw new Error('Isolated repository write Jobs require Agent Operations schema v12');
     }
     try {
       const project = this.database.prepare('SELECT 1 FROM projects WHERE id = ?').get(job.projectId);
@@ -960,7 +1163,20 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         job.createdAt,
         job.updatedAt,
       ] as const;
-      if (this.supportsOrchestration) {
+      if (this.supportsIsolatedWriteWorkspaces) {
+        this.database.prepare(`
+          INSERT INTO jobs
+            (id, project_id, title, description, status, repository_id,
+             preferred_runtime_agent_id, revision, created_at, updated_at,
+             acceptance_criteria, automatic_read_only_completion, execution_mode)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ...common,
+          job.acceptanceCriteria ?? null,
+          job.automaticReadOnlyCompletion ? 1 : 0,
+          executionMode,
+        );
+      } else if (this.supportsOrchestration) {
         this.database.prepare(`
           INSERT INTO jobs
             (id, project_id, title, description, status, repository_id,
@@ -1007,6 +1223,8 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     if (existing.projectId !== job.projectId
       || existing.repositoryId !== job.repositoryId
       || existing.preferredRuntimeAgentId !== job.preferredRuntimeAgentId
+      || (existing.executionMode ?? 'repository-read-only')
+        !== (job.executionMode ?? 'repository-read-only')
       || existing.acceptanceCriteria !== job.acceptanceCriteria
       || existing.automaticReadOnlyCompletion !== job.automaticReadOnlyCompletion
       || existing.createdAt !== job.createdAt) {
@@ -1186,6 +1404,9 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     if (!this.supportsExecutionCapabilities && plan.requestedCapabilities) {
       throw new Error('Runtime tool capabilities require Agent Operations schema v8');
     }
+    if (!this.supportsIsolatedWriteWorkspaces && plan.repositoryWorkspaceId) {
+      throw new Error('Repository Workspace Plans require Agent Operations schema v12');
+    }
     if (plan.jobRevisionAtPreparation < 0 || plan.attemptRevisionAtPreparation < 0) {
       throw new Error('Execution Plan revisions must be non-negative');
     }
@@ -1210,6 +1431,15 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
       || attempt.attempt_revision !== plan.attemptRevisionAtPreparation) {
       throw new Error(`Invalid Execution Plan durable associations: ${plan.id}`);
     }
+    if (plan.repositoryWorkspaceId) {
+      const workspace = await this.getRepositoryWorkspace(plan.repositoryWorkspaceId);
+      if (!workspace || workspace.jobId !== plan.jobId
+        || workspace.repositoryId !== plan.repositoryId
+        || workspace.sourceCheckoutBindingId !== plan.checkoutBindingId
+        || !['active', 'reviewing', 'ready_for_approval'].includes(workspace.state)) {
+        throw new Error(`Invalid Execution Plan Repository Workspace: ${plan.id}`);
+      }
+    }
     try {
       const common = [
         plan.id,
@@ -1226,7 +1456,31 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         plan.attemptRevisionAtPreparation,
         plan.createdAt,
       ] as const;
-      if (this.supportsExecutionCapabilities) {
+      if (this.supportsIsolatedWriteWorkspaces) {
+        this.database.prepare(`
+          INSERT INTO execution_plans
+            (id, attempt_id, job_id, project_id, installation_id, runtime_agent_id,
+             repository_id, checkout_binding_id, input_version, instruction,
+             job_revision, attempt_revision, created_at, requested_policy_version,
+             requested_filesystem, requested_network, requested_environment,
+             requested_capabilities_version, requested_repository_read,
+             repository_workspace_id, requested_repository_patch,
+             requested_test_run, requested_git_inspect)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ...common,
+          plan.requestedPolicy!.version,
+          plan.requestedPolicy!.filesystem,
+          plan.requestedPolicy!.network,
+          plan.requestedPolicy!.environment,
+          plan.requestedCapabilities!.version,
+          plan.requestedCapabilities!.repositoryRead ? 1 : 0,
+          plan.repositoryWorkspaceId ?? null,
+          plan.requestedCapabilities!.repositoryPatch ? 1 : 0,
+          plan.requestedCapabilities!.testRun ? 1 : 0,
+          plan.requestedCapabilities!.gitInspect ? 1 : 0,
+        );
+      } else if (this.supportsExecutionCapabilities) {
         this.database.prepare(`
           INSERT INTO execution_plans
             (id, attempt_id, job_id, project_id, installation_id, runtime_agent_id,
@@ -1410,7 +1664,39 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         dispatch.acceptedAt ?? null,
         dispatch.resolvedAt ?? null,
       ] as const;
-      const result = this.supportsExecutionCapabilities
+      const result = this.supportsIsolatedWriteWorkspaces
+        ? this.database.prepare(`
+            UPDATE execution_dispatches SET
+              status = ?, external_reference = ?, message = ?, revision = ?, updated_at = ?,
+              submitted_at = ?, accepted_at = ?, resolved_at = ?,
+              effective_policy_version = ?, effective_filesystem = ?,
+              effective_network = ?, effective_environment = ?,
+              effective_capabilities_version = ?, effective_repository_read = ?,
+              effective_repository_patch = ?, effective_test_run = ?, effective_git_inspect = ?
+            WHERE id = ? AND revision = ?
+          `).run(
+            ...common,
+            dispatch.effectivePolicy?.version ?? null,
+            dispatch.effectivePolicy?.filesystem ?? null,
+            dispatch.effectivePolicy?.network ?? null,
+            dispatch.effectivePolicy?.environment ?? null,
+            dispatch.effectiveCapabilities?.version ?? null,
+            dispatch.effectiveCapabilities?.repositoryRead === undefined
+              ? null
+              : dispatch.effectiveCapabilities.repositoryRead ? 1 : 0,
+            dispatch.effectiveCapabilities?.repositoryPatch === undefined
+              ? null
+              : dispatch.effectiveCapabilities.repositoryPatch ? 1 : 0,
+            dispatch.effectiveCapabilities?.testRun === undefined
+              ? null
+              : dispatch.effectiveCapabilities.testRun ? 1 : 0,
+            dispatch.effectiveCapabilities?.gitInspect === undefined
+              ? null
+              : dispatch.effectiveCapabilities.gitInspect ? 1 : 0,
+            dispatch.id,
+            expectedRevision,
+          )
+        : this.supportsExecutionCapabilities
         ? this.database.prepare(`
             UPDATE execution_dispatches SET
               status = ?, external_reference = ?, message = ?, revision = ?, updated_at = ?,
@@ -1500,7 +1786,45 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         observation.message ?? null,
         observation.outputSummary ?? null,
       ];
-      if (this.supportsOrchestration) {
+      if (this.supportsIsolatedWriteWorkspaces) {
+        this.database.prepare(`
+          INSERT INTO execution_observations
+            (id, dispatch_id, attempt_id, source, source_event_id, kind, correlation,
+             correlated_dispatch_id, runtime_session_id, external_reference, message,
+             output_summary, execution_working_directory, effective_policy_version,
+             effective_filesystem, effective_network, effective_environment,
+             repository_read_root, repository_write_root, effective_capabilities_version,
+             effective_repository_read, effective_repository_patch, effective_test_run,
+             effective_git_inspect, tool_operations_json, observed_at, recorded_at, result_text)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ...common,
+          observation.executionContext?.workingDirectory ?? null,
+          observation.effectivePolicy?.version ?? null,
+          observation.effectivePolicy?.filesystem ?? null,
+          observation.effectivePolicy?.network ?? null,
+          observation.effectivePolicy?.environment ?? null,
+          observation.executionContext?.repositoryReadRoot ?? null,
+          observation.executionContext?.repositoryWriteRoot ?? null,
+          observation.effectiveCapabilities?.version ?? null,
+          observation.effectiveCapabilities?.repositoryRead === undefined
+            ? null
+            : observation.effectiveCapabilities.repositoryRead ? 1 : 0,
+          observation.effectiveCapabilities?.repositoryPatch === undefined
+            ? null
+            : observation.effectiveCapabilities.repositoryPatch ? 1 : 0,
+          observation.effectiveCapabilities?.testRun === undefined
+            ? null
+            : observation.effectiveCapabilities.testRun ? 1 : 0,
+          observation.effectiveCapabilities?.gitInspect === undefined
+            ? null
+            : observation.effectiveCapabilities.gitInspect ? 1 : 0,
+          observation.toolOperations ? JSON.stringify(observation.toolOperations) : null,
+          observation.observedAt,
+          observation.recordedAt,
+          observation.resultText ?? null,
+        );
+      } else if (this.supportsOrchestration) {
         this.database.prepare(`
           INSERT INTO execution_observations
             (id, dispatch_id, attempt_id, source, source_event_id, kind, correlation,

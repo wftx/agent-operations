@@ -1087,7 +1087,7 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
       workspace_dependencies: false,
     });
     expect(JSON.stringify(threadStart)).not.toContain('.agent-operations');
-    expect(JSON.stringify(threadStart.dynamicTools)).not.toContain('shell');
+    expect(threadStart.dynamicTools.map(namespace => namespace.name)).not.toContain('shell');
 
     const record = String(atomicWriteSyncMock.mock.calls.at(-1)?.[1]);
     expect(record).toContain(`"repositoryReadRoot":"${root}"`);
@@ -1171,6 +1171,59 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
     });
     expect(list).toHaveBeenCalledTimes(2);
     expect(respondMock).toHaveBeenCalledWith(72, expect.objectContaining({ success: false }));
+  });
+
+  it('exposes isolated patch, allowlisted test, and Git inspection tools only for explicit write capabilities', async () => {
+    requestMock.mockImplementation(async (method: string) => {
+      if (method === 'config/read') return { result: { config: { mcp_servers: {} } } };
+      return method === 'thread/start'
+        ? { result: { thread: { id: 'thread-writer' } } }
+        : { result: { turn: { id: 'turn-writer', status: 'inProgress' } } };
+    });
+    const pty = makeReadyPty();
+    const root = process.cwd();
+    const policy = { version: 1 as const, filesystem: 'workspace-write' as const, network: 'deny' as const, environment: 'empty' as const };
+    const context = { workingDirectory: root, repositoryReadRoot: root, repositoryWriteRoot: root };
+    const capabilities = {
+      version: 1 as const, repositoryRead: true, repositoryPatch: true, testRun: true, gitInspect: true,
+    };
+    await pty.startCorrelationSafeTurn('make one bounded change', 'dispatch-plan:writer', policy, context, capabilities);
+    const threadStart = requestMock.mock.calls.find(([method]) => method === 'thread/start')?.[1] as {
+      dynamicTools: Array<{ name: string; tools: Array<{ name: string }> }>;
+      sandbox: string;
+      runtimeWorkspaceRoots: string[];
+    };
+    expect(threadStart.sandbox).toBe('workspace-write');
+    expect(threadStart.runtimeWorkspaceRoots).toEqual([root]);
+    expect(threadStart.dynamicTools.map(namespace => [
+      namespace.name,
+      namespace.tools.map(tool => tool.name),
+    ])).toEqual([
+      ['repository', ['list', 'read', 'search', 'patch']],
+      ['test', ['run']],
+      ['git', ['inspect']],
+    ]);
+    expect(threadStart.dynamicTools.map(namespace => namespace.name)).not.toContain('shell');
+    expect(String(atomicWriteSyncMock.mock.calls.at(-1)?.[1]))
+      .toContain(`"repositoryWriteRoot":"${root}"`);
+    rpc(pty).handleRpcMessage({
+      method: 'turn/completed',
+      params: { threadId: 'thread-writer', turn: { id: 'turn-writer', status: 'completed' } },
+    });
+    await flush();
+  });
+
+  it('rejects repository patch authority without the exact workspace write policy and root', async () => {
+    const pty = makeReadyPty();
+    const root = process.cwd();
+    await expect(pty.startCorrelationSafeTurn(
+      'must not start',
+      'dispatch-plan:invalid-writer',
+      restrictedPolicy,
+      { workingDirectory: root, repositoryReadRoot: root, repositoryWriteRoot: root },
+      { version: 1, repositoryRead: true, repositoryPatch: true },
+    )).rejects.toThrow('repository patch requires the exact workspace-write root');
+    expect(requestMock).not.toHaveBeenCalled();
   });
 
   it('creates distinct restricted threads when repository checkout CWD changes', async () => {

@@ -21,6 +21,7 @@ import type {
   DurableOperatorNotificationDelivery,
   DurableOperatorRun,
 } from './operator.js';
+import type { DurableRepositoryWorkspace } from './workspace.js';
 
 export interface AgentOperationsInstallation {
   readonly id: string;
@@ -106,6 +107,14 @@ export interface AgentOperationsStateStore {
   getLatestRepositoryObservation(checkoutBindingId: string): Promise<DurableRepositoryObservation | null>;
   recordRuntimeObservation(observation: DurableRuntimeObservation): Promise<void>;
   getLatestRuntimeObservation(projectId: string, agentId: string): Promise<DurableRuntimeObservation | null>;
+  createRepositoryWorkspace(workspace: DurableRepositoryWorkspace): Promise<void>;
+  getRepositoryWorkspace(id: string): Promise<DurableRepositoryWorkspace | null>;
+  getRepositoryWorkspaceForJob(jobId: string): Promise<DurableRepositoryWorkspace | null>;
+  listRepositoryWorkspaces(): Promise<readonly DurableRepositoryWorkspace[]>;
+  saveRepositoryWorkspaceTransition(
+    workspace: DurableRepositoryWorkspace,
+    expectedRevision: number,
+  ): Promise<void>;
   createJob(job: DurableJob): Promise<void>;
   getJob(id: string): Promise<DurableJob | null>;
   listJobs(projectId?: string): Promise<readonly DurableJob[]>;

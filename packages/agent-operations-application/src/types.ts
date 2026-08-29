@@ -12,13 +12,19 @@ import type {
   ExecutionRole,
   RuntimeExecutionCapabilities,
   RuntimeExecutionPolicy,
+  RuntimeStartResult,
+  JobExecutionMode,
+  DurableRepositoryWorkspace,
 } from '../../agent-operations-contracts/src/index.js';
+
+export type { RuntimeStartResult } from '../../agent-operations-contracts/src/index.js';
 
 export interface OperatorTaskInput {
   readonly projectId: string;
   readonly repositoryId: string;
   readonly task: string;
   readonly acceptanceCriteria: string;
+  readonly executionMode?: JobExecutionMode;
 }
 
 export interface OperatorPolicyDefaults {
@@ -26,7 +32,7 @@ export interface OperatorPolicyDefaults {
   readonly capabilities: RuntimeExecutionCapabilities;
   readonly maxWorkerAttempts: 2;
   readonly reviewerEnabled: true;
-  readonly automaticReadOnlyCompletion: true;
+  readonly automaticReadOnlyCompletion: boolean;
 }
 
 export interface OperatorProjectOption {
@@ -44,6 +50,7 @@ export interface OperatorTaskPreview {
   readonly task: string;
   readonly acceptanceCriteria: string;
   readonly defaults: OperatorPolicyDefaults;
+  readonly executionMode?: JobExecutionMode;
   readonly executionAuthorized: false;
 }
 
@@ -86,6 +93,7 @@ export type OperatorExecutionStage =
   | 'Capturing Review'
   | 'Preparing Revision'
   | 'Needs Me'
+  | 'Ready for Approval'
   | 'Completed'
   | 'Cancelled'
   | 'Failed';
@@ -120,6 +128,7 @@ export interface OperatorJobDetail {
   readonly finalWorkerResult?: string;
   readonly finalReview?: DurableAttemptReview;
   readonly completedAt?: string;
+  readonly repositoryWorkspace?: DurableRepositoryWorkspace;
 }
 
 export type OperatorJobList = 'all' | 'running' | 'needs-human' | 'done';
@@ -128,6 +137,7 @@ export interface OperatorApplication {
   startRunner(): void;
   listProjects(): Promise<readonly OperatorProjectOption[]>;
   getRuntimeStatus(): Promise<OperatorRuntimeStatus>;
+  startRuntime(): Promise<RuntimeStartResult>;
   previewTask(input: OperatorTaskInput): Promise<OperatorTaskPreview>;
   runOperatorJob(input: OperatorTaskInput): Promise<OperatorRunSession>;
   waitForRun(jobId: string): Promise<OperatorRunSession>;

@@ -3,6 +3,12 @@ import { randomUUID } from 'node:crypto';
 export const JOB_STATUSES = ['draft', 'ready', 'completed', 'cancelled'] as const;
 export type JobStatus = (typeof JOB_STATUSES)[number];
 
+export const JOB_EXECUTION_MODES = [
+  'repository-read-only',
+  'repository-write-isolated',
+] as const;
+export type JobExecutionMode = (typeof JOB_EXECUTION_MODES)[number];
+
 export const ATTEMPT_STATUSES = ['created', 'running', 'completed', 'failed', 'cancelled'] as const;
 export type AttemptStatus = (typeof ATTEMPT_STATUSES)[number];
 
@@ -14,6 +20,8 @@ export interface DurableJob {
   readonly projectId: string;
   readonly title: string;
   readonly description?: string;
+  /** Absent only for historical Jobs, where it means repository-read-only. */
+  readonly executionMode?: JobExecutionMode;
   /** Small, human-authored success definition supplied to the Reviewer. */
   readonly acceptanceCriteria?: string;
   /** Explicit opt-in. Absence and false both prohibit autonomous completion. */
@@ -25,6 +33,10 @@ export interface DurableJob {
   readonly revision: number;
   readonly createdAt: string;
   readonly updatedAt: string;
+}
+
+export function executionModeForJob(job: Pick<DurableJob, 'executionMode'>): JobExecutionMode {
+  return job.executionMode ?? 'repository-read-only';
 }
 
 export interface NewDurableJobAttempt {

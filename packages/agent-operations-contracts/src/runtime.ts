@@ -26,6 +26,9 @@ export type RuntimeCapability =
   | 'exact-turn-correlation'
   | 'execution-working-directory'
   | 'repository-read-tools'
+  | 'repository-write-tools'
+  | 'test-run-tools'
+  | 'git-inspection-tools'
   | 'filesystem-none'
   | 'filesystem-read-only'
   | 'filesystem-workspace-write'
@@ -77,6 +80,30 @@ export interface AgentRuntimeAdapter {
   listAgents(): Promise<readonly AgentRuntimeSummary[]>;
   getAgent(id: string): Promise<AgentRuntimeDetail | null>;
   getHealth(): Promise<RuntimeInventoryHealth>;
+}
+
+export interface RuntimeStartupInventory {
+  readonly configuredAgents: readonly {
+    readonly id: string;
+    readonly provider: RuntimeProvider;
+    readonly enabled: boolean | null;
+  }[];
+  readonly configuredCronCount: number;
+  readonly configuredIntegrationCount: number;
+}
+
+export interface RuntimeStartResult {
+  readonly status: 'started' | 'already-running' | 'failed';
+  readonly instanceId: string;
+  readonly message: string;
+  readonly inventory: RuntimeStartupInventory;
+  readonly daemonPid?: number;
+  readonly diagnostic?: string;
+}
+
+/** Explicit mutation port. Runtime inventory and page reads never call it. */
+export interface RuntimeLifecycleAdapter {
+  start(): Promise<RuntimeStartResult>;
 }
 
 export function isRuntimeProvider(value: unknown): value is RuntimeProvider {

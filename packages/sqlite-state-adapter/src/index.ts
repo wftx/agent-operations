@@ -17,6 +17,7 @@ export {
   RUNTIME_POLICY_SCHEMA_VERSION,
   INITIAL_SCHEMA_VERSION,
   JOB_SCHEMA_VERSION,
+  ISOLATED_WRITE_WORKSPACE_SCHEMA_VERSION,
   applyStateMigrations,
   type SqliteStateMigration,
 } from './migrations.js';

@@ -15,6 +15,7 @@ import {
 } from '../../agent-operations-core/src/index.js';
 import {
   OPERATOR_READ_ONLY_DEFAULTS,
+  OPERATOR_ISOLATED_WRITE_DEFAULTS,
   OperatorApplicationService,
   type OperatorNotificationEvent,
   type OperatorNotifier,
@@ -193,6 +194,24 @@ describe('OperatorApplicationService', () => {
     });
     expect(await store.listJobs()).toEqual([]);
     expect(orchestration.previewCalls).toBe(0);
+    expect(orchestration.runCalls).toBe(0);
+  });
+
+  it('previews isolated write authority without creating a Job or workspace', async () => {
+    const store = await configuredStore();
+    const orchestration = new FakeOrchestration(store);
+    const application = new OperatorApplicationService(store, orchestration);
+    const preview = await application.previewTask({
+      ...INPUT,
+      executionMode: 'repository-write-isolated',
+    });
+    expect(preview).toMatchObject({
+      executionMode: 'repository-write-isolated',
+      defaults: OPERATOR_ISOLATED_WRITE_DEFAULTS,
+      executionAuthorized: false,
+    });
+    expect(await store.listJobs()).toEqual([]);
+    expect(await store.listRepositoryWorkspaces()).toEqual([]);
     expect(orchestration.runCalls).toBe(0);
   });
 
@@ -460,7 +479,18 @@ describe('OperatorApplicationService', () => {
       .rejects.toThrow('already resolved');
   });
 
-  it('atomically resolves a late exact timeout, resumes the same run, and is idempotent', async () => {
+  it.each([
+    ['observation timeout', 'observation_timeout' as const, 'Observation timed out.'],
+    [
+      'known oversized observation failure',
+      'runtime_failure' as const,
+      'Runtime observation failed: Observation text exceeds 4000 characters',
+    ],
+  ])('atomically resolves a late exact %s, resumes the same run, and is idempotent', async (
+    _label,
+    reason,
+    summary,
+  ) => {
     const store = await configuredStore();
     const lifecycle = new JobLifecycleService(store, {
       now: () => new Date(TIME), jobIdFactory: () => 'job:late',
@@ -509,7 +539,7 @@ describe('OperatorApplicationService', () => {
     }, 1);
     await store.createEscalation({
       id: 'escalation:late', jobId: job.id, attemptId: attempt.id,
-      reason: 'observation_timeout', summary: 'Observation timed out.', createdAt: TIME,
+      reason, summary, createdAt: TIME,
     });
     const run = {
       id: 'operator-run:late', jobId: job.id, status: 'pending' as const, revision: 0,

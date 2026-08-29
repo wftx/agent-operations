@@ -3,6 +3,7 @@ export * from './repository.js';
 export * from './project.js';
 export * from './persistence.js';
 export * from './work.js';
+export * from './workspace.js';
 export * from './execution.js';
 export * from './dispatch.js';
 export * from './observation.js';

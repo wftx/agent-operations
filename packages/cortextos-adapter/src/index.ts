@@ -12,3 +12,8 @@ export {
   resolveCortextOSSocketPath,
   type CortextOSSocketPathOptions,
 } from './cortextos-state-location.js';
+export {
+  CortextOSRuntimeLifecycleAdapter,
+  resolveCodexExecutable,
+  type CortextOSRuntimeLifecycleAdapterOptions,
+} from './cortextos-runtime-lifecycle-adapter.js';

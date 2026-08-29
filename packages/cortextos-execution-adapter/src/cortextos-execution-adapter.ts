@@ -102,7 +102,8 @@ export class CortextOSExecutionAdapter implements RuntimeExecutionAdapter {
           const executionContext = parseExecutionContext(execution.executionContext);
           if (request.executionContext
             && (executionContext?.workingDirectory !== request.executionContext.workingDirectory
-              || executionContext?.repositoryReadRoot !== request.executionContext.repositoryReadRoot)) {
+              || executionContext?.repositoryReadRoot !== request.executionContext.repositoryReadRoot
+              || executionContext?.repositoryWriteRoot !== request.executionContext.repositoryWriteRoot)) {
             return { status: 'uncertain', code: 'SUBMISSION_UNCERTAIN', message: 'CortextOS did not prove the requested execution working directory.' };
           }
           try {
@@ -283,10 +284,16 @@ function parseExecutionContext(value: unknown): RuntimeDispatchRequest['executio
   if (value.repositoryReadRoot !== undefined
     && (typeof value.repositoryReadRoot !== 'string'
       || !value.repositoryReadRoot.startsWith('/'))) return null;
+  if (value.repositoryWriteRoot !== undefined
+    && (typeof value.repositoryWriteRoot !== 'string'
+      || !value.repositoryWriteRoot.startsWith('/'))) return null;
   return {
     workingDirectory: value.workingDirectory,
     ...(typeof value.repositoryReadRoot === 'string'
       ? { repositoryReadRoot: value.repositoryReadRoot }
+      : {}),
+    ...(typeof value.repositoryWriteRoot === 'string'
+      ? { repositoryWriteRoot: value.repositoryWriteRoot }
       : {}),
   };
 }
@@ -297,7 +304,16 @@ function parseExecutionCapabilities(
   if (!isRecord(value) || value.version !== 1 || typeof value.repositoryRead !== 'boolean') {
     return null;
   }
-  return { version: 1, repositoryRead: value.repositoryRead };
+  for (const field of ['repositoryPatch', 'testRun', 'gitInspect'] as const) {
+    if (value[field] !== undefined && typeof value[field] !== 'boolean') return null;
+  }
+  return {
+    version: 1,
+    repositoryRead: value.repositoryRead,
+    ...(value.repositoryPatch !== undefined ? { repositoryPatch: value.repositoryPatch as boolean } : {}),
+    ...(value.testRun !== undefined ? { testRun: value.testRun as boolean } : {}),
+    ...(value.gitInspect !== undefined ? { gitInspect: value.gitInspect as boolean } : {}),
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

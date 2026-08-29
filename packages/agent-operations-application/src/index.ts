@@ -1,5 +1,6 @@
 export {
   OPERATOR_READ_ONLY_DEFAULTS,
+  OPERATOR_ISOLATED_WRITE_DEFAULTS,
   OperatorApplicationService,
   type OperatorApplicationServiceOptions,
   type OperatorOrchestrationPort,
@@ -26,6 +27,7 @@ export type {
   OperatorPolicyDefaults,
   OperatorProjectOption,
   OperatorRuntimeStatus,
+  RuntimeStartResult,
   OperatorRunSession,
   OperatorRunStatus,
   OperatorTaskInput,

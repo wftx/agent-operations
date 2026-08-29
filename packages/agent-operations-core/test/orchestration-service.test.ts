@@ -9,6 +9,8 @@ import type {
   RuntimeExecutionObservation,
   RuntimeExecutionObservationAdapter,
   RuntimeExecutionObservationRequest,
+  RepositoryWorkspaceAdapter,
+  RepositoryWorkspaceInspection,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   FakeAgentRuntimeAdapter,
@@ -22,6 +24,7 @@ import {
   OrchestrationService,
   parseReviewerResult,
   readWorkerExecutionBudget,
+  RepositoryWorkspaceService,
 } from '../src/index.js';
 
 const TIME = '2026-08-27T03:00:00.000Z';
@@ -31,6 +34,7 @@ const REPOSITORY_ID = 'remote:github.com/wftx/agent-operations';
 const RUNTIME_ID = 'agent-operations/rehearsal';
 const INSTALLATION_ID = 'installation:orchestration-fixture';
 const CHECKOUT = '/fixtures/agent-operations';
+const WORKSPACE = '/ao-state/workspaces/orchestration-fixture';
 const POLICY = { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const };
 const CAPABILITIES = { version: 1 as const, repositoryRead: true };
 const WRONG_RESULT = 'The contract is src/types/index.ts RuntimeExecutionPolicyEnvelope with filesystem, network, and environment.';
@@ -58,6 +62,9 @@ type ObservationFixture =
         readonly network: 'deny';
         readonly environment: 'empty';
       };
+      readonly capabilities?: RuntimeExecutionObservation['effectiveCapabilities'];
+      readonly repositoryWriteRoot?: string;
+      readonly toolOperations?: RuntimeExecutionObservation['toolOperations'];
     }
   | { readonly kind: 'runtime-failure' }
   | { readonly kind: 'missing-correlation' };
@@ -131,9 +138,11 @@ class ScriptedObservationAdapter implements RuntimeExecutionObservationAdapter {
       executionContext: {
         workingDirectory: fixture.workingDirectory ?? CHECKOUT,
         repositoryReadRoot: fixture.workingDirectory ?? CHECKOUT,
+        ...(fixture.repositoryWriteRoot ? { repositoryWriteRoot: fixture.repositoryWriteRoot } : {}),
       },
       effectivePolicy: fixture.policy ?? POLICY,
-      effectiveCapabilities: CAPABILITIES,
+      effectiveCapabilities: fixture.capabilities ?? CAPABILITIES,
+      ...(fixture.toolOperations ? { toolOperations: fixture.toolOperations } : {}),
       ...(fixture.resultText ? { resultText: fixture.resultText } : {}),
     }];
   }
@@ -164,6 +173,7 @@ async function harness(
   observationFixtures: readonly ObservationFixture[],
   dispatchResults: readonly ('accepted' | 'rejected' | 'uncertain')[] = [],
   runtimePolicySupported = true,
+  writeMode = false,
 ) {
   const store = new CrashOnceStore({
     installation: { id: INSTALLATION_ID, createdAt: TIME },
@@ -206,6 +216,9 @@ async function harness(
       'Must not substitute RuntimeExecutionPolicyEnvelope.',
     ].join('\n'),
     automaticReadOnlyCompletion: true,
+    ...(writeMode
+      ? { executionMode: 'repository-write-isolated' as const, automaticReadOnlyCompletion: false }
+      : {}),
     repositoryId: REPOSITORY_ID,
     preferredRuntimeAgentId: RUNTIME_ID,
   });
@@ -217,7 +230,9 @@ async function harness(
         'exact-turn-correlation',
         'execution-working-directory',
         'repository-read-tools',
+        ...(writeMode ? ['repository-write-tools', 'test-run-tools', 'git-inspection-tools'] as const : []),
         'filesystem-read-only',
+        ...(writeMode ? ['filesystem-workspace-write'] as const : []),
         'network-denial',
         'environment-empty',
       ] as const
@@ -254,12 +269,41 @@ async function harness(
       },
     }],
     observedAt: TIME,
-  }]);
+  }, ...(writeMode ? [{
+    id: REPOSITORY_ID,
+    identityKind: 'remote' as const,
+    name: 'agent-operations',
+    checkoutPath: WORKSPACE,
+    repositoryRoot: WORKSPACE,
+    availability: 'available' as const,
+    branch: 'ao/job-orchestration-fixture',
+    detachedHead: false,
+    headCommit: '1111111111111111111111111111111111111111',
+    workingTree: 'dirty' as const,
+    remotes: [],
+    observedAt: TIME,
+  }] : [])]);
   const execution = new ScriptedExecutionAdapter(dispatchResults);
   const observer = new ScriptedObservationAdapter(observationFixtures);
   let review = 0;
   let escalation = 0;
   let outcome = 0;
+  const workspaceAdapter: RepositoryWorkspaceAdapter = {
+    inspectWorkspace: async (): Promise<RepositoryWorkspaceInspection> => ({ exists: false, registered: false }),
+    createWorkspace: async input => ({
+      exists: true, registered: true, canonicalPath: input.destinationPath,
+      repositoryId: input.repositoryId, branchName: input.branchName, headRevision: input.baseRevision,
+    }),
+    captureEvidence: async () => ({
+      changedFiles: ['README.md'], diffStat: '1 file changed', diffText: '+safe change', diffTruncated: false,
+    }),
+    removeWorkspace: async () => ({ exists: false, registered: false }),
+  };
+  const workspaceService = writeMode
+    ? new RepositoryWorkspaceService(store, repositories, workspaceAdapter, {
+        stateDirectory: '/ao-state', now: () => new Date(TIME),
+      })
+    : undefined;
   const service = new OrchestrationService(store, runtimes, repositories, execution, observer, {
     now: () => new Date(TIME),
     observationIntervalMs: 0,
@@ -268,8 +312,9 @@ async function harness(
     attemptReviewIdFactory: () => `review:${++review}`,
     escalationIdFactory: () => `escalation:${++escalation}`,
     outcomeDecisionIdFactory: () => `outcome:${++outcome}`,
+    ...(workspaceService ? { workspaceService } : {}),
   });
-  return { store, service, execution, observer, runtimes, repositories, job };
+  return { store, service, execution, observer, runtimes, repositories, job, workspaceService };
 }
 
 function resumedService(setup: Awaited<ReturnType<typeof harness>>): OrchestrationService {
@@ -317,6 +362,137 @@ describe('OrchestrationService', () => {
       'cortextos:codex-turn:v1:thread-1:turn-1',
       'cortextos:codex-turn:v1:thread-2:turn-2',
     ]);
+  });
+
+  it('keeps an isolated write PASS ready for human approval without commit or Job completion', async () => {
+    const writeCapabilities = {
+      version: 1 as const, repositoryRead: true, repositoryPatch: true, testRun: true, gitInspect: true,
+    };
+    const reviewCapabilities = {
+      version: 1 as const, repositoryRead: true, repositoryPatch: false, testRun: false, gitInspect: true,
+    };
+    const setup = await harness([
+      {
+        kind: 'completed', resultText: 'Updated README.md safely.', workingDirectory: WORKSPACE,
+        repositoryWriteRoot: WORKSPACE,
+        policy: { version: 1, filesystem: 'workspace-write', network: 'deny', environment: 'empty' },
+        capabilities: writeCapabilities,
+        toolOperations: [{
+          namespace: 'test', operation: 'run', success: true, occurredAt: TIME,
+          commandId: 'typecheck', command: 'npm run typecheck', exitCode: 0,
+          durationMs: 10, stdout: 'ok', stderr: '',
+        }],
+      },
+      {
+        kind: 'completed', resultText: PASS, workingDirectory: WORKSPACE,
+        policy: POLICY, capabilities: reviewCapabilities,
+      },
+    ], [], true, true);
+
+    const result = await setup.service.runJob(JOB_ID);
+    expect(result.finalDecision).toBe('ESCALATED');
+    expect(result.job.status).toBe('ready');
+    expect(result.reviews).toEqual([expect.objectContaining({ decision: 'PASS' })]);
+    expect(result.escalations).toEqual([expect.objectContaining({
+      reason: 'human_judgment_required', summary: expect.stringContaining('Ready for Approval'),
+    })]);
+    expect(setup.execution.requests).toHaveLength(2);
+    expect(setup.execution.requests[0]).toMatchObject({
+      requestedPolicy: { filesystem: 'workspace-write', network: 'deny', environment: 'empty' },
+      requestedCapabilities: writeCapabilities,
+      executionContext: { workingDirectory: WORKSPACE, repositoryWriteRoot: WORKSPACE },
+    });
+    expect(setup.execution.requests[1]).toMatchObject({
+      requestedPolicy: { filesystem: 'read-only', network: 'deny', environment: 'empty' },
+      requestedCapabilities: reviewCapabilities,
+      executionContext: { workingDirectory: WORKSPACE },
+    });
+    const workspace = await setup.store.getRepositoryWorkspaceForJob(JOB_ID);
+    expect(workspace).toMatchObject({
+      state: 'ready_for_approval', branchName: 'ao/job-orchestration-fixture',
+      evidence: { changedFiles: ['README.md'], testResults: [expect.objectContaining({ commandId: 'typecheck', status: 'passed' })] },
+    });
+    const pending = await setup.workspaceService!.requestCleanup(workspace!.id);
+    expect(pending).toMatchObject({ state: 'cleanup_pending', evidence: workspace!.evidence });
+    await expect(setup.workspaceService!.cleanup(workspace!.id)).resolves.toMatchObject({
+      state: 'cleaned',
+      evidence: workspace!.evidence,
+    });
+  });
+
+  it('uses a fresh Worker and Plan for write revision while preserving the same isolated workspace', async () => {
+    const writeCapabilities = {
+      version: 1 as const, repositoryRead: true, repositoryPatch: true, testRun: true, gitInspect: true,
+    };
+    const reviewCapabilities = {
+      version: 1 as const, repositoryRead: true, repositoryPatch: false, testRun: false, gitInspect: true,
+    };
+    const worker = (resultText: string): ObservationFixture => ({
+      kind: 'completed', resultText, workingDirectory: WORKSPACE,
+      repositoryWriteRoot: WORKSPACE,
+      policy: { version: 1, filesystem: 'workspace-write', network: 'deny', environment: 'empty' },
+      capabilities: writeCapabilities,
+    });
+    const reviewer = (resultText: string): ObservationFixture => ({
+      kind: 'completed', resultText, workingDirectory: WORKSPACE,
+      policy: POLICY, capabilities: reviewCapabilities,
+    });
+    const setup = await harness([
+      worker('{"summary":"first","filesChanged":["README.md"],"testsRun":[],"unresolvedIssues":[]}'),
+      reviewer(REVISION),
+      worker('{"summary":"revised","filesChanged":["README.md"],"testsRun":[],"unresolvedIssues":[]}'),
+      reviewer(PASS),
+    ], [], true, true);
+
+    const result = await setup.service.runJob(JOB_ID);
+    expect(result.finalDecision).toBe('ESCALATED');
+    expect(result.workerAttempts).toHaveLength(2);
+    expect(result.reviewerAttempts).toHaveLength(2);
+    expect(result.reviews.map(review => review.decision)).toEqual(['REVISION_REQUIRED', 'PASS']);
+    expect(new Set(setup.execution.requests.map(request => request.executionPlanId)).size).toBe(4);
+    expect(new Set(setup.execution.requests.map(request => request.executionContext!.workingDirectory)))
+      .toEqual(new Set([WORKSPACE]));
+    const plans = await Promise.all([
+      ...result.workerAttempts,
+      ...result.reviewerAttempts,
+    ].map(attempt => setup.store.getExecutionPlanForAttempt(attempt.id)));
+    const workspaceIds = plans.map(plan => plan?.repositoryWorkspaceId);
+    expect(new Set(workspaceIds).size).toBe(1);
+    expect(workspaceIds[0]).toMatch(/^workspace:/);
+    await expect(setup.store.getRepositoryWorkspaceForJob(JOB_ID)).resolves.toMatchObject({
+      state: 'ready_for_approval',
+      branchName: 'ao/job-orchestration-fixture',
+    });
+  });
+
+  it('keeps isolated evidence in reviewing when the Reviewer escalates', async () => {
+    const writeCapabilities = {
+      version: 1 as const, repositoryRead: true, repositoryPatch: true, testRun: true, gitInspect: true,
+    };
+    const reviewCapabilities = {
+      version: 1 as const, repositoryRead: true, repositoryPatch: false, testRun: false, gitInspect: true,
+    };
+    const setup = await harness([
+      {
+        kind: 'completed', resultText: '{"summary":"change","filesChanged":["README.md"],"testsRun":[],"unresolvedIssues":[]}',
+        workingDirectory: WORKSPACE, repositoryWriteRoot: WORKSPACE,
+        policy: { version: 1, filesystem: 'workspace-write', network: 'deny', environment: 'empty' },
+        capabilities: writeCapabilities,
+      },
+      {
+        kind: 'completed',
+        resultText: JSON.stringify({ decision: 'ESCALATE', summary: 'Human product judgment is required.' }),
+        workingDirectory: WORKSPACE, policy: POLICY, capabilities: reviewCapabilities,
+      },
+    ], [], true, true);
+
+    const result = await setup.service.runJob(JOB_ID);
+    expect(result.finalDecision).toBe('ESCALATED');
+    expect(result.reviews).toEqual([expect.objectContaining({ decision: 'ESCALATE' })]);
+    await expect(setup.store.getRepositoryWorkspaceForJob(JOB_ID)).resolves.toMatchObject({
+      state: 'reviewing',
+      evidence: { changedFiles: ['README.md'] },
+    });
   });
 
   it('dogfoods the exact wrong-envelope failure, creates fresh Attempt 2, then passes and completes', async () => {
@@ -580,6 +756,77 @@ describe('OrchestrationService', () => {
     expect(setup.execution.requests).toHaveLength(1);
     expect(lateObserver.requests).toHaveLength(1);
     expect(lateObserver.requests[0].externalReference).toBe(dispatch!.externalReference);
+  });
+
+  it('reconciles the known oversized observation failure without redispatch', async () => {
+    const setup = await harness([]);
+    const timedOut = await setup.service.runJob(JOB_ID);
+    const timeout = timedOut.escalations[0];
+    const worker = timedOut.workerAttempts[0];
+    await setup.store.resolveEscalationAndCreateEscalation(
+      timeout.id,
+      TIME,
+      'Reclassified after deterministic diagnosis.',
+      {
+        id: 'escalation:oversized-observation',
+        jobId: JOB_ID,
+        attemptId: worker.id,
+        reason: 'runtime_failure',
+        summary: 'Runtime observation failed: Observation text exceeds 4000 characters',
+        createdAt: TIME,
+      },
+    );
+    const lateObserver = new ScriptedObservationAdapter([{
+      kind: 'completed',
+      resultText: CORRECT_RESULT,
+      toolOperations: [{
+        namespace: 'test', operation: 'run', success: false, occurredAt: TIME,
+        commandId: 'agent-operations-tests', stderr: 'x'.repeat(10_000),
+      }],
+    }]);
+    const reconciler = new OrchestrationService(
+      setup.store, setup.runtimes, setup.repositories, setup.execution, lateObserver,
+      { now: () => new Date(TIME), outcomeDecisionIdFactory: () => 'outcome:oversized-observation' },
+    );
+
+    const result = await reconciler.reconcileTimedOutExecution('escalation:oversized-observation');
+
+    expect(result).toMatchObject({ status: 'completed', attemptId: worker.id });
+    expect(setup.execution.requests).toHaveLength(1);
+    expect((await setup.store.listExecutionObservationsForDispatch(result.dispatchId))[0]
+      .toolOperations?.find(operation => operation.namespace === 'test'))
+      .toMatchObject({ outputTruncated: true, stderr: 'x'.repeat(4_000) });
+  });
+
+  it('reconciles an isolated write Worker against its exact workspace without redispatch', async () => {
+    const setup = await harness([], [], true, true);
+    const timedOut = await setup.service.runJob(JOB_ID);
+    const escalation = timedOut.escalations[0];
+    const worker = timedOut.workerAttempts[0];
+    const lateObserver = new ScriptedObservationAdapter([{
+      kind: 'completed',
+      resultText: '{"summary":"updated","filesChanged":["README.md"],"testsRun":[],"unresolvedIssues":[]}',
+      workingDirectory: WORKSPACE,
+      repositoryWriteRoot: WORKSPACE,
+      policy: { version: 1, filesystem: 'workspace-write', network: 'deny', environment: 'empty' },
+      capabilities: {
+        version: 1, repositoryRead: true, repositoryPatch: true, testRun: true, gitInspect: true,
+      },
+    }]);
+    const reconciler = new OrchestrationService(
+      setup.store, setup.runtimes, setup.repositories, setup.execution, lateObserver,
+      {
+        now: () => new Date(TIME),
+        outcomeDecisionIdFactory: () => 'outcome:late-write',
+        workspaceService: setup.workspaceService,
+      },
+    );
+
+    const result = await reconciler.reconcileTimedOutExecution(escalation.id);
+
+    expect(result).toMatchObject({ status: 'completed', attemptId: worker.id });
+    expect(setup.execution.requests).toHaveLength(1);
+    expect(await setup.store.getAttempt(worker.id)).toMatchObject({ status: 'completed' });
   });
 
   it('continues a reconciled Worker through exactly one fresh Reviewer submission', async () => {

@@ -133,6 +133,26 @@ describe('ExecutionObservationService', () => {
     });
   });
 
+  it('bounds oversized historical tool output and records truncation', async () => {
+    const setup = await harness([{
+      ...exact(),
+      toolOperations: [{
+        namespace: 'test',
+        operation: 'run',
+        success: false,
+        occurredAt: TIME,
+        commandId: 'agent-operations-tests',
+        stderr: 'x'.repeat(10_000),
+      }],
+    }]);
+
+    const result = await setup.observations.observeAttemptExecution(setup.attempt.id);
+
+    expect(result.detail.observations[0].toolOperations).toEqual([
+      expect.objectContaining({ outputTruncated: true, stderr: 'x'.repeat(4_000) }),
+    ]);
+  });
+
   it('ignores an exact event for another Dispatch', async () => {
     const setup = await harness([exact('dispatch:unrelated')]);
     const result = await setup.observations.observeAttemptExecution(setup.attempt.id);

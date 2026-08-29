@@ -28,6 +28,7 @@ import type {
   DurableOperatorNotificationDelivery,
   DurableOperatorRun,
 } from '../operator.js';
+import type { DurableRepositoryWorkspace } from '../workspace.js';
 
 export type InMemoryStateStoreOperation =
   | 'get-installation'
@@ -35,6 +36,7 @@ export type InMemoryStateStoreOperation =
   | 'read'
   | 'record-repository-observation'
   | 'record-runtime-observation'
+  | 'write-repository-workspace'
   | 'write-job'
   | 'write-attempt'
   | 'write-execution-plan'
@@ -77,6 +79,21 @@ function copyRepositoryObservation(value: DurableRepositoryObservation): Durable
 
 function copyRuntimeObservation(value: DurableRuntimeObservation): DurableRuntimeObservation {
   return { ...value };
+}
+
+function copyRepositoryWorkspace(value: DurableRepositoryWorkspace): DurableRepositoryWorkspace {
+  return {
+    ...value,
+    ...(value.evidence
+      ? {
+          evidence: {
+            ...value.evidence,
+            changedFiles: [...value.evidence.changedFiles],
+            testResults: value.evidence.testResults.map(result => ({ ...result })),
+          },
+        }
+      : {}),
+  };
 }
 
 function copyJob(value: DurableJob): DurableJob {
@@ -187,6 +204,7 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   private readonly projectRuntimeAgents = new Map<string, Set<string>>();
   private readonly repositoryObservations = new Map<string, DurableRepositoryObservation[]>();
   private readonly runtimeObservations = new Map<string, DurableRuntimeObservation[]>();
+  private readonly repositoryWorkspaces = new Map<string, DurableRepositoryWorkspace>();
   private readonly jobs = new Map<string, DurableJob>();
   private readonly attempts = new Map<string, DurableJobAttempt>();
   private readonly executionPlans = new Map<string, DurableExecutionPlan>();
@@ -366,6 +384,85 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     return latest ? copyRuntimeObservation(latest) : null;
   }
 
+  async createRepositoryWorkspace(workspace: DurableRepositoryWorkspace): Promise<void> {
+    this.assertAvailable('write-repository-workspace');
+    const job = this.jobs.get(workspace.jobId);
+    if (!job || job.projectId !== workspace.projectId || job.repositoryId !== workspace.repositoryId) {
+      throw new Error(`Invalid Repository Workspace Job association: ${workspace.id}`);
+    }
+    const binding = this.bindings.get(workspace.sourceCheckoutBindingId);
+    if (!binding || binding.repositoryId !== workspace.repositoryId) {
+      throw new Error(`Invalid Repository Workspace checkout association: ${workspace.id}`);
+    }
+    if (workspace.state !== 'preparing' || workspace.revision !== 0) {
+      throw new Error('New Repository Workspaces must be preparing at revision 0');
+    }
+    if (this.repositoryWorkspaces.has(workspace.id)
+      || [...this.repositoryWorkspaces.values()].some(value => value.jobId === workspace.jobId)) {
+      throw new Error(`Duplicate Repository Workspace identity: ${workspace.id}`);
+    }
+    if ([...this.repositoryWorkspaces.values()].some(value => value.canonicalPath === workspace.canonicalPath)) {
+      throw new Error(`Repository Workspace path already has an owner: ${workspace.canonicalPath}`);
+    }
+    this.repositoryWorkspaces.set(workspace.id, copyRepositoryWorkspace(workspace));
+  }
+
+  async getRepositoryWorkspace(id: string): Promise<DurableRepositoryWorkspace | null> {
+    this.assertAvailable('read');
+    const value = this.repositoryWorkspaces.get(id);
+    return value ? copyRepositoryWorkspace(value) : null;
+  }
+
+  async getRepositoryWorkspaceForJob(jobId: string): Promise<DurableRepositoryWorkspace | null> {
+    this.assertAvailable('read');
+    const value = [...this.repositoryWorkspaces.values()].find(workspace => workspace.jobId === jobId);
+    return value ? copyRepositoryWorkspace(value) : null;
+  }
+
+  async listRepositoryWorkspaces(): Promise<readonly DurableRepositoryWorkspace[]> {
+    this.assertAvailable('read');
+    return [...this.repositoryWorkspaces.values()]
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+      .map(copyRepositoryWorkspace);
+  }
+
+  async saveRepositoryWorkspaceTransition(
+    workspace: DurableRepositoryWorkspace,
+    expectedRevision: number,
+  ): Promise<void> {
+    this.assertAvailable('write-repository-workspace');
+    const existing = this.repositoryWorkspaces.get(workspace.id);
+    if (!existing) throw new Error(`Repository Workspace not found: ${workspace.id}`);
+    if (existing.revision !== expectedRevision || workspace.revision !== expectedRevision + 1) {
+      throw new Error(`Stale Repository Workspace revision for ${workspace.id}`);
+    }
+    for (const field of [
+      'jobId', 'projectId', 'repositoryId', 'sourceCheckoutBindingId', 'baseRevision',
+      'baseBranch', 'branchName', 'canonicalPath', 'createdAt',
+    ] as const) {
+      if (existing[field] !== workspace[field]) {
+        throw new Error(`Repository Workspace transition cannot rewrite ${field}: ${workspace.id}`);
+      }
+    }
+    const allowed = existing.state === 'preparing'
+      ? ['active', 'failed', 'cancelled']
+      : existing.state === 'active'
+        ? ['reviewing', 'failed', 'cancelled']
+        : existing.state === 'reviewing'
+          ? ['active', 'ready_for_approval', 'failed', 'cleanup_pending', 'cancelled']
+          : existing.state === 'ready_for_approval'
+            ? ['failed', 'cleanup_pending', 'cancelled']
+          : existing.state === 'failed'
+            ? ['cleanup_pending', 'cancelled']
+            : existing.state === 'cancelled'
+              ? ['cleanup_pending']
+              : existing.state === 'cleanup_pending' ? ['cleaned', 'failed'] : [];
+    if (!allowed.includes(workspace.state)) {
+      throw new Error(`Repository Workspace cannot transition from ${existing.state} to ${workspace.state}`);
+    }
+    this.repositoryWorkspaces.set(workspace.id, copyRepositoryWorkspace(workspace));
+  }
+
   async createJob(job: DurableJob): Promise<void> {
     this.assertAvailable('write-job');
     requireNonEmpty(job.id, 'Job ID');
@@ -413,6 +510,7 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
       || existing.preferredRuntimeAgentId !== job.preferredRuntimeAgentId
       || existing.acceptanceCriteria !== job.acceptanceCriteria
       || existing.automaticReadOnlyCompletion !== job.automaticReadOnlyCompletion
+      || existing.executionMode !== job.executionMode
       || existing.createdAt !== job.createdAt) {
       throw new Error(`Job transition cannot rewrite durable identity or assignment: ${job.id}`);
     }

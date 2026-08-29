@@ -17,7 +17,8 @@ export const EXECUTION_CAPABILITY_SCHEMA_VERSION = 8;
 export const ORCHESTRATION_SCHEMA_VERSION = 9;
 export const DAILY_OPERATOR_SCHEMA_VERSION = 10;
 export const LATE_EXECUTION_RECONCILIATION_SCHEMA_VERSION = 11;
-export const CURRENT_SCHEMA_VERSION = LATE_EXECUTION_RECONCILIATION_SCHEMA_VERSION;
+export const ISOLATED_WRITE_WORKSPACE_SCHEMA_VERSION = 12;
+export const CURRENT_SCHEMA_VERSION = ISOLATED_WRITE_WORKSPACE_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -541,6 +542,61 @@ const LATE_EXECUTION_RECONCILIATION_SCHEMA_SQL = `
     CHECK (resolution_summary IS NULL OR length(trim(resolution_summary)) > 0);
 `;
 
+const ISOLATED_WRITE_WORKSPACE_SCHEMA_SQL = `
+  ALTER TABLE jobs ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'repository-read-only'
+    CHECK (execution_mode IN ('repository-read-only', 'repository-write-isolated'));
+
+  CREATE TABLE repository_workspaces (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    repository_id TEXT NOT NULL REFERENCES repositories(id),
+    source_checkout_binding_id TEXT NOT NULL REFERENCES repository_checkouts(id),
+    base_revision TEXT NOT NULL CHECK (length(trim(base_revision)) > 0),
+    base_branch TEXT,
+    branch_name TEXT NOT NULL UNIQUE CHECK (length(trim(branch_name)) > 0),
+    canonical_path TEXT NOT NULL UNIQUE CHECK (length(trim(canonical_path)) > 0),
+    state TEXT NOT NULL CHECK (state IN (
+      'preparing', 'active', 'reviewing', 'ready_for_approval', 'failed', 'cancelled',
+      'cleanup_pending', 'cleaned'
+    )),
+    evidence_json TEXT,
+    failure_reason TEXT,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK ((state = 'failed') = (failure_reason IS NOT NULL))
+  );
+
+  CREATE INDEX repository_workspaces_by_state
+    ON repository_workspaces(state, created_at, id);
+
+  ALTER TABLE execution_plans ADD COLUMN repository_workspace_id TEXT
+    REFERENCES repository_workspaces(id);
+  ALTER TABLE execution_plans ADD COLUMN requested_repository_patch INTEGER
+    CHECK (requested_repository_patch IS NULL OR requested_repository_patch IN (0, 1));
+  ALTER TABLE execution_plans ADD COLUMN requested_test_run INTEGER
+    CHECK (requested_test_run IS NULL OR requested_test_run IN (0, 1));
+  ALTER TABLE execution_plans ADD COLUMN requested_git_inspect INTEGER
+    CHECK (requested_git_inspect IS NULL OR requested_git_inspect IN (0, 1));
+
+  ALTER TABLE execution_dispatches ADD COLUMN effective_repository_patch INTEGER
+    CHECK (effective_repository_patch IS NULL OR effective_repository_patch IN (0, 1));
+  ALTER TABLE execution_dispatches ADD COLUMN effective_test_run INTEGER
+    CHECK (effective_test_run IS NULL OR effective_test_run IN (0, 1));
+  ALTER TABLE execution_dispatches ADD COLUMN effective_git_inspect INTEGER
+    CHECK (effective_git_inspect IS NULL OR effective_git_inspect IN (0, 1));
+
+  ALTER TABLE execution_observations ADD COLUMN repository_write_root TEXT;
+  ALTER TABLE execution_observations ADD COLUMN effective_repository_patch INTEGER
+    CHECK (effective_repository_patch IS NULL OR effective_repository_patch IN (0, 1));
+  ALTER TABLE execution_observations ADD COLUMN effective_test_run INTEGER
+    CHECK (effective_test_run IS NULL OR effective_test_run IN (0, 1));
+  ALTER TABLE execution_observations ADD COLUMN effective_git_inspect INTEGER
+    CHECK (effective_git_inspect IS NULL OR effective_git_inspect IN (0, 1));
+  ALTER TABLE execution_observations ADD COLUMN tool_operations_json TEXT;
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -596,6 +652,11 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: LATE_EXECUTION_RECONCILIATION_SCHEMA_VERSION,
     name: 'late-execution-reconciliation',
     up: database => database.exec(LATE_EXECUTION_RECONCILIATION_SCHEMA_SQL),
+  },
+  {
+    version: ISOLATED_WRITE_WORKSPACE_SCHEMA_VERSION,
+    name: 'isolated-write-job-workspaces',
+    up: database => database.exec(ISOLATED_WRITE_WORKSPACE_SCHEMA_SQL),
   },
 ];
 

@@ -20,6 +20,11 @@ import {
   RootScopedRepositoryReader,
   type RepositoryReadAuditEvent,
 } from './repository-read-capability.js';
+import {
+  RootScopedRepositoryWorkspaceTools,
+  WorkspaceToolError,
+  type WorkspaceToolAuditEvent,
+} from './repository-workspace-capability.js';
 
 interface IPty {
   pid: number;
@@ -91,6 +96,8 @@ interface CorrelatedTurnRecord {
   effectiveCapabilities?: RuntimeExecutionCapabilitiesEnvelope;
   repositoryReadRoot?: string;
   repositoryReadOperations?: readonly RepositoryReadAuditEvent[];
+  repositoryWriteRoot?: string;
+  toolOperations?: readonly WorkspaceToolAuditEvent[];
 }
 
 export interface CorrelationSafeTurnReference {
@@ -198,6 +205,85 @@ const REPOSITORY_DYNAMIC_TOOLS = [{
   ],
 }] as const;
 
+const REPOSITORY_PATCH_DYNAMIC_TOOLS = [{
+  type: 'namespace',
+  name: 'repository',
+  description: 'Bounded repository access rooted to the isolated Agent Operations worktree.',
+  tools: [{
+    type: 'function',
+    name: 'patch',
+    description: 'Replace one exact, unique text fragment in one existing repository file.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        oldText: { type: 'string' },
+        newText: { type: 'string' },
+      },
+      required: ['path', 'oldText', 'newText'],
+      additionalProperties: false,
+    },
+  }],
+}] as const;
+
+const TEST_DYNAMIC_TOOLS = [{
+  type: 'namespace',
+  name: 'test',
+  description: 'Run one predefined Agent Operations validation command without shell access.',
+  tools: [{
+    type: 'function',
+    name: 'run',
+    description: 'Run an allowlisted validation by command ID.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        commandId: {
+          type: 'string',
+          enum: ['typecheck', 'agent-operations-tests', 'build', 'dashboard-tests'],
+        },
+      },
+      required: ['commandId'],
+      additionalProperties: false,
+    },
+  }],
+}] as const;
+
+const GIT_INSPECTION_DYNAMIC_TOOLS = [{
+  type: 'namespace',
+  name: 'git',
+  description: 'Read-only Git evidence for the isolated Agent Operations worktree.',
+  tools: [{
+    type: 'function',
+    name: 'inspect',
+    description: 'Inspect status, diff, diff stat, or HEAD without mutating Git state.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        operation: { type: 'string', enum: ['status', 'diff', 'diff-stat', 'head'] },
+      },
+      required: ['operation'],
+      additionalProperties: false,
+    },
+  }],
+}] as const;
+
+function buildDynamicTools(capabilities?: RuntimeExecutionCapabilitiesEnvelope): unknown[] {
+  const tools: unknown[] = [];
+  if (capabilities?.repositoryRead) {
+    const repository = REPOSITORY_DYNAMIC_TOOLS[0];
+    tools.push({
+      ...repository,
+      tools: [
+        ...repository.tools,
+        ...(capabilities.repositoryPatch ? REPOSITORY_PATCH_DYNAMIC_TOOLS[0].tools : []),
+      ],
+    });
+  }
+  if (capabilities?.testRun) tools.push(...TEST_DYNAMIC_TOOLS);
+  if (capabilities?.gitInspect) tools.push(...GIT_INSPECTION_DYNAMIC_TOOLS);
+  return tools;
+}
+
 const THREAD_PERMISSION_OVERRIDES = {
   approvalPolicy: 'never',
   sandbox: 'danger-full-access',
@@ -250,6 +336,9 @@ export class CodexAppServerPTY {
   private _protectedThreadId: string | null = null;
   private _repositoryReader: RootScopedRepositoryReader | null = null;
   private _repositoryReadOperations: RepositoryReadAuditEvent[] = [];
+  private _workspaceTools: RootScopedRepositoryWorkspaceTools | null = null;
+  private _workspaceToolOperations: WorkspaceToolAuditEvent[] = [];
+  private _workspaceToolCapabilities: RuntimeExecutionCapabilitiesEnvelope | null = null;
   private _protectedTurnResultText: string | null = null;
   private _correlationStartPending = false;
   private _writeBuffer = '';
@@ -347,6 +436,9 @@ export class CodexAppServerPTY {
     this._protectedThreadId = null;
     this._repositoryReader = null;
     this._repositoryReadOperations = [];
+    this._workspaceTools = null;
+    this._workspaceToolOperations = [];
+    this._workspaceToolCapabilities = null;
     this._protectedTurnResultText = null;
     this._correlationStartPending = false;
     this._turnQueue = [];
@@ -426,6 +518,10 @@ export class CodexAppServerPTY {
       ? mapExecutionPolicyToCodex(executionPolicy, executionWorkingDirectory)
       : null;
     const repositoryReadEnabled = executionCapabilities?.repositoryRead === true;
+    const repositoryPatchEnabled = executionCapabilities?.repositoryPatch === true;
+    const workspaceToolsEnabled = repositoryPatchEnabled
+      || executionCapabilities?.testRun === true
+      || executionCapabilities?.gitInspect === true;
     if (executionCapabilities && executionCapabilities.version !== 1) {
       throw new Error('POLICY_UNSUPPORTED: unsupported execution capabilities version');
     }
@@ -437,6 +533,18 @@ export class CodexAppServerPTY {
     if (!repositoryReadEnabled && executionContext?.repositoryReadRoot) {
       throw new Error('POLICY_UNSUPPORTED: repository-read root supplied without capability');
     }
+    if (repositoryPatchEnabled
+      && (!executionContext?.repositoryWriteRoot
+        || executionContext.repositoryWriteRoot !== executionWorkingDirectory
+        || executionPolicy?.filesystem !== 'workspace-write')) {
+      throw new Error('POLICY_UNSUPPORTED: repository patch requires the exact workspace-write root');
+    }
+    if (!repositoryPatchEnabled && executionContext?.repositoryWriteRoot) {
+      throw new Error('POLICY_UNSUPPORTED: repository-write root supplied without patch capability');
+    }
+    if (workspaceToolsEnabled && !executionContext?.repositoryReadRoot) {
+      throw new Error('POLICY_UNSUPPORTED: workspace tools require the exact repository root');
+    }
     this._executing = true;
     this._correlationStartPending = true;
     let threadId: string;
@@ -445,12 +553,19 @@ export class CodexAppServerPTY {
         ? new RootScopedRepositoryReader(executionWorkingDirectory)
         : null;
       this._repositoryReadOperations = [];
+      this._workspaceTools = workspaceToolsEnabled
+        ? new RootScopedRepositoryWorkspaceTools(executionWorkingDirectory)
+        : null;
+      this._workspaceToolOperations = [];
+      this._workspaceToolCapabilities = executionCapabilities
+        ? { ...executionCapabilities }
+        : null;
       this._protectedTurnResultText = null;
       threadId = policyMapping
         ? await this.startPolicyIsolatedThread(
             policyMapping,
             executionWorkingDirectory,
-            repositoryReadEnabled,
+            executionCapabilities,
           )
         : this._threadId;
     } catch (error) {
@@ -458,6 +573,9 @@ export class CodexAppServerPTY {
       this._correlationStartPending = false;
       this._repositoryReader = null;
       this._repositoryReadOperations = [];
+      this._workspaceTools = null;
+      this._workspaceToolOperations = [];
+      this._workspaceToolCapabilities = null;
       this._protectedTurnResultText = null;
       if (this._alive && this._turnQueue.length > 0) void this.drainQueue();
       throw new Error(`POLICY_THREAD_SETUP_FAILED: ${error instanceof Error ? error.message : String(error)}`);
@@ -507,6 +625,7 @@ export class CodexAppServerPTY {
         executionPolicy,
         executionCapabilities,
         executionContext?.repositoryReadRoot,
+        executionContext?.repositoryWriteRoot,
       )) {
         throw new Error('Codex turn started but correlated state could not be persisted');
       }
@@ -521,6 +640,9 @@ export class CodexAppServerPTY {
                 workingDirectory: executionWorkingDirectory,
                 ...(executionContext.repositoryReadRoot
                   ? { repositoryReadRoot: executionContext.repositoryReadRoot }
+                  : {}),
+                ...(executionContext.repositoryWriteRoot
+                  ? { repositoryWriteRoot: executionContext.repositoryWriteRoot }
                   : {}),
               },
             }
@@ -554,7 +676,7 @@ export class CodexAppServerPTY {
   private async startPolicyIsolatedThread(
     mapping: CodexExecutionPolicyMapping,
     workingDirectory: string,
-    repositoryReadEnabled: boolean,
+    capabilities?: RuntimeExecutionCapabilitiesEnvelope,
   ): Promise<string> {
     const mcpServers = await this.readRestrictedMcpServerOverrides(workingDirectory);
     const response = await this.request<ThreadResponse>('thread/start', {
@@ -563,7 +685,7 @@ export class CodexAppServerPTY {
       approvalPolicy: 'never',
       sandbox: mapping.threadSandbox,
       ...(mapping.environments ? { environments: mapping.environments } : {}),
-      dynamicTools: repositoryReadEnabled ? REPOSITORY_DYNAMIC_TOOLS : [],
+      dynamicTools: buildDynamicTools(capabilities),
       selectedCapabilityRoots: [],
       config: {
         features: {
@@ -1146,7 +1268,7 @@ export class CodexAppServerPTY {
       const method = String(message.method);
       const id = message.id as number | string;
       if (method === 'item/tool/call') {
-        this.handleRepositoryToolCall(id, message.params);
+        void this.handleDynamicToolCall(id, message.params);
         return;
       }
       this._outputBuffer.push(`[codex-app-server] unsupported request: ${method}\n`);
@@ -1356,6 +1478,93 @@ export class CodexAppServerPTY {
     }
   }
 
+  private async handleDynamicToolCall(id: number | string, rawParams: unknown): Promise<void> {
+    const params = isRecord(rawParams) ? rawParams as unknown as DynamicToolCallParams : null;
+    if (params?.namespace === 'repository'
+      && (params.tool === 'list' || params.tool === 'read' || params.tool === 'search')) {
+      this.handleRepositoryToolCall(id, rawParams);
+      return;
+    }
+    const reply = (success: boolean, value: unknown): void => {
+      this._rpc?.respond(id, {
+        success,
+        contentItems: [{
+          type: 'inputText',
+          text: typeof value === 'string' ? value : JSON.stringify(value),
+        }],
+      });
+    };
+    const exactTurn = params
+      && params.threadId === this._protectedThreadId
+      && params.turnId === this._protectedTurnId;
+    const args = params && isRecord(params.arguments) ? params.arguments : {};
+    const allowed = exactTurn && this._workspaceTools && (
+      params.namespace === 'repository' && params.tool === 'patch'
+        ? this._workspaceToolCapabilities?.repositoryPatch === true
+        : params.namespace === 'test' && params.tool === 'run'
+          ? this._workspaceToolCapabilities?.testRun === true
+          : params.namespace === 'git' && params.tool === 'inspect'
+            ? this._workspaceToolCapabilities?.gitInspect === true
+            : false
+    );
+    if (!allowed || !params || !this._workspaceTools) {
+      reply(false, { code: 'CAPABILITY_DENIED', message: 'Workspace capability is unavailable for this exact turn' });
+      return;
+    }
+    try {
+      if (params.namespace === 'repository') {
+        const path = typeof args.path === 'string' ? args.path : '';
+        const result = this._workspaceTools.patch(
+          path,
+          typeof args.oldText === 'string' ? args.oldText : '',
+          typeof args.newText === 'string' ? args.newText : '',
+        );
+        this.recordWorkspaceToolOperation({
+          namespace: 'repository', operation: 'patch', path,
+          success: true, occurredAt: new Date().toISOString(),
+        });
+        reply(true, result);
+        return;
+      }
+      if (params.namespace === 'test') {
+        const event = await this._workspaceTools.runTest(
+          typeof args.commandId === 'string' ? args.commandId : '',
+        );
+        this.recordWorkspaceToolOperation(event);
+        reply(event.success, event);
+        return;
+      }
+      const operation = args.operation === 'status' || args.operation === 'diff'
+        || args.operation === 'diff-stat' || args.operation === 'head' ? args.operation : null;
+      if (!operation) throw new WorkspaceToolError('INVALID_OPERATION', 'Git inspection operation is invalid');
+      const event = await this._workspaceTools.inspectGit(operation);
+      this.recordWorkspaceToolOperation(event);
+      reply(event.success, event);
+    } catch (error) {
+      const code = error instanceof WorkspaceToolError ? error.code : 'TOOL_FAILED';
+      const event: WorkspaceToolAuditEvent = {
+        namespace: params.namespace as 'repository' | 'test' | 'git',
+        operation: params.tool,
+        success: false,
+        occurredAt: new Date().toISOString(),
+        errorCode: code,
+        ...(typeof args.path === 'string' ? { path: args.path } : {}),
+        ...(typeof args.commandId === 'string' ? { commandId: args.commandId } : {}),
+      };
+      this.recordWorkspaceToolOperation(event);
+      reply(false, { code, message: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  private recordWorkspaceToolOperation(event: WorkspaceToolAuditEvent): void {
+    this._workspaceToolOperations = [...this._workspaceToolOperations, event].slice(-100);
+    if (!this._protectedThreadId || !this._protectedTurnId) return;
+    this.writeCorrelatedTurnRecord(
+      this._protectedThreadId,
+      { id: this._protectedTurnId, status: 'inProgress' },
+    );
+  }
+
   private recordRepositoryReadOperation(event: RepositoryReadAuditEvent): void {
     this._repositoryReadOperations = [...this._repositoryReadOperations, event].slice(-100);
     if (!this._protectedThreadId || !this._protectedTurnId) return;
@@ -1406,6 +1615,9 @@ export class CodexAppServerPTY {
     this._correlationStartPending = false;
     this._repositoryReader = null;
     this._repositoryReadOperations = [];
+    this._workspaceTools = null;
+    this._workspaceToolOperations = [];
+    this._workspaceToolCapabilities = null;
     this._protectedTurnResultText = null;
     this._executing = false;
     if (this._alive && this._turnQueue.length > 0) {
@@ -1433,6 +1645,7 @@ export class CodexAppServerPTY {
     effectivePolicy?: RuntimeExecutionPolicyEnvelope,
     effectiveCapabilities?: RuntimeExecutionCapabilitiesEnvelope,
     repositoryReadRoot?: string,
+    repositoryWriteRoot?: string,
   ): boolean {
     const path = this.correlatedTurnRecordPath(threadId, turn.id);
     if (!path) return false;
@@ -1454,9 +1667,13 @@ export class CodexAppServerPTY {
     const recordedPolicy = effectivePolicy ?? previous?.effectivePolicy;
     const recordedCapabilities = effectiveCapabilities ?? previous?.effectiveCapabilities;
     const recordedReaderRoot = repositoryReadRoot ?? previous?.repositoryReadRoot;
+    const recordedWriterRoot = repositoryWriteRoot ?? previous?.repositoryWriteRoot;
     const recordedOperations = this._repositoryReadOperations.length
       ? this._repositoryReadOperations
       : previous?.repositoryReadOperations;
+    const recordedToolOperations = this._workspaceToolOperations.length
+      ? this._workspaceToolOperations
+      : previous?.toolOperations;
     const recordedResultText = this._protectedTurnResultText ?? previous?.resultText;
     const record: CorrelatedTurnRecord = {
       version: 1,
@@ -1483,8 +1700,12 @@ export class CodexAppServerPTY {
         ? { effectiveCapabilities: { ...recordedCapabilities } }
         : {}),
       ...(recordedReaderRoot ? { repositoryReadRoot: recordedReaderRoot } : {}),
+      ...(recordedWriterRoot ? { repositoryWriteRoot: recordedWriterRoot } : {}),
       ...(recordedOperations?.length
         ? { repositoryReadOperations: recordedOperations.map(operation => ({ ...operation })) }
+        : {}),
+      ...(recordedToolOperations?.length
+        ? { toolOperations: recordedToolOperations.map(operation => ({ ...operation })) }
         : {}),
     };
     try {

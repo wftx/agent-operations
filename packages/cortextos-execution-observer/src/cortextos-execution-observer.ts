@@ -27,6 +27,7 @@ interface CorrelatedTurnRecord {
   readonly resultText?: string;
   readonly workingDirectory?: string;
   readonly repositoryReadRoot?: string;
+  readonly repositoryWriteRoot?: string;
   readonly effectivePolicy?: {
     readonly version: 1;
     readonly filesystem: 'none' | 'read-only' | 'workspace-write';
@@ -36,6 +37,9 @@ interface CorrelatedTurnRecord {
   readonly effectiveCapabilities?: {
     readonly version: 1;
     readonly repositoryRead: boolean;
+    readonly repositoryPatch?: boolean;
+    readonly testRun?: boolean;
+    readonly gitInspect?: boolean;
   };
   readonly repositoryReadOperations?: readonly {
     readonly operation: 'list' | 'read' | 'search';
@@ -45,6 +49,7 @@ interface CorrelatedTurnRecord {
     readonly occurredAt: string;
     readonly errorCode?: string;
   }[];
+  readonly toolOperations?: RuntimeExecutionObservation['toolOperations'];
 }
 
 export interface CortextOSExecutionObserverOptions {
@@ -192,10 +197,16 @@ export class CortextOSExecutionObserver implements RuntimeExecutionObservationAd
         && (record.repositoryReadRoot === undefined
           || (record.repositoryReadRoot === record.workingDirectory
             && resolve(record.repositoryReadRoot) === record.repositoryReadRoot))
+        && (record.repositoryWriteRoot === undefined
+          || (record.repositoryWriteRoot === record.workingDirectory
+            && resolve(record.repositoryWriteRoot) === record.repositoryWriteRoot))
         ? {
             workingDirectory: record.workingDirectory,
             ...(record.repositoryReadRoot
               ? { repositoryReadRoot: record.repositoryReadRoot }
+              : {}),
+            ...(record.repositoryWriteRoot
+              ? { repositoryWriteRoot: record.repositoryWriteRoot }
               : {}),
           }
         : undefined;
@@ -213,11 +224,14 @@ export class CortextOSExecutionObserver implements RuntimeExecutionObservationAd
         ...(executionContext ? { executionContext } : {}),
         ...(effectivePolicy ? { effectivePolicy } : {}),
         ...(effectiveCapabilities ? { effectiveCapabilities } : {}),
+        ...(record.toolOperations?.length
+          ? { toolOperations: record.toolOperations.map(operation => ({ ...operation })) }
+          : {}),
         ...(record.status === 'completed' && record.resultText
           ? { resultText: record.resultText }
           : {}),
-        ...(record.repositoryReadOperations?.length
-          ? { outputSummary: `${record.repositoryReadOperations.length} bounded repository-read operation(s) recorded; file contents are not persisted.` }
+        ...(record.repositoryReadOperations?.length || record.toolOperations?.length
+          ? { outputSummary: `${record.repositoryReadOperations?.length ?? 0} bounded repository read operation(s) and ${record.toolOperations?.length ?? 0} workspace operation(s) recorded.` }
           : {}),
         message: record.status === 'completed'
           ? 'Codex reported structured completion for the exact accepted turn; semantic outcome remains an Agent Operations control-plane decision.'
@@ -278,7 +292,18 @@ function parseExecutionCapabilities(
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const capabilities = value as Record<string, unknown>;
   if (capabilities.version !== 1 || typeof capabilities.repositoryRead !== 'boolean') return undefined;
-  return { version: 1, repositoryRead: capabilities.repositoryRead };
+  for (const field of ['repositoryPatch', 'testRun', 'gitInspect'] as const) {
+    if (capabilities[field] !== undefined && typeof capabilities[field] !== 'boolean') return undefined;
+  }
+  return {
+    version: 1,
+    repositoryRead: capabilities.repositoryRead,
+    ...(capabilities.repositoryPatch !== undefined
+      ? { repositoryPatch: capabilities.repositoryPatch as boolean }
+      : {}),
+    ...(capabilities.testRun !== undefined ? { testRun: capabilities.testRun as boolean } : {}),
+    ...(capabilities.gitInspect !== undefined ? { gitInspect: capabilities.gitInspect as boolean } : {}),
+  };
 }
 
 function runtimeAgentName(runtimeAgentId: string): string {

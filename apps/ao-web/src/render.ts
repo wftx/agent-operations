@@ -5,6 +5,7 @@ import type {
   OperatorRuntimeStatus,
   OperatorTaskInput,
   OperatorTaskPreview,
+  RuntimeStartResult,
 } from '../../../packages/agent-operations-application/src/index.js';
 
 export function renderDashboard(
@@ -16,6 +17,7 @@ export function renderDashboard(
     readonly preview?: OperatorTaskPreview;
     readonly input?: Partial<OperatorTaskInput>;
     readonly telegramConfigured?: boolean;
+    readonly runtimeStart?: RuntimeStartResult;
   } = {},
 ): string {
   const runnable = projects.filter(project => project.runnable);
@@ -23,16 +25,18 @@ export function renderDashboard(
   const selectedRepository = options.input?.repositoryId
     ?? runnable.find(project => project.project.id === selectedProject)?.repositories[0]?.id
     ?? '';
+  const selectedMode = options.input?.executionMode ?? 'repository-read-only';
   const running = jobs.filter(job => job.operatorRun?.status === 'pending' || job.operatorRun?.status === 'running').length;
   const needsMe = jobs.filter(job => job.needsHuman).length;
   const today = new Date().toISOString().slice(0, 10);
   const doneToday = jobs.filter(job => job.job.status === 'completed' && job.job.updatedAt.startsWith(today)).length;
   const form = `
     <section class="mission-summary">
-      <div class="runtime ${runtime.state}"><span class="runtime-dot"></span><div><p class="eyebrow">Runtime</p><strong>${escapeHtml(runtime.label)}</strong>${runtime.reason ? `<small>${escapeHtml(runtime.reason)}</small>` : ''}</div></div>
+      <div class="runtime ${runtime.state}"><span class="runtime-dot"></span><div><p class="eyebrow">Runtime</p><strong>${escapeHtml(runtime.label)}</strong>${runtime.reason ? `<small>${escapeHtml(runtime.reason)}</small>` : ''}${runtime.state !== 'ready' ? '<form method="post" action="/runtime/start"><button>Start Runtime</button></form>' : ''}</div></div>
       <div><p class="eyebrow">Notifications</p><strong>Telegram: ${options.telegramConfigured ? 'Configured' : 'Not configured'}</strong></div>
       <div><span>${running}</span><small>Running</small></div><div><span>${needsMe}</span><small>Needs Me</small></div><div><span>${doneToday}</span><small>Done Today</small></div>
     </section>
+    ${options.runtimeStart ? renderRuntimeStart(options.runtimeStart) : ''}
     <section class="hero">
       <div><p class="eyebrow">New repository job</p><h1>What should Agent Operations do?</h1>
       <p class="lede">One bounded Worker, one independent Reviewer, and at most one revision. Read-only by default.</p></div>
@@ -51,15 +55,26 @@ export function renderDashboard(
         <label>Task
           <textarea name="task" rows="5" required placeholder="Find where the RuntimeExecutionPolicy contract is defined and summarize it.">${escapeHtml(options.input?.task ?? '')}</textarea>
         </label>
+        <label>Execution mode
+          <select name="executionMode" required>
+            <option value="repository-read-only" ${selectedMode === 'repository-read-only' ? 'selected' : ''}>Read repository only</option>
+            <option value="repository-write-isolated" ${selectedMode === 'repository-write-isolated' ? 'selected' : ''}>Write in isolated AO workspace</option>
+          </select>
+        </label>
         <label>Acceptance criteria
           <textarea name="acceptanceCriteria" rows="3" required placeholder="Identify the authoritative contract file and its three dimensions.">${escapeHtml(options.input?.acceptanceCriteria ?? '')}</textarea>
         </label>
-        <div class="defaults"><span>Repository <strong>read-only</strong></span><span>Network <strong>deny</strong></span><span>Environment <strong>empty</strong></span><span>Worker executions <strong>max 2</strong></span><span>Reviewer <strong>on</strong></span><span>Auto-complete <strong>after PASS</strong></span></div>
+        <div class="defaults"><span>Repository <strong>${selectedMode === 'repository-write-isolated' ? 'isolated workspace' : 'read only'}</strong></span><span>Network <strong>deny</strong></span><span>Environment <strong>empty</strong></span><span>Worker executions <strong>max 2</strong></span><span>Reviewer <strong>on</strong></span><span>Result <strong>${selectedMode === 'repository-write-isolated' ? 'approval required after PASS' : 'complete after PASS'}</strong></span></div>
         <div class="actions"><button class="secondary" name="intent" value="preview">Preview</button><button name="intent" value="run" ${runnable.length ? '' : 'disabled'}>Run Job</button></div>
       </form>
     </section>
     ${renderJobTable(jobs, 'Recent Jobs')}`;
   return layout('Jobs', form, 'jobs');
+}
+
+function renderRuntimeStart(result: RuntimeStartResult): string {
+  const inventory = `${result.inventory.configuredAgents.length} configured agent(s), ${result.inventory.configuredCronCount} cron(s), ${result.inventory.configuredIntegrationCount} integration credential file(s)`;
+  return `<div class="alert ${result.status === 'failed' ? 'error' : 'preview'}"><strong>${escapeHtml(result.message)}</strong><br>${escapeHtml(inventory)}${result.diagnostic ? `<br><small>${escapeHtml(result.diagnostic)}</small>` : ''}</div>`;
 }
 
 export function renderJobList(
@@ -110,6 +125,7 @@ export function renderJobDetail(detail: OperatorJobDetail): string {
   const escalations = detail.escalations.map(escalation => `<div class="alert ${escalation.resolvedAt ? 'preview' : 'error'}"><strong>${escapeHtml(humanize(escalation.reason))}</strong><br>${escapeHtml(escalation.summary)}${escalation.resolvedAt ? `<br><small>Resolved ${formatTime(escalation.resolvedAt)}${escalation.resolutionSummary ? ` — ${escapeHtml(escalation.resolutionSummary)}` : ''}</small>` : ''}${!escalation.resolvedAt ? renderEscalationActions(detail, escalation.id) : ''}</div>`).join('');
   const guidance = detail.guidance.map(item => `<article class="story-step"><div class="step-number">H</div><div class="step-body"><p class="eyebrow">Human guidance</p><div class="result">${escapeHtml(item.instruction)}</div><p class="muted">Applied only to the next fresh Worker Attempt · ${formatTime(item.createdAt)}</p></div></article>`).join('');
   const content = `<a class="back" href="/">← All Jobs</a><header class="detail-head"><div><span class="status ${statusClass(summary)}">${escapeHtml(summary.orchestrationState)}</span><h1>${escapeHtml(summary.job.title)}</h1><p>${escapeHtml(summary.projectName)} · ${escapeHtml(summary.repositoryName)}</p></div><time>Created ${formatTime(summary.job.createdAt)}</time></header>
+    <section class="criteria"><p class="eyebrow">Execution mode</p><p><strong>${summary.job.executionMode === 'repository-write-isolated' ? 'Isolated repository write' : 'Repository read only'}</strong>${detail.repositoryWorkspace ? ` · branch ${escapeHtml(detail.repositoryWorkspace.branchName)} · base ${escapeHtml(detail.repositoryWorkspace.baseRevision.slice(0, 12))} · workspace ${escapeHtml(detail.repositoryWorkspace.canonicalPath)} · state ${escapeHtml(detail.repositoryWorkspace.state)}` : ''}</p>${detail.repositoryWorkspace?.evidence ? `<p>${detail.repositoryWorkspace.evidence.changedFiles.length} changed file(s). Diff ${detail.repositoryWorkspace.evidence.diffTruncated ? 'was truncated to its audit bound' : 'captured in full'}. ${detail.repositoryWorkspace.evidence.testResults.length} test result(s) recorded.</p><details><summary>Bounded diff evidence</summary><pre>${escapeHtml(detail.repositoryWorkspace.evidence.diffStat)}\n\n${escapeHtml(detail.repositoryWorkspace.evidence.diffText)}</pre></details>` : ''}</section>
     <section class="criteria"><p class="eyebrow">Worker execution budget</p><p><strong>${summary.workerExecutionCount} of 2 consumed</strong> · ${summary.workerAttemptCount} historical Worker ${summary.workerAttemptCount === 1 ? 'Attempt' : 'Attempts'} retained for audit.</p></section>
     <section class="criteria"><p class="eyebrow">Acceptance criteria</p><p>${escapeHtml(detail.acceptanceCriteria)}</p></section>
     ${escalations}<section class="story">${story || '<div class="empty"><h2>Accepted</h2><p>Agent Operations will prepare the first Worker Attempt.</p></div>'}${guidance}</section>
@@ -125,7 +141,8 @@ export function renderError(message: string, status = 500): string {
 }
 
 function renderPreview(preview: OperatorTaskPreview): string {
-  return `<div class="alert preview"><strong>Safe preview — no Job or Dispatch created.</strong><br>${escapeHtml(preview.project.name)} / ${escapeHtml(preview.repository.name)} · ${escapeHtml(preview.runtimeAgentId)} · read-only / deny / empty · 2 Worker executions · Reviewer enabled</div>`;
+  const write = preview.executionMode === 'repository-write-isolated';
+  return `<div class="alert preview"><strong>Safe preview, no Job or Dispatch created.</strong> No workspace created.<br>${escapeHtml(preview.project.name)} / ${escapeHtml(preview.repository.name)} · ${escapeHtml(preview.runtimeAgentId)} · ${write ? 'workspace write in isolated AO worktree' : 'read only'} / deny / empty · 2 Worker executions · Reviewer enabled · ${write ? 'human approval required after PASS' : 'automatic completion after PASS'}</div>`;
 }
 
 function renderJobTable(jobs: readonly OperatorJobSummary[], title: string): string {

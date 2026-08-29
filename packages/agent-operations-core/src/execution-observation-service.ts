@@ -184,7 +184,12 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
         && (typeof executionContext.repositoryReadRoot !== 'string'
           || !executionContext.repositoryReadRoot.startsWith('/')
           || resolve(executionContext.repositoryReadRoot) !== executionContext.repositoryReadRoot
-          || executionContext.repositoryReadRoot.length > MAX_WORKING_DIRECTORY_LENGTH)))) {
+          || executionContext.repositoryReadRoot.length > MAX_WORKING_DIRECTORY_LENGTH))
+      || (executionContext.repositoryWriteRoot !== undefined
+        && (typeof executionContext.repositoryWriteRoot !== 'string'
+          || !executionContext.repositoryWriteRoot.startsWith('/')
+          || resolve(executionContext.repositoryWriteRoot) !== executionContext.repositoryWriteRoot
+          || executionContext.repositoryWriteRoot.length > MAX_WORKING_DIRECTORY_LENGTH)))) {
     throw new Error('Runtime observer returned an invalid execution working directory');
   }
   const effectivePolicy = value.effectivePolicy;
@@ -200,7 +205,10 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
   if (effectiveCapabilities !== undefined
     && (!isRecord(effectiveCapabilities)
       || effectiveCapabilities.version !== 1
-      || typeof effectiveCapabilities.repositoryRead !== 'boolean')) {
+      || typeof effectiveCapabilities.repositoryRead !== 'boolean'
+      || ['repositoryPatch', 'testRun', 'gitInspect'].some(field =>
+        effectiveCapabilities[field] !== undefined
+        && typeof effectiveCapabilities[field] !== 'boolean'))) {
     throw new Error('Runtime observer returned invalid effective execution capabilities');
   }
   if (effectiveCapabilities?.repositoryRead === true
@@ -211,6 +219,14 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
   if (effectiveCapabilities?.repositoryRead === false && executionContext?.repositoryReadRoot !== undefined) {
     throw new Error('Repository-read root cannot be present when repository-read capability is disabled');
   }
+  if (effectiveCapabilities?.repositoryPatch === true
+    && executionContext?.repositoryWriteRoot !== executionContext?.workingDirectory) {
+    throw new Error('Repository patch evidence requires an exact writer root matching the execution workspace');
+  }
+  if (effectiveCapabilities?.repositoryPatch !== true
+    && executionContext?.repositoryWriteRoot !== undefined) {
+    throw new Error('Repository write root cannot be present when repository patch is disabled');
+  }
   if (correlation !== 'exact' && (executionContext !== undefined
     || effectivePolicy !== undefined || effectiveCapabilities !== undefined)) {
     throw new Error('Only exact runtime observations may carry execution context evidence');
@@ -218,6 +234,10 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
   const resultText = boundedOptional(value.resultText, EXECUTION_RESULT_MAX_CHARS);
   if (resultText && (correlation !== 'exact' || kind !== 'turn-completed')) {
     throw new Error('Execution result text requires exact turn-completion evidence');
+  }
+  const toolOperations = normalizeToolOperations(value.toolOperations);
+  if (toolOperations && correlation !== 'exact') {
+    throw new Error('Only exact runtime observations may carry tool operation evidence');
   }
   return {
     source,
@@ -246,6 +266,9 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
             ...(executionContext.repositoryReadRoot
               ? { repositoryReadRoot: String(executionContext.repositoryReadRoot) }
               : {}),
+            ...(executionContext.repositoryWriteRoot
+              ? { repositoryWriteRoot: String(executionContext.repositoryWriteRoot) }
+              : {}),
           },
         }
       : {}),
@@ -264,10 +287,72 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
           effectiveCapabilities: {
             version: 1,
             repositoryRead: Boolean(effectiveCapabilities.repositoryRead),
+            ...(effectiveCapabilities.repositoryPatch !== undefined
+              ? { repositoryPatch: Boolean(effectiveCapabilities.repositoryPatch) }
+              : {}),
+            ...(effectiveCapabilities.testRun !== undefined
+              ? { testRun: Boolean(effectiveCapabilities.testRun) }
+              : {}),
+            ...(effectiveCapabilities.gitInspect !== undefined
+              ? { gitInspect: Boolean(effectiveCapabilities.gitInspect) }
+              : {}),
           },
         }
       : {}),
+    ...(toolOperations ? { toolOperations } : {}),
   };
+}
+
+function normalizeToolOperations(value: unknown): RuntimeExecutionObservation['toolOperations'] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 100) {
+    throw new Error('Runtime observer returned invalid tool operation evidence');
+  }
+  return value.map(item => {
+    if (!isRecord(item)
+      || !['repository', 'test', 'git'].includes(String(item.namespace))
+      || typeof item.operation !== 'string' || !item.operation.trim()
+      || typeof item.success !== 'boolean'
+      || typeof item.occurredAt !== 'string'
+      || Number.isNaN(new Date(item.occurredAt).getTime())) {
+      throw new Error('Runtime observer returned invalid tool operation evidence');
+    }
+    const stdout = boundedToolOutput(item.stdout);
+    const stderr = boundedToolOutput(item.stderr);
+    return {
+      namespace: item.namespace as 'repository' | 'test' | 'git',
+      operation: boundedRequired(item.operation, 'Tool operation', 100),
+      success: item.success,
+      occurredAt: item.occurredAt,
+      ...(boundedOptional(item.path, 1_024) ? { path: boundedOptional(item.path, 1_024) } : {}),
+      ...(boundedOptional(item.commandId, 100) ? { commandId: boundedOptional(item.commandId, 100) } : {}),
+      ...(boundedOptional(item.command, 500) ? { command: boundedOptional(item.command, 500) } : {}),
+      ...(typeof item.exitCode === 'number' && Number.isInteger(item.exitCode)
+        ? { exitCode: item.exitCode }
+        : {}),
+      ...(typeof item.durationMs === 'number' && Number.isFinite(item.durationMs) && item.durationMs >= 0
+        ? { durationMs: item.durationMs }
+        : {}),
+      ...(stdout.text ? { stdout: stdout.text } : {}),
+      ...(stderr.text ? { stderr: stderr.text } : {}),
+      ...((stdout.truncated || stderr.truncated || item.outputTruncated === true)
+        ? { outputTruncated: true }
+        : {}),
+      ...(boundedOptional(item.errorCode, 100)
+        ? { errorCode: boundedOptional(item.errorCode, 100) }
+        : {}),
+    };
+  });
+}
+
+function boundedToolOutput(value: unknown): { text?: string; truncated: boolean } {
+  if (value === undefined || value === null) return { truncated: false };
+  if (typeof value !== 'string') throw new Error('Optional Observation text must be a string');
+  const clean = value.trim();
+  if (!clean) return { truncated: false };
+  return clean.length > MAX_OUTPUT_SUMMARY_LENGTH
+    ? { text: clean.slice(0, MAX_OUTPUT_SUMMARY_LENGTH), truncated: true }
+    : { text: clean, truncated: false };
 }
 
 function required(value: string, field: string): string {

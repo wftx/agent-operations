@@ -1,11 +1,14 @@
-import { CortextOSRuntimeAdapter } from '../../../packages/cortextos-adapter/src/index.js';
+import {
+  CortextOSRuntimeAdapter,
+  CortextOSRuntimeLifecycleAdapter,
+} from '../../../packages/cortextos-adapter/src/index.js';
 import { CortextOSExecutionAdapter } from '../../../packages/cortextos-execution-adapter/src/index.js';
 import { CortextOSExecutionObserver } from '../../../packages/cortextos-execution-observer/src/index.js';
-import { GitRepositoryAdapter } from '../../../packages/git-adapter/src/index.js';
-import { OrchestrationService } from '../../../packages/agent-operations-core/src/index.js';
+import { GitRepositoryAdapter, GitRepositoryWorkspaceAdapter } from '../../../packages/git-adapter/src/index.js';
+import { OrchestrationService, RepositoryWorkspaceService } from '../../../packages/agent-operations-core/src/index.js';
 import { OperatorApplicationService } from '../../../packages/agent-operations-application/src/index.js';
 import { NoopOperatorNotifier } from '../../../packages/agent-operations-application/src/index.js';
-import { SqliteAgentOperationsStateStore } from '../../../packages/sqlite-state-adapter/src/index.js';
+import { SqliteAgentOperationsStateStore, resolveAgentOperationsStateLocation } from '../../../packages/sqlite-state-adapter/src/index.js';
 import {
   TelegramOperatorNotifier,
   loadAgentOperationsTelegramEnvironmentFile,
@@ -18,16 +21,27 @@ const host = '127.0.0.1';
 const port = parsePort(process.env['AO_WEB_PORT'] ?? '4310');
 const store = SqliteAgentOperationsStateStore.open();
 const runtime = new CortextOSRuntimeAdapter();
+const runtimeLifecycle = new CortextOSRuntimeLifecycleAdapter({ runtime });
+const repositories = new GitRepositoryAdapter();
+const stateLocation = resolveAgentOperationsStateLocation();
+const repositoryWorkspace = new RepositoryWorkspaceService(
+  store,
+  repositories,
+  new GitRepositoryWorkspaceAdapter({ workspaceRoot: `${stateLocation.stateDirectory}/workspaces` }),
+  { stateDirectory: stateLocation.stateDirectory },
+);
 const orchestration = new OrchestrationService(
   store,
   runtime,
-  new GitRepositoryAdapter(),
+  repositories,
   new CortextOSExecutionAdapter(),
   new CortextOSExecutionObserver(),
+  { workspaceService: repositoryWorkspace },
 );
 const notification = loadNotifier();
 const application = new OperatorApplicationService(store, orchestration, {
   runtime,
+  runtimeLifecycle,
   notifier: notification.notifier,
 });
 application.startRunner();

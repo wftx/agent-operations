@@ -29,6 +29,18 @@ export class OperatorWebApplication {
           { telegramConfigured: this.options.telegramConfigured ?? false },
         ));
       }
+      if (request.method === 'POST' && url.pathname === '/runtime/start') {
+        const runtimeStart = await this.application.startRuntime();
+        return html(renderDashboard(
+          await this.application.listProjects(),
+          await this.application.listJobs('all'),
+          await this.application.getRuntimeStatus(),
+          {
+            telegramConfigured: this.options.telegramConfigured ?? false,
+            runtimeStart,
+          },
+        ), runtimeStart.status === 'failed' ? 409 : 200);
+      }
       if (request.method === 'GET' && url.pathname === '/running') {
         return this.listPage('Running', 'Worker and Reviewer turns currently managed by Agent Operations.', 'running');
       }
@@ -83,6 +95,9 @@ export class OperatorWebApplication {
       repositoryId: selection?.repositoryId ?? textValue(form, 'repositoryId'),
       task: textValue(form, 'task'),
       acceptanceCriteria: textValue(form, 'acceptanceCriteria'),
+      executionMode: textValue(form, 'executionMode') === 'repository-write-isolated'
+        ? 'repository-write-isolated'
+        : 'repository-read-only',
     };
     try {
       if (textValue(form, 'intent') === 'preview') {

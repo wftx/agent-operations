@@ -98,7 +98,26 @@ export class ExecutionPreflightService {
         ? `Runtime ${plan.runtimeAgentId} supports bounded repository-read tools.`
         : `Runtime ${plan.runtimeAgentId} cannot expose bounded repository-read tools.`,
     );
-    return supported ? { ...requested } : null;
+    let allSupported = supported;
+    const optional = [
+      ['repositoryPatch', 'repository-write-tools', 'repository-write-capability-supported', 'repository-write-capability-unsupported'],
+      ['testRun', 'test-run-tools', 'test-run-capability-supported', 'test-run-capability-unsupported'],
+      ['gitInspect', 'git-inspection-tools', 'git-inspection-capability-supported', 'git-inspection-capability-unsupported'],
+    ] as const;
+    for (const [field, capability, passCode, failCode] of optional) {
+      if (requested[field] !== true) continue;
+      const has = runtime?.capabilities.includes(capability) === true;
+      add(
+        checks,
+        has ? passCode : failCode,
+        has ? 'pass' : 'blocking',
+        has
+          ? `Runtime ${plan.runtimeAgentId} supports ${capability}.`
+          : `Runtime ${plan.runtimeAgentId} cannot expose ${capability}.`,
+      );
+      allSupported = allSupported && has;
+    }
+    return allSupported ? { ...requested } : null;
   }
 
   private checkRuntimePolicy(
@@ -341,19 +360,43 @@ export class ExecutionPreflightService {
         ? `Runtime ${plan.runtimeAgentId} can establish a per-execution working directory.`
         : `Runtime ${plan.runtimeAgentId} cannot establish a proven per-execution working directory.`,
     );
-    const restrictedRepositoryPolicy = effectivePolicy?.filesystem === 'read-only'
+    const writeExecution = effectiveCapabilities?.repositoryPatch === true;
+    const restrictedRepositoryPolicy = effectivePolicy?.filesystem === (writeExecution ? 'workspace-write' : 'read-only')
       && effectivePolicy.network === 'deny'
-      && effectivePolicy.environment === 'empty';
+      && (effectivePolicy.environment === 'empty'
+        || (writeExecution && effectivePolicy.environment === 'minimal'));
     add(
       checks,
       restrictedRepositoryPolicy ? 'repository-read-only-policy' : 'repository-policy-unsafe',
       restrictedRepositoryPolicy ? 'pass' : 'blocking',
       restrictedRepositoryPolicy
-        ? 'Repository execution is restricted to filesystem=read-only, network=deny, environment=empty.'
-        : 'Phase 18 repository execution requires filesystem=read-only, network=deny, environment=empty.',
+        ? `Repository execution is restricted to filesystem=${effectivePolicy!.filesystem}, network=deny, environment=${effectivePolicy!.environment}.`
+        : writeExecution
+          ? 'Isolated write execution requires filesystem=workspace-write, network=deny, environment=empty or minimal.'
+          : 'Repository review execution requires filesystem=read-only, network=deny, environment=empty.',
     );
     try {
-      const observation = await this.repositories.inspectRepository(binding.canonicalPath);
+      const workspace = plan.repositoryWorkspaceId
+        ? await this.store.getRepositoryWorkspace(plan.repositoryWorkspaceId)
+        : null;
+      const workspaceValid = !plan.repositoryWorkspaceId || Boolean(workspace
+        && workspace.jobId === plan.jobId
+        && workspace.repositoryId === plan.repositoryId
+        && workspace.sourceCheckoutBindingId === plan.checkoutBindingId
+        && (workspace.state === 'active'
+          || (!writeExecution && ['reviewing', 'ready_for_approval'].includes(workspace.state))));
+      if (plan.repositoryWorkspaceId) {
+        add(
+          checks,
+          workspaceValid ? 'repository-workspace-valid' : 'repository-workspace-invalid',
+          workspaceValid ? 'pass' : 'blocking',
+          workspaceValid
+            ? `Repository Workspace ${plan.repositoryWorkspaceId} matches this immutable Plan.`
+            : `Repository Workspace ${plan.repositoryWorkspaceId} is unavailable or no longer valid.`,
+        );
+      }
+      const targetPath = workspace?.canonicalPath ?? binding.canonicalPath;
+      const observation = await this.repositories.inspectRepository(targetPath);
       if (observation.availability === 'unavailable') {
         add(
           checks,
@@ -377,7 +420,7 @@ export class ExecutionPreflightService {
         return null;
       }
       add(checks, 'checkout-available', 'pass', `Checkout path ${binding.canonicalPath} is available.`);
-      const canonicalBindingPath = resolve(binding.canonicalPath);
+      const canonicalBindingPath = resolve(targetPath);
       const observedRoot = observation.repositoryRoot
         ? resolve(observation.repositoryRoot)
         : resolve(observation.checkoutPath);
@@ -422,7 +465,12 @@ export class ExecutionPreflightService {
         && canSelectWorkingDirectory
         && restrictedRepositoryPolicy
         && readerRootValid
-        ? { workingDirectory: observedRoot, repositoryReadRoot: observedRoot }
+        && workspaceValid
+        ? {
+            workingDirectory: observedRoot,
+            repositoryReadRoot: observedRoot,
+            ...(writeExecution ? { repositoryWriteRoot: observedRoot } : {}),
+          }
         : null;
     } catch (error) {
       add(

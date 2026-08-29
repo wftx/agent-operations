@@ -55,6 +55,25 @@ export interface RuntimeExecutionObservation {
   readonly effectivePolicy?: RuntimeExecutionPolicy;
   /** Trusted exact-turn tool capability evidence; omitted for weak or legacy observations. */
   readonly effectiveCapabilities?: RuntimeExecutionCapabilities;
+  /** Bounded audit evidence for dynamic tools used by this exact turn. */
+  readonly toolOperations?: readonly RuntimeToolOperation[];
+}
+
+export interface RuntimeToolOperation {
+  readonly namespace: 'repository' | 'test' | 'git';
+  readonly operation: string;
+  readonly success: boolean;
+  readonly occurredAt: string;
+  readonly path?: string;
+  readonly commandId?: string;
+  readonly command?: string;
+  readonly exitCode?: number;
+  readonly durationMs?: number;
+  readonly stdout?: string;
+  readonly stderr?: string;
+  /** True when AO retained only the bounded prefix of provider tool output. */
+  readonly outputTruncated?: boolean;
+  readonly errorCode?: string;
 }
 
 /** Read-only, explicitly invoked observation capability. */

@@ -5,6 +5,7 @@ import type {
   DurableProject,
   DurableRepository,
   ExecutionRole,
+  JobExecutionMode,
   JobStatus,
 } from '../../agent-operations-contracts/src/index.js';
 import {
@@ -19,6 +20,7 @@ export interface CreateJobInput {
   readonly description?: string;
   readonly acceptanceCriteria?: string;
   readonly automaticReadOnlyCompletion?: boolean;
+  readonly executionMode?: JobExecutionMode;
   readonly repositoryId?: string;
   readonly preferredRuntimeAgentId?: string;
 }
@@ -86,6 +88,10 @@ export class JobLifecycleService {
     if (input.automaticReadOnlyCompletion && !acceptanceCriteria) {
       throw new Error('Automatic read-only completion requires acceptance criteria');
     }
+    const executionMode = input.executionMode ?? 'repository-read-only';
+    if (executionMode === 'repository-write-isolated' && input.automaticReadOnlyCompletion) {
+      throw new Error('Write Jobs cannot enable automatic read-only completion');
+    }
     const job: DurableJob = {
       id: this.jobIdFactory(),
       projectId,
@@ -93,6 +99,7 @@ export class JobLifecycleService {
       ...(optional(input.description) ? { description: optional(input.description) } : {}),
       ...(acceptanceCriteria ? { acceptanceCriteria } : {}),
       ...(input.automaticReadOnlyCompletion ? { automaticReadOnlyCompletion: true } : {}),
+      ...(input.executionMode ? { executionMode } : {}),
       status: 'draft',
       ...(input.repositoryId ? { repositoryId: input.repositoryId } : {}),
       ...(input.preferredRuntimeAgentId

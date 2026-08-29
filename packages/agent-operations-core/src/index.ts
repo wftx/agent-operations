@@ -60,3 +60,7 @@ export {
   readWorkerExecutionBudget,
   type WorkerExecutionBudget,
 } from './worker-execution-budget.js';
+export {
+  RepositoryWorkspaceService,
+  type RepositoryWorkspaceServiceOptions,
+} from './repository-workspace-service.js';

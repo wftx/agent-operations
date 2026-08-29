@@ -8,8 +8,12 @@ import type {
   OperatorRunSession,
   OperatorTaskInput,
   OperatorTaskPreview,
+  RuntimeStartResult,
 } from '../../../packages/agent-operations-application/src/index.js';
-import { OPERATOR_READ_ONLY_DEFAULTS } from '../../../packages/agent-operations-application/src/index.js';
+import {
+  OPERATOR_ISOLATED_WRITE_DEFAULTS,
+  OPERATOR_READ_ONLY_DEFAULTS,
+} from '../../../packages/agent-operations-application/src/index.js';
 import { OperatorWebApplication } from '../src/app.js';
 import { createOperatorHttpServer } from '../src/http-server.js';
 
@@ -24,6 +28,7 @@ class StubOperatorApplication implements OperatorApplication {
   guidanceCalls = 0;
   cancelCalls = 0;
   reconcileCalls = 0;
+  startRuntimeCalls = 0;
 
   constructor(private readonly runtimeReady = true) {}
 
@@ -35,19 +40,36 @@ class StubOperatorApplication implements OperatorApplication {
       : { state: 'offline' as const, label: 'Offline', reason: 'Runtime is not running.' };
   }
 
+  async startRuntime(): Promise<RuntimeStartResult> {
+    this.startRuntimeCalls += 1;
+    return {
+      status: 'started',
+      instanceId: 'default',
+      message: 'Runtime is ready with one configured agent.',
+      inventory: {
+        configuredAgents: [{ id: 'agent-operations/rehearsal', provider: 'codex', enabled: true }],
+        configuredCronCount: 0,
+        configuredIntegrationCount: 0,
+      },
+      daemonPid: 123,
+    };
+  }
+
   async listProjects(): Promise<readonly OperatorProjectOption[]> {
     return [PROJECT];
   }
 
   async previewTask(input: OperatorTaskInput): Promise<OperatorTaskPreview> {
     this.previewCalls += 1;
+    const writeMode = input.executionMode === 'repository-write-isolated';
     return {
       project: PROJECT.project,
       repository: PROJECT.repositories[0],
       runtimeAgentId: 'agent-operations/rehearsal',
       task: input.task,
       acceptanceCriteria: input.acceptanceCriteria,
-      defaults: OPERATOR_READ_ONLY_DEFAULTS,
+      executionMode: writeMode ? 'repository-write-isolated' : 'repository-read-only',
+      defaults: writeMode ? OPERATOR_ISOLATED_WRITE_DEFAULTS : OPERATOR_READ_ONLY_DEFAULTS,
       executionAuthorized: false,
     };
   }
@@ -127,6 +149,7 @@ describe('OperatorWebApplication', () => {
     expect(await escalationDetail.text()).toContain('Choose whether to revise the task.');
     expect(service.previewCalls).toBe(0);
     expect(service.runCalls).toBe(0);
+    expect(service.startRuntimeCalls).toBe(0);
   });
 
   it('shows retained preflight history separately from the Worker execution budget', async () => {
@@ -220,6 +243,8 @@ describe('OperatorWebApplication', () => {
     const body = await landing.text();
     expect(body).toContain('Offline');
     expect(body).toContain('Runtime is not running.');
+    expect(body).toContain('Start Runtime');
+    expect(service.startRuntimeCalls).toBe(0);
     expect(service.runCalls).toBe(0);
 
     const invalid = await app.handle(new Request(
@@ -228,6 +253,20 @@ describe('OperatorWebApplication', () => {
     ));
     expect(invalid.status).toBe(400);
     expect(await invalid.text()).toContain('Guidance is not valid here');
+  });
+
+  it('starts the runtime only through the explicit POST action and only once', async () => {
+    const service = new StubOperatorApplication(false);
+    const app = new OperatorWebApplication(service);
+
+    await app.handle(new Request('http://127.0.0.1/'));
+    await app.handle(new Request('http://127.0.0.1/'));
+    expect(service.startRuntimeCalls).toBe(0);
+
+    const response = await app.handle(new Request('http://127.0.0.1/runtime/start', { method: 'POST' }));
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain('Runtime is ready with one configured agent.');
+    expect(service.startRuntimeCalls).toBe(1);
   });
 
   it('serves a useful local landing page over an isolated fake HTTP server', async () => {
@@ -275,11 +314,15 @@ describe('OperatorWebApplication', () => {
       task: 'Inspect reviews.',
       acceptanceCriteria: 'Name all decisions.',
       intent: 'preview',
+      executionMode: 'repository-write-isolated',
     });
 
     const preview = await app.handle(formRequest(fields));
     expect(preview.status).toBe(200);
-    expect(await preview.text()).toContain('no Job or Dispatch created');
+    const previewBody = await preview.text();
+    expect(previewBody).toContain('no Job or Dispatch created');
+    expect(previewBody).toContain('workspace write in isolated AO worktree');
+    expect(previewBody).toContain('human approval required after PASS');
     expect(service.previewCalls).toBe(1);
     expect(service.runCalls).toBe(0);
 

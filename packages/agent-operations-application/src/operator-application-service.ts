@@ -1,6 +1,7 @@
 import type {
   AgentOperationsStateStore,
   AgentRuntimeAdapter,
+  RuntimeLifecycleAdapter,
   DurableJob,
   DurableJobAttempt,
   DurableOperatorRun,
@@ -8,6 +9,7 @@ import type {
 import {
   REPOSITORY_READ_EXECUTION_CAPABILITIES,
   RESTRICTED_TEXT_EXECUTION_POLICY,
+  REPOSITORY_WRITE_EXECUTION_CAPABILITIES,
   createHumanGuidanceId,
   createEscalationId,
   createOperatorRunId,
@@ -49,6 +51,7 @@ export interface OperatorOrchestrationPort {
 export interface OperatorApplicationServiceOptions {
   readonly now?: () => Date;
   readonly runtime?: AgentRuntimeAdapter;
+  readonly runtimeLifecycle?: RuntimeLifecycleAdapter;
   readonly notifier?: OperatorNotifier;
   readonly operatorRunIdFactory?: () => string;
   readonly humanGuidanceIdFactory?: () => string;
@@ -63,6 +66,14 @@ export const OPERATOR_READ_ONLY_DEFAULTS: OperatorPolicyDefaults = {
   automaticReadOnlyCompletion: true,
 };
 
+export const OPERATOR_ISOLATED_WRITE_DEFAULTS: OperatorPolicyDefaults = {
+  policy: { version: 1, filesystem: 'workspace-write', network: 'deny', environment: 'empty' },
+  capabilities: { ...REPOSITORY_WRITE_EXECUTION_CAPABILITIES },
+  maxWorkerAttempts: MVP_MAX_WORKER_ATTEMPTS,
+  reviewerEnabled: true,
+  automaticReadOnlyCompletion: false,
+};
+
 /**
  * Job-shaped boundary used by both local operator surfaces. Read operations
  * inspect AO durable state only. runOperatorJob is the sole execution entry.
@@ -73,6 +84,7 @@ export class OperatorApplicationService implements OperatorApplication {
   private runReserved = false;
   private readonly runner: OperatorRunner;
   private readonly runtime?: AgentRuntimeAdapter;
+  private readonly runtimeLifecycle?: RuntimeLifecycleAdapter;
   private readonly operatorRunIdFactory: () => string;
   private readonly humanGuidanceIdFactory: () => string;
   private readonly escalationIdFactory: () => string;
@@ -85,6 +97,7 @@ export class OperatorApplicationService implements OperatorApplication {
     this.now = options.now ?? (() => new Date());
     this.lifecycle = new JobLifecycleService(store, { now: this.now });
     this.runtime = options.runtime;
+    this.runtimeLifecycle = options.runtimeLifecycle;
     this.operatorRunIdFactory = options.operatorRunIdFactory ?? (() => createOperatorRunId());
     this.humanGuidanceIdFactory = options.humanGuidanceIdFactory ?? (() => createHumanGuidanceId());
     this.escalationIdFactory = options.escalationIdFactory ?? (() => createEscalationId());
@@ -121,6 +134,11 @@ export class OperatorApplicationService implements OperatorApplication {
     }
   }
 
+  async startRuntime() {
+    if (!this.runtimeLifecycle) throw new Error('Runtime startup is not configured.');
+    return this.runtimeLifecycle.start();
+  }
+
   async listProjects(): Promise<readonly OperatorProjectOption[]> {
     const projects = await this.store.listProjects();
     return Promise.all(projects.map(async project => {
@@ -146,6 +164,10 @@ export class OperatorApplicationService implements OperatorApplication {
     const acceptanceCriteria = boundedRequired(input.acceptanceCriteria, 'Acceptance criteria', 8_192);
     const projectId = required(input.projectId, 'Project');
     const repositoryId = required(input.repositoryId, 'Repository');
+    const executionMode = input.executionMode ?? 'repository-read-only';
+    if (executionMode !== 'repository-read-only' && executionMode !== 'repository-write-isolated') {
+      throw new Error('Execution mode must be repository read only or isolated repository write');
+    }
     const project = await this.store.getProject(projectId);
     if (!project) throw new Error(`Project not found: ${projectId}`);
     const repositoryIds = await this.store.listProjectRepositoryIds(projectId);
@@ -164,7 +186,10 @@ export class OperatorApplicationService implements OperatorApplication {
       runtimeAgentId: runtimeAgentIds[0],
       task,
       acceptanceCriteria,
-      defaults: OPERATOR_READ_ONLY_DEFAULTS,
+      defaults: executionMode === 'repository-write-isolated'
+        ? OPERATOR_ISOLATED_WRITE_DEFAULTS
+        : OPERATOR_READ_ONLY_DEFAULTS,
+      executionMode,
       executionAuthorized: false,
     };
   }
@@ -180,6 +205,11 @@ export class OperatorApplicationService implements OperatorApplication {
     this.runReserved = true;
     try {
       const preview = await this.previewTask(input);
+      if (preview.executionMode === 'repository-write-isolated') {
+        const occupied = (await this.store.listRepositoryWorkspaces()).find(workspace =>
+          ['preparing', 'active', 'reviewing', 'ready_for_approval'].includes(workspace.state));
+        if (occupied) throw new Error(`Write Job ${occupied.jobId} already owns the isolated workspace slot`);
+      }
       const created = await this.lifecycle.createJob({
         projectId: preview.project.id,
         repositoryId: preview.repository.id,
@@ -187,7 +217,8 @@ export class OperatorApplicationService implements OperatorApplication {
         title: taskTitle(preview.task),
         description: preview.task,
         acceptanceCriteria: preview.acceptanceCriteria,
-        automaticReadOnlyCompletion: true,
+        executionMode: preview.executionMode,
+        automaticReadOnlyCompletion: preview.executionMode === 'repository-read-only',
       });
       const job = await this.lifecycle.markJobReady(created.id);
       const createdAt = this.now().toISOString();
@@ -288,8 +319,8 @@ export class OperatorApplicationService implements OperatorApplication {
     if (!escalation) throw new Error(`Escalation not found: ${id}`);
     const existingRun = await this.requireOperatorRun(escalation.jobId);
     if (escalation.resolvedAt) return toRunSession(existingRun);
-    if (escalation.reason !== 'observation_timeout') {
-      throw new Error(`Escalation ${id} is not an execution observation timeout`);
+    if (!isRecoverableObservationEscalation(escalation)) {
+      throw new Error(`Escalation ${id} is not a recoverable execution observation failure`);
     }
     if (existingRun.status !== 'needs_human') {
       throw new Error(`Operator Run ${existingRun.id} is ${existingRun.status}`);
@@ -369,6 +400,7 @@ export class OperatorApplicationService implements OperatorApplication {
     const reviewerAttempts = stories.filter(story => story.attempt.executionRole === 'reviewer');
     const finalWorkerResult = [...workerAttempts].reverse().find(story => story.resultText)?.resultText;
     const finalReview = reviews.at(-1);
+    const repositoryWorkspace = await this.store.getRepositoryWorkspaceForJob(job.id);
     return {
       summary,
       acceptanceCriteria: job.acceptanceCriteria ?? '',
@@ -385,6 +417,7 @@ export class OperatorApplicationService implements OperatorApplication {
       ...(finalWorkerResult ? { finalWorkerResult } : {}),
       ...(finalReview ? { finalReview } : {}),
       ...(job.status === 'completed' ? { completedAt: job.updatedAt } : {}),
+      ...(repositoryWorkspace ? { repositoryWorkspace } : {}),
     };
   }
 
@@ -450,6 +483,9 @@ export class OperatorApplicationService implements OperatorApplication {
     needsHuman: boolean,
     run: DurableOperatorRun | null,
   ): Promise<OperatorExecutionStage> {
+    const workspace = await this.store.getRepositoryWorkspaceForJob(job.id);
+    if (workspace?.state === 'ready_for_approval'
+      && (needsHuman || run?.status === 'needs_human')) return 'Ready for Approval';
     if (needsHuman || run?.status === 'needs_human') return 'Needs Me';
     if (job.status === 'completed' || run?.status === 'completed') return 'Completed';
     if (job.status === 'cancelled' || run?.status === 'cancelled') return 'Cancelled';
@@ -499,7 +535,7 @@ export class OperatorApplicationService implements OperatorApplication {
     attempts: readonly DurableJobAttempt[],
   ): Promise<readonly OperatorEscalationAction[]> {
     if (escalation.resolvedAt) return [];
-    if (escalation.reason === 'observation_timeout' && escalation.attemptId) {
+    if (isRecoverableObservationEscalation(escalation) && escalation.attemptId) {
       const attempt = attempts.find(candidate => candidate.id === escalation.attemptId);
       const plan = attempt ? await this.store.getExecutionPlanForAttempt(attempt.id) : null;
       const dispatch = plan ? await this.store.getExecutionDispatchForPlan(plan.id) : null;
@@ -574,6 +610,14 @@ function boundedRequired(value: string, field: string, max: number): string {
   const clean = required(value, field);
   if (clean.length > max) throw new Error(`${field} exceeds ${max} characters`);
   return clean;
+}
+
+function isRecoverableObservationEscalation(
+  escalation: { reason: string; summary: string },
+): boolean {
+  return escalation.reason === 'observation_timeout'
+    || (escalation.reason === 'runtime_failure'
+      && escalation.summary.startsWith('Runtime observation failed: Observation text exceeds'));
 }
 
 function taskTitle(task: string): string {

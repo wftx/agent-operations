@@ -523,6 +523,14 @@ export class AgentProcess {
         message: `agent "${this.name}" requires repository-read root to match the execution checkout`,
       };
     }
+    if (executionCapabilities?.repositoryPatch === true
+      && executionContext?.repositoryWriteRoot !== executionContext?.workingDirectory) {
+      return {
+        ok: false,
+        code: 'POLICY_UNSUPPORTED',
+        message: `agent "${this.name}" requires repository-write root to match the execution workspace`,
+      };
+    }
     if (this.dedup.isDuplicate(content)) {
       this.log('Dedup: skipping duplicate correlated message');
       return { ok: false, code: 'DEDUPED', message: `inject for "${this.name}" deduped — content matches MessageDedup hash window` };

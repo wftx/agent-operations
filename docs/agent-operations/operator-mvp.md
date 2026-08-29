@@ -23,6 +23,18 @@ polling only read AO durable state. Preview creates no Job, Plan, or Dispatch.
 **Run Job** durably accepts a Job and returns immediately; the one-process local
 runner continues Worker and Reviewer work after the HTTP request ends.
 
+If the runtime is offline, **Start Runtime** is the only web action that may
+start CortextOS. It is an explicit POST action. Page load, refresh, status
+inventory, previews, and Job detail reads never start a process. The lifecycle
+adapter inventories the configured agents, cron count, integration count, and
+current owner before it uses the canonical `node dist/cli.js start
+--foreground --instance default` path. It resolves Codex from
+`AO_CODEX_EXECUTABLE`, then `PATH`, then the packaged ChatGPT macOS candidate.
+Missing Codex and early provider exit return bounded, credential-redacted
+diagnostics. A healthy runtime or concurrent Start request never creates a
+second daemon. Stop Runtime remains deferred until a comparably narrow
+supported lifecycle can be proven.
+
 The server resumes only Jobs with a durable Operator Run marker. It never scans
 or executes unrelated historical ready Jobs. Exactly one Operator Run is active
 at a time; this is a local continuation mechanism, not a general queue.
@@ -156,8 +168,41 @@ authoritative whether Telegram is configured, unavailable, or rejected.
 - Reviewer passes: 1 per Worker Attempt
 - automatic completion: only after Reviewer `PASS`
 
-There is no write mode, general queue, scheduler, concurrent Job execution,
-interactive Telegram approval, production authentication, or remote deployment
-in this MVP. Starting the AO web surface does not start CortextOS. If the
-Runtime indicator is offline, start the development runtime separately using
-the documented CortextOS lifecycle.
+## Isolated Code Changes
+
+The Operator mode selector offers **Repository Read Only** and **Code Change in
+Isolated Worktree**. Previewing either mode creates no Job, workspace, Plan, or
+Dispatch. Write capable Jobs execute in a dedicated AO Git worktree and Job
+branch without modifying the operator's primary checkout. The Worker can write
+only inside that isolated worktree, while the Reviewer remains read only.
+Human approval is required before any future merge, and the Worker cannot
+commit, merge, or push. A write Job uses these fixed boundaries:
+
+```text
+one durable Job
+→ one AO owned Git worktree and deterministic branch
+→ Worker with bounded patch and test tools
+→ bounded diff and test evidence
+→ independent read only Reviewer
+→ Ready for Approval or Needs Me
+```
+
+AO creates worktrees under its machine local state directory, never inside the
+tracked checkout. The Worker receives `workspace-write / deny / empty` and can
+use only repository list, read, search, exact patch, allowlisted test, and read
+only Git inspection tools. It cannot create, delete, rename, chmod, commit,
+merge, rebase, push, use arbitrary shell, or enable network. The Reviewer sees
+the same worktree with read only filesystem authority plus the captured files,
+diff, and test evidence.
+
+Reviewer `PASS` means Ready for Approval. It does not complete the Job, commit,
+merge, or push. A revision uses the same worktree but a fresh Worker Attempt,
+Plan, Dispatch, and exact provider turn. One active write workspace is permitted
+at a time. Cleanup is explicit, refuses a dirty or mismatched worktree, removes
+only a proven AO owned worktree, and preserves the dedicated branch and durable
+evidence.
+
+There is no automatic merge, general queue, scheduler, concurrent write Job
+execution, interactive Telegram approval, production authentication, or remote
+deployment in this MVP. Starting the AO web surface still does not start
+CortextOS.

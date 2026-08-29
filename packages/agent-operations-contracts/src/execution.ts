@@ -38,6 +38,9 @@ export interface RuntimeExecutionPolicy {
 export interface RuntimeExecutionCapabilities {
   readonly version: 1;
   readonly repositoryRead: boolean;
+  readonly repositoryPatch?: boolean;
+  readonly testRun?: boolean;
+  readonly gitInspect?: boolean;
 }
 
 export const NO_RUNTIME_EXECUTION_CAPABILITIES: RuntimeExecutionCapabilities = {
@@ -50,12 +53,30 @@ export const REPOSITORY_READ_EXECUTION_CAPABILITIES: RuntimeExecutionCapabilitie
   repositoryRead: true,
 };
 
+export const REPOSITORY_WRITE_EXECUTION_CAPABILITIES: RuntimeExecutionCapabilities = {
+  version: 1,
+  repositoryRead: true,
+  repositoryPatch: true,
+  testRun: true,
+  gitInspect: true,
+};
+
+export const REPOSITORY_WRITE_REVIEW_EXECUTION_CAPABILITIES: RuntimeExecutionCapabilities = {
+  version: 1,
+  repositoryRead: true,
+  repositoryPatch: false,
+  testRun: false,
+  gitInspect: true,
+};
+
 /** Provider-neutral, per-execution context resolved from durable AO state. */
 export interface RuntimeExecutionContext {
   /** Canonical absolute checkout root for repository-bound execution. */
   readonly workingDirectory: string;
   /** Canonical reader root derived from the same checkout binding, never model input. */
   readonly repositoryReadRoot?: string;
+  /** Present only for an isolated write Worker and equal to workingDirectory. */
+  readonly repositoryWriteRoot?: string;
 }
 
 export const RESTRICTED_TEXT_EXECUTION_POLICY: RuntimeExecutionPolicy = {
@@ -97,7 +118,20 @@ export function createRuntimeExecutionCapabilities(
   if (typeof capabilities.repositoryRead !== 'boolean') {
     throw new Error('Runtime repository-read capability must be boolean');
   }
-  return { version: 1, repositoryRead: capabilities.repositoryRead };
+  for (const field of ['repositoryPatch', 'testRun', 'gitInspect'] as const) {
+    if (capabilities[field] !== undefined && typeof capabilities[field] !== 'boolean') {
+      throw new Error(`Runtime ${field} capability must be boolean`);
+    }
+  }
+  return {
+    version: 1,
+    repositoryRead: capabilities.repositoryRead,
+    ...(capabilities.repositoryPatch !== undefined
+      ? { repositoryPatch: capabilities.repositoryPatch }
+      : {}),
+    ...(capabilities.testRun !== undefined ? { testRun: capabilities.testRun } : {}),
+    ...(capabilities.gitInspect !== undefined ? { gitInspect: capabilities.gitInspect } : {}),
+  };
 }
 
 export function isRuntimeExecutionCapabilitiesNoBroaderThan(
@@ -105,7 +139,10 @@ export function isRuntimeExecutionCapabilitiesNoBroaderThan(
   requested: RuntimeExecutionCapabilities,
 ): boolean {
   return effective.version === requested.version
-    && (!effective.repositoryRead || requested.repositoryRead);
+    && (!effective.repositoryRead || requested.repositoryRead)
+    && (!effective.repositoryPatch || requested.repositoryPatch === true)
+    && (!effective.testRun || requested.testRun === true)
+    && (!effective.gitInspect || requested.gitInspect === true);
 }
 
 /** True when effective authority is equal to or narrower than requested authority. */
@@ -184,6 +221,8 @@ export interface DurableExecutionPlan {
   readonly runtimeAgentId: string;
   readonly repositoryId?: string;
   readonly checkoutBindingId?: string;
+  /** Present only when execution targets an AO-owned isolated Job worktree. */
+  readonly repositoryWorkspaceId?: string;
   readonly input: ExecutionInputEnvelope;
   /** Absent only for truthful legacy Plans created before policy schema v6. */
   readonly requestedPolicy?: RuntimeExecutionPolicy;
@@ -234,6 +273,14 @@ export type ExecutionPreflightFindingCode =
   | 'repository-read-capability-required'
   | 'repository-read-capability-supported'
   | 'repository-read-capability-unsupported'
+  | 'repository-write-capability-supported'
+  | 'repository-write-capability-unsupported'
+  | 'test-run-capability-supported'
+  | 'test-run-capability-unsupported'
+  | 'git-inspection-capability-supported'
+  | 'git-inspection-capability-unsupported'
+  | 'repository-workspace-valid'
+  | 'repository-workspace-invalid'
   | 'repository-read-root-valid'
   | 'repository-read-root-invalid'
   | 'runtime-working-directory-unavailable'

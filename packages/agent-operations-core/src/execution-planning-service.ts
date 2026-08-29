@@ -24,6 +24,7 @@ export interface PrepareExecutionPlanInput {
   readonly requestedPolicy: RuntimeExecutionPolicy;
   readonly requestedCapabilities?: RuntimeExecutionCapabilities;
   readonly checkoutBindingId?: string;
+  readonly repositoryWorkspaceId?: string;
 }
 
 export interface ExecutionPlanDetail {
@@ -100,6 +101,22 @@ export class ExecutionPlanningService {
     if (requestedCapabilities.repositoryRead && !job.repositoryId) {
       throw new Error('Repository-read capability requires a repository-bound Job');
     }
+    const workspace = input.repositoryWorkspaceId
+      ? await this.store.getRepositoryWorkspace(input.repositoryWorkspaceId)
+      : null;
+    if (input.repositoryWorkspaceId && (!workspace || workspace.jobId !== job.id
+      || workspace.repositoryId !== job.repositoryId
+      || workspace.sourceCheckoutBindingId !== checkout?.id
+      || !['active', 'reviewing', 'ready_for_approval'].includes(workspace.state))) {
+      throw new Error(`Repository Workspace is not active for Job ${job.id}`);
+    }
+    if ((requestedCapabilities.repositoryPatch || requestedCapabilities.testRun
+      || requestedCapabilities.gitInspect) && !workspace) {
+      throw new Error('Write and Git tool capabilities require an isolated Repository Workspace');
+    }
+    if (requestedCapabilities.repositoryPatch && requestedPolicy.filesystem !== 'workspace-write') {
+      throw new Error('Repository patch capability requires filesystem=workspace-write');
+    }
     const plan: DurableExecutionPlan = {
       id: this.planIdFactory(),
       attemptId: attempt.id,
@@ -109,6 +126,7 @@ export class ExecutionPlanningService {
       runtimeAgentId: attempt.runtimeAgentId,
       ...(job.repositoryId ? { repositoryId: job.repositoryId } : {}),
       ...(checkout ? { checkoutBindingId: checkout.id } : {}),
+      ...(workspace ? { repositoryWorkspaceId: workspace.id } : {}),
       input: createExecutionInputEnvelope(input.instruction),
       requestedPolicy,
       requestedCapabilities,

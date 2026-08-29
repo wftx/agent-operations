@@ -302,7 +302,7 @@ describe('SQLite execution observation persistence', () => {
     expect(() => SqliteAgentOperationsStateStore.open({
       databasePath,
       additionalMigrations: [{
-        version: 12,
+        version: 13,
         name: 'deliberate-observation-rollback',
         up: database => {
           database.exec('CREATE TABLE should_rollback_observation (id TEXT)');
@@ -317,7 +317,7 @@ describe('SQLite execution observation persistence', () => {
     expect(database.prepare('SELECT id FROM execution_observations').get())
       .toEqual({ id: observation().id });
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }]);
     database.close();
   });
 });
