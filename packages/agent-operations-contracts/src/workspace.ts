@@ -23,8 +23,17 @@ export interface WorkspaceTestResult {
   readonly occurredAt: string;
 }
 
+export interface WorkspaceBinaryFileEvidence {
+  readonly path: string;
+  readonly gitStatus: string;
+  readonly mediaType: string;
+  readonly byteSize: number;
+  readonly sha256: string;
+}
+
 export interface RepositoryWorkspaceEvidence {
   readonly changedFiles: readonly string[];
+  readonly binaryFiles?: readonly WorkspaceBinaryFileEvidence[];
   readonly diffStat: string;
   readonly diffText: string;
   readonly diffTruncated: boolean;

@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -64,6 +65,40 @@ describe('GitRepositoryWorkspaceAdapter', () => {
       baseRevision,
       branchName: 'ao/job-two',
     })).rejects.toThrow('child of the AO workspace root');
+  });
+
+  it('captures bounded metadata for an added binary without serializing its contents', async () => {
+    const { root, source, baseRevision } = fixture();
+    const repositoryId = (await new GitRepositoryAdapter().inspectRepository(source)).id;
+    const workspaceRoot = join(root, 'state', 'workspaces');
+    const destinationPath = join(workspaceRoot, 'job-binary');
+    const adapter = new GitRepositoryWorkspaceAdapter({ workspaceRoot });
+    await adapter.createWorkspace({
+      sourceCheckoutPath: source,
+      destinationPath,
+      repositoryId,
+      baseRevision,
+      branchName: 'ao/job-binary',
+    });
+    mkdirSync(join(destinationPath, 'public'));
+    const content = Buffer.concat([
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+      Buffer.from([0, 1, 2, 3, 4, 5]),
+    ]);
+    writeFileSync(join(destinationPath, 'public', 'mirror-x-photo.png'), content);
+
+    const evidence = await adapter.captureEvidence(destinationPath);
+    expect(evidence.changedFiles).toEqual(['public/mirror-x-photo.png']);
+    expect(evidence.binaryFiles).toEqual([{
+      path: 'public/mirror-x-photo.png',
+      gitStatus: '??',
+      mediaType: 'image/png',
+      byteSize: content.length,
+      sha256: createHash('sha256').update(content).digest('hex'),
+    }]);
+    expect(evidence.diffStat).toContain('public/mirror-x-photo.png | binary');
+    expect(evidence.diffText).toContain('content omitted');
+    expect(evidence.diffText).not.toContain(content.toString('latin1'));
   });
 
   it('removes only the exact clean AO worktree and preserves its branch and unrelated worktrees', async () => {

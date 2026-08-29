@@ -89,6 +89,9 @@ function copyRepositoryWorkspace(value: DurableRepositoryWorkspace): DurableRepo
           evidence: {
             ...value.evidence,
             changedFiles: [...value.evidence.changedFiles],
+            ...(value.evidence.binaryFiles
+              ? { binaryFiles: value.evidence.binaryFiles.map(file => ({ ...file })) }
+              : {}),
             testResults: value.evidence.testResults.map(result => ({ ...result })),
           },
         }

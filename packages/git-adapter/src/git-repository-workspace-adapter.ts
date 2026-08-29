@@ -1,5 +1,7 @@
 import { execFile } from 'node:child_process';
-import { lstat, mkdir, realpath, stat, symlink } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { createReadStream } from 'node:fs';
+import { lstat, mkdir, open, realpath, stat, symlink } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type {
   RepositoryWorkspaceAdapter,
@@ -115,21 +117,31 @@ export class GitRepositoryWorkspaceAdapter implements RepositoryWorkspaceAdapter
   async captureEvidence(canonicalPath: string) {
     const root = requireWorkspaceChild(this.root, canonicalPath);
     const [status, statResult, diffResult] = await Promise.all([
-      this.runGit(root, ['status', '--porcelain=v1', '--untracked-files=normal']),
+      this.runGit(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']),
       this.runGit(root, ['diff', '--stat', '--no-ext-diff', '--']),
       this.runGit(root, ['diff', '--no-ext-diff', '--no-color', '--']),
     ]);
     if (!status.ok || !statResult.ok || !diffResult.ok) {
       throw new Error(bounded(`Could not capture workspace evidence: ${status.error || statResult.error || diffResult.error || status.stderr || statResult.stderr || diffResult.stderr}`));
     }
-    const changedFiles = status.stdout.split(/\r?\n/).filter(Boolean).map(line => line.slice(3));
-    const bytes = Buffer.byteLength(diffResult.stdout, 'utf8');
+    const statusEntries = parsePorcelainStatus(status.stdout);
+    const changedFiles = statusEntries.map(entry => entry.path);
+    const binaryFiles = (await Promise.all(statusEntries.map(entry =>
+      binaryEvidence(root, entry.path, entry.gitStatus)))).filter(value => value !== null);
+    const binaryStat = binaryFiles.map(file =>
+      `${file.path} | binary ${file.byteSize} bytes ${file.mediaType} ${file.gitStatus} sha256 ${file.sha256}`);
+    const diffStat = [statResult.stdout.trim(), ...binaryStat].filter(Boolean).join('\n');
+    const binaryDiff = binaryFiles.map(file =>
+      `binary ${file.gitStatus} ${file.path} | ${file.mediaType} | ${file.byteSize} bytes | sha256 ${file.sha256} | content omitted`);
+    const combinedDiff = [diffResult.stdout.trimEnd(), ...binaryDiff].filter(Boolean).join('\n');
+    const bytes = Buffer.byteLength(combinedDiff, 'utf8');
     return {
       changedFiles,
-      diffStat: bounded(statResult.stdout),
+      binaryFiles,
+      diffStat: bounded(diffStat),
       diffText: bytes > MAX_EVIDENCE_BYTES
-        ? Buffer.from(diffResult.stdout).subarray(0, MAX_EVIDENCE_BYTES).toString('utf8')
-        : diffResult.stdout,
+        ? Buffer.from(combinedDiff).subarray(0, MAX_EVIDENCE_BYTES).toString('utf8')
+        : combinedDiff,
       diffTruncated: bytes > MAX_EVIDENCE_BYTES,
     };
   }
@@ -208,6 +220,65 @@ export class GitRepositoryWorkspaceAdapter implements RepositoryWorkspaceAdapter
       }));
     });
   }
+}
+
+interface StatusEntry {
+  readonly gitStatus: string;
+  readonly path: string;
+}
+
+function parsePorcelainStatus(value: string): readonly StatusEntry[] {
+  const fields = value.split('\0').filter(Boolean);
+  const entries: StatusEntry[] = [];
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index];
+    if (field.length < 4) throw new Error('Git returned malformed workspace status evidence');
+    const gitStatus = field.slice(0, 2);
+    const path = field.slice(3);
+    if (!path || path.includes('\0') || isAbsolute(path) || path.split('/').includes('..')) {
+      throw new Error('Git returned an unsafe workspace status path');
+    }
+    entries.push({ gitStatus, path });
+    if (gitStatus.includes('R') || gitStatus.includes('C')) index += 1;
+  }
+  return entries;
+}
+
+async function binaryEvidence(root: string, path: string, gitStatus: string) {
+  const absolute = join(root, path);
+  const metadata = await lstat(absolute).catch(() => null);
+  if (!metadata?.isFile()) return null;
+  const handle = await open(absolute, 'r');
+  const prefix = Buffer.alloc(Math.min(8_192, metadata.size));
+  try {
+    await handle.read(prefix, 0, prefix.length, 0);
+  } finally {
+    await handle.close();
+  }
+  const mediaType = detectMediaType(prefix);
+  if (mediaType === 'text/plain' && !prefix.includes(0)) return null;
+  const digest = createHash('sha256');
+  for await (const chunk of createReadStream(absolute)) digest.update(chunk as Buffer);
+  return {
+    path,
+    gitStatus,
+    mediaType,
+    byteSize: metadata.size,
+    sha256: digest.digest('hex'),
+  };
+}
+
+function detectMediaType(prefix: Buffer): string {
+  if (prefix.length >= 8 && prefix.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return 'image/png';
+  }
+  if (prefix.length >= 3 && prefix[0] === 0xff && prefix[1] === 0xd8 && prefix[2] === 0xff) return 'image/jpeg';
+  if (prefix.subarray(0, 6).toString('ascii') === 'GIF87a'
+    || prefix.subarray(0, 6).toString('ascii') === 'GIF89a') return 'image/gif';
+  if (prefix.subarray(0, 4).toString('ascii') === 'RIFF'
+    && prefix.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  if (prefix.subarray(4, 12).toString('ascii').includes('ftypavif')) return 'image/avif';
+  return prefix.includes(0) ? 'application/octet-stream' : 'text/plain';
 }
 
 function requireAbsolute(value: string, field: string): string {
