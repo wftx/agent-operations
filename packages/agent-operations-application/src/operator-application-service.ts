@@ -4,6 +4,7 @@ import type {
   RuntimeLifecycleAdapter,
   DurableJob,
   DurableJobAttempt,
+  DurableEscalation,
   DurableOperatorRun,
 } from '../../agent-operations-contracts/src/index.js';
 import {
@@ -436,7 +437,7 @@ export class OperatorApplicationService implements OperatorApplication {
       MVP_MAX_WORKER_ATTEMPTS,
     );
     const currentRole = activeAttempt?.executionRole ?? null;
-    const currentStage = await this.deriveStage(job, attempts, reviews, unresolved.length > 0, operatorRun);
+    const currentStage = await this.deriveStage(job, attempts, reviews, unresolved, operatorRun);
     const startedAt = operatorRun?.startedAt;
     const finishedAt = operatorRun?.finishedAt;
     return {
@@ -480,12 +481,14 @@ export class OperatorApplicationService implements OperatorApplication {
     job: DurableJob,
     attempts: readonly DurableJobAttempt[],
     reviews: readonly { readonly decision: string; readonly workerAttemptId: string }[],
-    needsHuman: boolean,
+    unresolved: readonly DurableEscalation[],
     run: DurableOperatorRun | null,
   ): Promise<OperatorExecutionStage> {
+    const needsHuman = unresolved.length > 0;
     const workspace = await this.store.getRepositoryWorkspaceForJob(job.id);
     if (workspace?.state === 'ready_for_approval'
-      && (needsHuman || run?.status === 'needs_human')) return 'Ready for Approval';
+      && unresolved.some(escalation => escalation.reason === 'human_judgment_required'
+        && escalation.summary.startsWith('Ready for Approval.'))) return 'Ready for Approval';
     if (needsHuman || run?.status === 'needs_human') return 'Needs Me';
     if (job.status === 'completed' || run?.status === 'completed') return 'Completed';
     if (job.status === 'cancelled' || run?.status === 'cancelled') return 'Cancelled';

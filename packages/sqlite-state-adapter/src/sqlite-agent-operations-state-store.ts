@@ -708,7 +708,7 @@ function isValidRepositoryWorkspaceTransition(
   return from === 'preparing' && (to === 'active' || to === 'failed' || to === 'cancelled')
     || from === 'active' && (to === 'reviewing' || to === 'failed' || to === 'cancelled')
     || from === 'reviewing' && (to === 'active' || to === 'ready_for_approval' || to === 'failed' || to === 'cleanup_pending' || to === 'cancelled')
-    || from === 'ready_for_approval' && (to === 'failed' || to === 'cleanup_pending' || to === 'cancelled')
+    || from === 'ready_for_approval' && (to === 'active' || to === 'failed' || to === 'cleanup_pending' || to === 'cancelled')
     || from === 'failed' && (to === 'cleanup_pending' || to === 'cancelled')
     || from === 'cancelled' && to === 'cleanup_pending'
     || from === 'cleanup_pending' && (to === 'cleaned' || to === 'failed');

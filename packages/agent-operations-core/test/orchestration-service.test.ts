@@ -288,16 +288,28 @@ async function harness(
   let review = 0;
   let escalation = 0;
   let outcome = 0;
+  let workspaceExists = false;
   const workspaceAdapter: RepositoryWorkspaceAdapter = {
-    inspectWorkspace: async (): Promise<RepositoryWorkspaceInspection> => ({ exists: false, registered: false }),
-    createWorkspace: async input => ({
-      exists: true, registered: true, canonicalPath: input.destinationPath,
-      repositoryId: input.repositoryId, branchName: input.branchName, headRevision: input.baseRevision,
-    }),
+    inspectWorkspace: async input => workspaceExists
+      ? ({
+          exists: true, registered: true, canonicalPath: input.destinationPath,
+          repositoryId: input.repositoryId, branchName: input.branchName, headRevision: input.baseRevision,
+        })
+      : ({ exists: false, registered: false } satisfies RepositoryWorkspaceInspection),
+    createWorkspace: async input => {
+      workspaceExists = true;
+      return {
+        exists: true, registered: true, canonicalPath: input.destinationPath,
+        repositoryId: input.repositoryId, branchName: input.branchName, headRevision: input.baseRevision,
+      };
+    },
     captureEvidence: async () => ({
       changedFiles: ['README.md'], diffStat: '1 file changed', diffText: '+safe change', diffTruncated: false,
     }),
-    removeWorkspace: async () => ({ exists: false, registered: false }),
+    removeWorkspace: async () => {
+      workspaceExists = false;
+      return { exists: false, registered: false };
+    },
   };
   const workspaceService = writeMode
     ? new RepositoryWorkspaceService(store, repositories, workspaceAdapter, {
@@ -412,6 +424,21 @@ describe('OrchestrationService', () => {
       state: 'ready_for_approval', branchName: 'ao/job-orchestration-fixture',
       evidence: { changedFiles: ['README.md'], testResults: [expect.objectContaining({ commandId: 'typecheck', status: 'passed' })] },
     });
+
+    await setup.store.resolveEscalation(result.escalations[0].id, TIME);
+    const reconciled = await setup.service.runJob(JOB_ID);
+    expect(reconciled.finalDecision).toBe('ESCALATED');
+    expect(reconciled.escalations).toEqual([
+      expect.objectContaining({ reason: 'human_judgment_required', resolvedAt: TIME }),
+      expect.objectContaining({ reason: 'human_judgment_required', summary: expect.stringContaining('Ready for Approval') }),
+    ]);
+    expect(reconciled.escalations).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ reason: 'runtime_failure' }),
+    ]));
+    expect(setup.execution.requests).toHaveLength(2);
+    expect(setup.observer.requests).toHaveLength(2);
+    await expect(setup.store.getRepositoryWorkspaceForJob(JOB_ID)).resolves.toEqual(workspace);
+
     const pending = await setup.workspaceService!.requestCleanup(workspace!.id);
     expect(pending).toMatchObject({ state: 'cleanup_pending', evidence: workspace!.evidence });
     await expect(setup.workspaceService!.cleanup(workspace!.id)).resolves.toMatchObject({
@@ -463,6 +490,61 @@ describe('OrchestrationService', () => {
       state: 'ready_for_approval',
       branchName: 'ao/job-orchestration-fixture',
     });
+  });
+
+  it('uses human guidance to revise a Ready for Approval write result only through a fresh Worker', async () => {
+    const writeCapabilities = {
+      version: 1 as const, repositoryRead: true, repositoryPatch: true, testRun: true, gitInspect: true,
+    };
+    const reviewCapabilities = {
+      version: 1 as const, repositoryRead: true, repositoryPatch: false, testRun: false, gitInspect: true,
+    };
+    const worker = (resultText: string): ObservationFixture => ({
+      kind: 'completed', resultText, workingDirectory: WORKSPACE,
+      repositoryWriteRoot: WORKSPACE,
+      policy: { version: 1, filesystem: 'workspace-write', network: 'deny', environment: 'empty' },
+      capabilities: writeCapabilities,
+    });
+    const reviewer = (resultText: string): ObservationFixture => ({
+      kind: 'completed', resultText, workingDirectory: WORKSPACE,
+      policy: POLICY, capabilities: reviewCapabilities,
+    });
+    const setup = await harness([
+      worker('{"summary":"first","filesChanged":["README.md"],"testsRun":[],"unresolvedIssues":[]}'),
+      reviewer(PASS),
+      worker('{"summary":"guided","filesChanged":["README.md"],"testsRun":[],"unresolvedIssues":[]}'),
+      reviewer(PASS),
+    ], [], true, true);
+
+    const first = await setup.service.runJob(JOB_ID);
+    const escalation = first.escalations[0];
+    await setup.store.createHumanGuidanceAndResolveEscalation({
+      id: 'guidance:ready-revision',
+      jobId: JOB_ID,
+      escalationId: escalation.id,
+      instruction: 'Replace the remote image with the supplied local asset.',
+      createdAt: TIME,
+    }, TIME);
+
+    const resumed = await setup.service.runJob(JOB_ID);
+    expect(resumed.finalDecision).toBe('ESCALATED');
+    expect(resumed.workerAttempts).toHaveLength(2);
+    expect(resumed.reviewerAttempts).toHaveLength(2);
+    expect(resumed.reviews.map(review => review.decision)).toEqual(['PASS', 'PASS']);
+    expect(setup.execution.requests).toHaveLength(4);
+    expect(setup.execution.requests[2].input.instruction)
+      .toContain('<human_guidance>\nReplace the remote image with the supplied local asset.\n</human_guidance>');
+    expect(new Set(setup.execution.requests.map(request => request.executionPlanId)).size).toBe(4);
+    expect(await setup.store.getRepositoryWorkspaceForJob(JOB_ID)).toMatchObject({
+      state: 'ready_for_approval',
+      branchName: 'ao/job-orchestration-fixture',
+    });
+    expect(resumed.escalations.filter(candidate => !candidate.resolvedAt)).toEqual([
+      expect.objectContaining({
+        reason: 'human_judgment_required',
+        summary: expect.stringContaining('Ready for Approval'),
+      }),
+    ]);
   });
 
   it('keeps isolated evidence in reviewing when the Reviewer escalates', async () => {

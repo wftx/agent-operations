@@ -108,8 +108,8 @@ export class RepositoryWorkspaceService {
 
   async reopenForRevision(workspaceId: string): Promise<DurableRepositoryWorkspace> {
     const workspace = await this.requireWorkspace(workspaceId);
-    if (workspace.state !== 'reviewing') {
-      throw new Error(`Repository Workspace ${workspace.id} is ${workspace.state}, not reviewing`);
+    if (!['reviewing', 'ready_for_approval'].includes(workspace.state)) {
+      throw new Error(`Repository Workspace ${workspace.id} is ${workspace.state}, not reviewable`);
     }
     const { evidence: _evidence, failureReason: _failureReason, ...identity } = workspace;
     const next: DurableRepositoryWorkspace = {

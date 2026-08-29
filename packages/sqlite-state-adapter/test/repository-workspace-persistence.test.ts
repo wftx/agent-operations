@@ -72,10 +72,30 @@ describe('SQLite Repository Workspace persistence', () => {
       revision: 3,
     };
     await store.saveRepositoryWorkspaceTransition(ready, 2);
+    const { evidence: _evidence, ...readyIdentity } = ready;
+    const reopenedForHumanRevision: DurableRepositoryWorkspace = {
+      ...readyIdentity,
+      state: 'active',
+      revision: 4,
+    };
+    await store.saveRepositoryWorkspaceTransition(reopenedForHumanRevision, 3);
+    const reviewedAgain: DurableRepositoryWorkspace = {
+      ...reopenedForHumanRevision,
+      state: 'reviewing',
+      evidence: ready.evidence,
+      revision: 5,
+    };
+    await store.saveRepositoryWorkspaceTransition(reviewedAgain, 4);
+    const readyAgain: DurableRepositoryWorkspace = {
+      ...reviewedAgain,
+      state: 'ready_for_approval',
+      revision: 6,
+    };
+    await store.saveRepositoryWorkspaceTransition(readyAgain, 5);
     await store.close();
 
     const reopened = open(path);
-    await expect(reopened.getRepositoryWorkspaceForJob(job.id)).resolves.toEqual(ready);
+    await expect(reopened.getRepositoryWorkspaceForJob(job.id)).resolves.toEqual(readyAgain);
     await expect(reopened.getJob(job.id)).resolves.toMatchObject({
       id: job.id, executionMode: 'repository-write-isolated',
     });

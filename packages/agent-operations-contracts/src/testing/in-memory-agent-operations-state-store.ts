@@ -451,7 +451,7 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
         : existing.state === 'reviewing'
           ? ['active', 'ready_for_approval', 'failed', 'cleanup_pending', 'cancelled']
           : existing.state === 'ready_for_approval'
-            ? ['failed', 'cleanup_pending', 'cancelled']
+            ? ['active', 'failed', 'cleanup_pending', 'cancelled']
           : existing.state === 'failed'
             ? ['cleanup_pending', 'cancelled']
             : existing.state === 'cancelled'

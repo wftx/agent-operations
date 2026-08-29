@@ -215,6 +215,60 @@ describe('OperatorApplicationService', () => {
     expect(orchestration.runCalls).toBe(0);
   });
 
+  it('shows Needs Me when a prior Ready workspace has later human revision guidance', async () => {
+    const store = await configuredStore();
+    const lifecycle = new JobLifecycleService(store, {
+      now: () => new Date(TIME),
+      jobIdFactory: () => 'job:guided-write',
+    });
+    const draft = await lifecycle.createJob({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      preferredRuntimeAgentId: RUNTIME_ID,
+      title: 'Revise an isolated change',
+      acceptanceCriteria: 'Use a local asset.',
+      executionMode: 'repository-write-isolated',
+      automaticReadOnlyCompletion: false,
+    });
+    const job = await lifecycle.markJobReady(draft.id);
+    const bindingId = createRepositoryCheckoutBindingId('installation:test', '/tmp/agent-operations-test');
+    const workspace = {
+      id: 'workspace:guided-write', jobId: job.id, projectId: PROJECT_ID, repositoryId: REPOSITORY_ID,
+      sourceCheckoutBindingId: bindingId, baseRevision: 'a'.repeat(40), baseBranch: 'main',
+      branchName: 'ao/job-guided-write', canonicalPath: '/tmp/ao-guided-write',
+      state: 'preparing' as const, revision: 0, createdAt: TIME, updatedAt: TIME,
+    };
+    await store.createRepositoryWorkspace(workspace);
+    await store.saveRepositoryWorkspaceTransition({ ...workspace, state: 'active', revision: 1 }, 0);
+    const reviewing = {
+      ...workspace,
+      state: 'reviewing' as const,
+      revision: 2,
+      evidence: {
+        changedFiles: ['app/page.tsx'], diffStat: '1 file changed', diffText: '+change',
+        diffTruncated: false, testResults: [], capturedAt: TIME,
+      },
+    };
+    await store.saveRepositoryWorkspaceTransition(reviewing, 1);
+    await store.saveRepositoryWorkspaceTransition({ ...reviewing, state: 'ready_for_approval', revision: 3 }, 2);
+    await store.createEscalation({
+      id: 'escalation:guided-write', jobId: job.id, reason: 'human_judgment_required',
+      summary: 'The prior result needs a local asset before another review.', createdAt: TIME,
+    });
+    const pending = {
+      id: 'operator-run:guided-write', jobId: job.id, status: 'pending' as const,
+      revision: 0, createdAt: TIME, updatedAt: TIME,
+    };
+    await store.createOperatorRun(pending);
+    await store.saveOperatorRunTransition({ ...pending, status: 'running', revision: 1, startedAt: TIME }, 0);
+    await store.saveOperatorRunTransition({
+      ...pending, status: 'needs_human', revision: 2, startedAt: TIME, finishedAt: TIME,
+    }, 1);
+
+    const detail = await new OperatorApplicationService(store, new FakeOrchestration(store)).getJobDetail(job.id);
+    expect(detail.summary.currentStage).toBe('Needs Me');
+  });
+
   it.each([
     [{ ...INPUT, task: '' }, 'Task is required'],
     [{ ...INPUT, acceptanceCriteria: '' }, 'Acceptance criteria is required'],

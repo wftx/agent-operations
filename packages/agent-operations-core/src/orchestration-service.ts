@@ -313,10 +313,45 @@ export class OrchestrationService {
           await this.escalate(job.id, 'runtime_failure', 'Persisted Review has no completed Reviewer Attempt.', latestWorker.id, review.id);
           return this.readModel(job.id, 'ESCALATED');
         }
+        const guidance = await this.guidanceFor(job.id, latestWorker.id, review.id);
         if (review.decision === 'PASS') {
+          if (guidance) {
+            if (workerBudget.exhausted) {
+              await this.escalate(
+                job.id,
+                'review_failed_after_budget',
+                `Worker execution budget of ${MVP_MAX_WORKER_ATTEMPTS} is exhausted.`,
+                latestWorker.id,
+                review.id,
+              );
+              return this.readModel(job.id, 'ESCALATED');
+            }
+            if (executionModeForJob(job) === 'repository-write-isolated') {
+              const workspace = await this.store.getRepositoryWorkspaceForJob(job.id);
+              if (!workspace || !this.workspaceService) {
+                await this.escalate(
+                  job.id,
+                  'runtime_failure',
+                  'Isolated workspace is unavailable for human guided revision.',
+                  latestWorker.id,
+                  review.id,
+                );
+                return this.readModel(job.id, 'ESCALATED');
+              }
+              await this.workspaceService.reopenForRevision(workspace.id);
+            }
+            await this.lifecycle.createAttempt(job.id, {
+              runtimeAgentId: workerRuntimeAgentId,
+              executionRole: 'worker',
+            });
+            continue;
+          }
           if (executionModeForJob(job) === 'repository-write-isolated') {
             const workspace = await this.store.getRepositoryWorkspaceForJob(job.id);
-            if (!workspace || workspace.state !== 'reviewing' || !workspace.evidence || !this.workspaceService) {
+            if (!workspace
+              || !['reviewing', 'ready_for_approval'].includes(workspace.state)
+              || !workspace.evidence
+              || !this.workspaceService) {
               await this.escalate(
                 job.id,
                 'runtime_failure',
@@ -325,7 +360,9 @@ export class OrchestrationService {
                 review.id,
               );
             } else {
-              const ready = await this.workspaceService.markReadyForApproval(workspace.id);
+              const ready = workspace.state === 'ready_for_approval'
+                ? workspace
+                : await this.workspaceService.markReadyForApproval(workspace.id);
               await this.escalate(
                 job.id,
                 'human_judgment_required',
@@ -353,7 +390,6 @@ export class OrchestrationService {
           return this.readModel(job.id, 'PASS');
         }
 
-        const guidance = await this.guidanceFor(job.id, latestWorker.id, review.id);
         if (review.decision === 'ESCALATE' && !guidance) {
           await this.escalate(
             job.id,
