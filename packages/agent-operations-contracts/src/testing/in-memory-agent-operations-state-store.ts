@@ -92,7 +92,12 @@ function copyRepositoryWorkspace(value: DurableRepositoryWorkspace): DurableRepo
             ...(value.evidence.binaryFiles
               ? { binaryFiles: value.evidence.binaryFiles.map(file => ({ ...file })) }
               : {}),
-            testResults: value.evidence.testResults.map(result => ({ ...result })),
+            testResults: value.evidence.testResults.map(result => ({
+              ...result,
+              ...(result.ephemeralArtifacts
+                ? { ephemeralArtifacts: result.ephemeralArtifacts.map(artifact => ({ ...artifact })) }
+                : {}),
+            })),
           },
         }
       : {}),

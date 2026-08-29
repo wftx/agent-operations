@@ -94,6 +94,29 @@ describe('RootScopedRepositoryWorkspaceTools', () => {
       });
       server.listen(0, '127.0.0.1', () => process.exit(8));
     `);
+    writeFileSync(join(root, 'artifacts.mjs'), `
+      import { mkdirSync, writeFileSync } from 'node:fs';
+      mkdirSync('node-compile-cache');
+      writeFileSync('node-compile-cache/cache.bin', 'cache');
+      writeFileSync('xcrun_db', 'cache');
+      console.log('ephemeral fixtures created');
+    `);
+    writeFileSync(join(root, 'dependency-write.mjs'), `
+      import { writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      try {
+        writeFileSync(join(process.env.NODE_PATH, 'ao-write-probe'), 'denied');
+        process.exit(11);
+      } catch {
+        console.log('dependency write denied');
+      }
+    `);
+    writeFileSync(join(root, 'signal.mjs'), `
+      import { spawn } from 'node:child_process';
+      const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)']);
+      setTimeout(() => child.kill('SIGTERM'), 25);
+      child.once('exit', () => console.log('child signal allowed'));
+    `);
     writeFileSync(join(root, 'package.json'), JSON.stringify({
       scripts: {
         typecheck: 'node success.mjs',
@@ -132,6 +155,32 @@ describe('RootScopedRepositoryWorkspaceTools', () => {
       });
       expect(contained.stdout).toContain('outside read denied');
       expect(readFileSync(outside, 'utf8')).toBe('outside secret fixture');
+      writeFileSync(join(root, 'package.json'), JSON.stringify({
+        scripts: { typecheck: 'node success.mjs', build: 'node dependency-write.mjs' },
+      }));
+      await expect(tools.runTest('build')).resolves.toMatchObject({
+        success: true,
+        stdout: expect.stringContaining('dependency write denied'),
+      });
+      writeFileSync(join(root, 'package.json'), JSON.stringify({
+        scripts: { typecheck: 'node success.mjs', build: 'node signal.mjs' },
+      }));
+      await expect(tools.runTest('build')).resolves.toMatchObject({
+        success: true,
+        stdout: expect.stringContaining('child signal allowed'),
+      });
+      writeFileSync(join(root, 'package.json'), JSON.stringify({
+        scripts: { typecheck: 'node success.mjs', build: 'node artifacts.mjs' },
+      }));
+      await expect(tools.runTest('build')).resolves.toMatchObject({
+        success: true,
+        ephemeralArtifacts: [
+          { path: 'node-compile-cache', kind: 'directory', byteSize: 5, fileCount: 1, cleanupStatus: 'removed' },
+          { path: 'xcrun_db', kind: 'file', byteSize: 5, fileCount: 1, cleanupStatus: 'removed' },
+        ],
+      });
+      expect(readdirSync(root)).not.toContain('node-compile-cache');
+      expect(readdirSync(root)).not.toContain('xcrun_db');
       writeFileSync(join(root, 'package.json'), JSON.stringify({
         scripts: { typecheck: 'node success.mjs', build: 'node network.mjs' },
       }));

@@ -956,6 +956,9 @@ export class OrchestrationService {
         durationMs: operation.durationMs!,
         stdout: operation.stdout ?? '',
         stderr: operation.stderr ?? '',
+        ...(operation.ephemeralArtifacts
+          ? { ephemeralArtifacts: operation.ephemeralArtifacts.map(artifact => ({ ...artifact })) }
+          : {}),
         occurredAt: operation.occurredAt,
       }));
     return this.workspaceService.captureEvidence(workspace.id, testResults);

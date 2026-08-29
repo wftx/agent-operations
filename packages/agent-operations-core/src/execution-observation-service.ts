@@ -319,6 +319,7 @@ function normalizeToolOperations(value: unknown): RuntimeExecutionObservation['t
     }
     const stdout = boundedToolOutput(item.stdout);
     const stderr = boundedToolOutput(item.stderr);
+    const ephemeralArtifacts = normalizeEphemeralArtifacts(item.ephemeralArtifacts);
     return {
       namespace: item.namespace as 'repository' | 'test' | 'git',
       operation: boundedRequired(item.operation, 'Tool operation', 100),
@@ -341,6 +342,39 @@ function normalizeToolOperations(value: unknown): RuntimeExecutionObservation['t
       ...(boundedOptional(item.errorCode, 100)
         ? { errorCode: boundedOptional(item.errorCode, 100) }
         : {}),
+      ...(ephemeralArtifacts ? { ephemeralArtifacts } : {}),
+    };
+  });
+}
+
+function normalizeEphemeralArtifacts(value: unknown) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 10) {
+    throw new Error('Runtime observer returned invalid ephemeral artifact evidence');
+  }
+  return value.map(item => {
+    if (!isRecord(item)
+      || typeof item.path !== 'string'
+      || !item.path.trim()
+      || item.path.length > 200
+      || item.path.includes('\0')
+      || item.path.includes('/')
+      || !['file', 'directory', 'symlink', 'other'].includes(String(item.kind))
+      || typeof item.byteSize !== 'number'
+      || !Number.isSafeInteger(item.byteSize)
+      || item.byteSize < 0
+      || typeof item.fileCount !== 'number'
+      || !Number.isSafeInteger(item.fileCount)
+      || item.fileCount < 0
+      || item.cleanupStatus !== 'removed') {
+      throw new Error('Runtime observer returned invalid ephemeral artifact evidence');
+    }
+    return {
+      path: item.path,
+      kind: item.kind as 'file' | 'directory' | 'symlink' | 'other',
+      byteSize: item.byteSize,
+      fileCount: item.fileCount,
+      cleanupStatus: 'removed' as const,
     };
   });
 }

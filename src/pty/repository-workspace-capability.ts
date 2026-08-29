@@ -9,10 +9,12 @@ import {
   readFileSync,
   realpathSync,
   mkdtempSync,
+  readdirSync,
   rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 const MAX_FILE_BYTES = 1_048_576;
@@ -32,6 +34,15 @@ export interface WorkspaceToolAuditEvent {
   readonly stderr?: string;
   readonly outputTruncated?: boolean;
   readonly errorCode?: string;
+  readonly ephemeralArtifacts?: readonly WorkspaceEphemeralArtifactAudit[];
+}
+
+export interface WorkspaceEphemeralArtifactAudit {
+  readonly path: string;
+  readonly kind: 'file' | 'directory' | 'symlink' | 'other';
+  readonly byteSize: number;
+  readonly fileCount: number;
+  readonly cleanupStatus: 'removed';
 }
 
 export class WorkspaceToolError extends Error {
@@ -107,7 +118,12 @@ export class RootScopedRepositoryWorkspaceTools {
   async runTest(commandId: string): Promise<WorkspaceToolAuditEvent> {
     const selected = TEST_COMMANDS[commandId as keyof typeof TEST_COMMANDS];
     if (!selected) throw new WorkspaceToolError('COMMAND_DENIED', 'Test command is not allowlisted');
-    const [file, args] = selected;
+    const [file, configuredArgs] = selected;
+    // Next production webpack avoids Turbopack retaining sandboxed workers and
+    // remains explicit in the durable command evidence.
+    const args = commandId === 'build' && packageUsesNextBuild(this.root)
+      ? [...configuredArgs, '--', '--webpack']
+      : [...configuredArgs];
     const started = Date.now();
     const result = await runSandboxed(file, args, this.root, 10 * 60_000);
     const stdout = bounded(result.stdout);
@@ -122,6 +138,9 @@ export class RootScopedRepositoryWorkspaceTools {
       durationMs: Date.now() - started,
       stdout: stdout.text,
       stderr: stderr.text,
+      ...(result.ephemeralArtifacts.length > 0
+        ? { ephemeralArtifacts: result.ephemeralArtifacts }
+        : {}),
       ...((stdout.truncated || stderr.truncated) ? { outputTruncated: true } : {}),
       occurredAt: new Date().toISOString(),
     };
@@ -170,6 +189,21 @@ export class RootScopedRepositoryWorkspaceTools {
   }
 }
 
+function packageUsesNextBuild(root: string): boolean {
+  try {
+    const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
+      scripts?: { build?: unknown };
+    };
+    return typeof manifest.scripts?.build === 'string'
+      && /^next\s+build(?:\s|$)/.test(manifest.scripts.build.trim());
+  } catch {
+    throw new WorkspaceToolError(
+      'INVALID_PROJECT_MANIFEST',
+      'The bounded build command requires a readable package manifest',
+    );
+  }
+}
+
 function normalize(path: string): string {
   const clean = path.trim().replace(/\\/g, '/');
   if (!clean || clean.length > 1_024 || clean.includes('\0') || isAbsolute(clean)) {
@@ -177,7 +211,7 @@ function normalize(path: string): string {
   }
   const parts = clean.split('/');
   if (parts.some(part => !part || part === '.' || part === '..')
-    || ['.git', '.agent-operations'].includes(parts[0])) {
+    || ['.git', '.agent-operations', 'node_modules'].includes(parts[0])) {
     throw new WorkspaceToolError('RESTRICTED_PATH', 'Patch path is restricted');
   }
   return parts.join('/');
@@ -223,7 +257,12 @@ async function runSandboxed(
   args: readonly string[],
   cwd: string,
   timeout: number,
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+): Promise<{
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  ephemeralArtifacts: readonly WorkspaceEphemeralArtifactAudit[];
+}> {
   if (process.platform !== 'darwin') {
     throw new WorkspaceToolError(
       'SANDBOX_UNAVAILABLE',
@@ -231,17 +270,22 @@ async function runSandboxed(
     );
   }
   const dependencyRoot = trustedDependencyRoot(cwd);
-  const tempDirectory = mkdtempSync(join(cwd, '.ao-test-tmp-'));
+  const knownArtifacts = ['node-compile-cache', 'xcrun_db'] as const;
+  const existedBefore = new Set(knownArtifacts.filter(name => pathMetadata(join(cwd, name)) !== null));
+  const tempDirectory = realpathSync(mkdtempSync(join(tmpdir(), 'ao-bounded-test-')));
   const escapedRoot = cwd.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   const escapedDependencies = dependencyRoot.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  const escapedTemporary = tempDirectory.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   const profile = [
     '(version 1)',
     '(deny default)',
     '(allow process*)',
+    '(allow signal (target same-sandbox))',
     '(allow file-read-metadata)',
     '(allow file-read-data (literal "/"))',
     `(allow file-read* (subpath "${escapedRoot}"))`,
     `(allow file-read* (subpath "${escapedDependencies}"))`,
+    `(allow file-read* (subpath "${escapedTemporary}"))`,
     '(allow file-read* (subpath "/System"))',
     '(allow file-read* (subpath "/usr"))',
     '(allow file-read* (subpath "/bin"))',
@@ -256,20 +300,55 @@ async function runSandboxed(
     '(allow file-read* (literal "/dev/random"))',
     '(allow file-read* (literal "/dev/urandom"))',
     `(allow file-write* (subpath "${escapedRoot}"))`,
+    `(allow file-write* (subpath "${escapedTemporary}"))`,
+    `(deny file-write* (subpath "${escapedDependencies}"))`,
     '(allow sysctl-read)',
     '(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))',
   ].join('');
   try {
-    return await run('/usr/bin/sandbox-exec', ['-p', profile, file, ...args], cwd, timeout, {
+    const result = await run('/usr/bin/sandbox-exec', ['-p', profile, file, ...args], cwd, timeout, {
       PATH: [join(dependencyRoot, '.bin'), process.env.PATH ?? '/usr/bin:/bin'].join(delimiter),
       NODE_PATH: dependencyRoot,
       TMPDIR: tempDirectory,
+      HOME: tempDirectory,
+      NODE_COMPILE_CACHE: join(tempDirectory, 'node-compile-cache'),
+      NEXT_TELEMETRY_DISABLED: '1',
+      xcrun_nocache: '1',
       GIT_CONFIG_GLOBAL: '/dev/null',
       GIT_CONFIG_NOSYSTEM: '1',
     });
+    const ephemeralArtifacts = knownArtifacts
+      .filter(name => !existedBefore.has(name) && pathMetadata(join(cwd, name)) !== null)
+      .map(name => inspectEphemeralArtifact(cwd, name));
+    for (const artifact of ephemeralArtifacts) {
+      try {
+        rmSync(join(cwd, artifact.path), { recursive: true, force: true });
+      } catch {
+        throw new WorkspaceToolError(
+          'EPHEMERAL_CLEANUP_FAILED',
+          `Bounded validation could not remove its ${artifact.path} artifact`,
+        );
+      }
+    }
+    return { ...result, ephemeralArtifacts };
   } finally {
-    rmSync(tempDirectory, { recursive: true, force: true });
+    await removeTemporaryDirectory(tempDirectory);
   }
+}
+
+async function removeTemporaryDirectory(path: string): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      rmSync(path, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOTEMPTY') throw error;
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 50));
+    }
+  }
+  throw lastError;
 }
 
 function trustedDependencyRoot(cwd: string): string {
@@ -283,6 +362,17 @@ function trustedDependencyRoot(cwd: string): string {
       'The isolated worktree has no AO prepared dependency link',
     );
   }
+  if (metadata.isDirectory()) {
+    const marker = join(link, '.ao-dependency-projection.json');
+    const markerMetadata = pathMetadata(marker);
+    if (!markerMetadata?.isFile()) {
+      throw new WorkspaceToolError(
+        'DEPENDENCIES_UNAVAILABLE',
+        'The isolated worktree dependency projection is not AO owned',
+      );
+    }
+    return realpathSync(link);
+  }
   if (!metadata.isSymbolicLink()) {
     throw new WorkspaceToolError(
       'DEPENDENCIES_UNAVAILABLE',
@@ -294,6 +384,48 @@ function trustedDependencyRoot(cwd: string): string {
     throw new WorkspaceToolError('DEPENDENCIES_UNAVAILABLE', 'The dependency link target is unavailable');
   }
   return target;
+}
+
+function pathMetadata(path: string): ReturnType<typeof lstatSync> | null {
+  try {
+    return lstatSync(path);
+  } catch {
+    return null;
+  }
+}
+
+function inspectEphemeralArtifact(cwd: string, name: string): WorkspaceEphemeralArtifactAudit {
+  const root = join(cwd, name);
+  const metadata = lstatSync(root);
+  let byteSize = metadata.isFile() ? metadata.size : 0;
+  let fileCount = metadata.isFile() ? 1 : 0;
+  if (metadata.isDirectory()) {
+    const pending = [root];
+    while (pending.length > 0) {
+      const directory = pending.pop()!;
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const child = join(directory, entry.name);
+        if (entry.isDirectory()) pending.push(child);
+        else {
+          fileCount += 1;
+          byteSize += lstatSync(child).size;
+        }
+      }
+    }
+  }
+  return {
+    path: name,
+    kind: metadata.isDirectory()
+      ? 'directory'
+      : metadata.isFile()
+        ? 'file'
+        : metadata.isSymbolicLink()
+          ? 'symlink'
+          : 'other',
+    byteSize,
+    fileCount,
+    cleanupStatus: 'removed',
+  };
 }
 
 function bounded(value: string): { text: string; truncated: boolean } {

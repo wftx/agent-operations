@@ -84,7 +84,12 @@ export class RepositoryWorkspaceService {
       state: 'reviewing',
       evidence: {
         ...captured,
-        testResults: testResults.map(result => ({ ...result })),
+        testResults: testResults.map(result => ({
+          ...result,
+          ...(result.ephemeralArtifacts
+            ? { ephemeralArtifacts: result.ephemeralArtifacts.map(artifact => ({ ...artifact })) }
+            : {}),
+        })),
         capturedAt: this.now().toISOString(),
       },
     });

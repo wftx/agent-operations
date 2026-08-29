@@ -20,7 +20,16 @@ export interface WorkspaceTestResult {
   readonly durationMs: number;
   readonly stdout: string;
   readonly stderr: string;
+  readonly ephemeralArtifacts?: readonly WorkspaceEphemeralArtifactEvidence[];
   readonly occurredAt: string;
+}
+
+export interface WorkspaceEphemeralArtifactEvidence {
+  readonly path: string;
+  readonly kind: 'file' | 'directory' | 'symlink' | 'other';
+  readonly byteSize: number;
+  readonly fileCount: number;
+  readonly cleanupStatus: 'removed';
 }
 
 export interface WorkspaceBinaryFileEvidence {

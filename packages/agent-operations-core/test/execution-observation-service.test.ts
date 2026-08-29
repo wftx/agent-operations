@@ -143,13 +143,30 @@ describe('ExecutionObservationService', () => {
         occurredAt: TIME,
         commandId: 'agent-operations-tests',
         stderr: 'x'.repeat(10_000),
+        ephemeralArtifacts: [{
+          path: 'node-compile-cache',
+          kind: 'directory',
+          byteSize: 512,
+          fileCount: 3,
+          cleanupStatus: 'removed',
+        }],
       }],
     }]);
 
     const result = await setup.observations.observeAttemptExecution(setup.attempt.id);
 
     expect(result.detail.observations[0].toolOperations).toEqual([
-      expect.objectContaining({ outputTruncated: true, stderr: 'x'.repeat(4_000) }),
+      expect.objectContaining({
+        outputTruncated: true,
+        stderr: 'x'.repeat(4_000),
+        ephemeralArtifacts: [{
+          path: 'node-compile-cache',
+          kind: 'directory',
+          byteSize: 512,
+          fileCount: 3,
+          cleanupStatus: 'removed',
+        }],
+      }),
     ]);
   });
 

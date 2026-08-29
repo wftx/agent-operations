@@ -5,6 +5,7 @@ import type {
   RuntimeExecutionPolicy,
 } from './execution.js';
 import { EXECUTION_RESULT_MAX_CHARS } from './orchestration.js';
+import type { WorkspaceEphemeralArtifactEvidence } from './workspace.js';
 
 export const EXECUTION_OBSERVATION_KINDS = [
   'runtime-running',
@@ -74,6 +75,8 @@ export interface RuntimeToolOperation {
   /** True when AO retained only the bounded prefix of provider tool output. */
   readonly outputTruncated?: boolean;
   readonly errorCode?: string;
+  /** Exact known validation artifacts removed before workspace evidence capture. */
+  readonly ephemeralArtifacts?: readonly WorkspaceEphemeralArtifactEvidence[];
 }
 
 /** Read-only, explicitly invoked observation capability. */

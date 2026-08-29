@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { createReadStream } from 'node:fs';
-import { lstat, mkdir, open, realpath, stat, symlink } from 'node:fs/promises';
+import { constants, createReadStream } from 'node:fs';
+import { cp, lstat, mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type {
   RepositoryWorkspaceAdapter,
@@ -11,6 +11,7 @@ import type {
 import { GitRepositoryAdapter } from './git-repository-adapter.js';
 
 const MAX_EVIDENCE_BYTES = 64 * 1024;
+const DEPENDENCY_PROJECTION_MARKER = '.ao-dependency-projection.json';
 
 interface GitResult {
   readonly ok: boolean;
@@ -189,16 +190,48 @@ export class GitRepositoryWorkspaceAdapter implements RepositoryWorkspaceAdapter
     }
     const canonicalSource = await realpath(source);
     const destinationMetadata = await lstat(destination).catch(() => null);
-    if (!destinationMetadata) {
-      await symlink(canonicalSource, destination, 'dir').catch(() => undefined);
+    const projectionFingerprint = await dependencyProjectionFingerprint(
+      canonicalSource,
+      input.sourceCheckoutPath,
+    );
+    if (destinationMetadata?.isDirectory()) {
+      const marker = await readFile(join(destination, DEPENDENCY_PROJECTION_MARKER), 'utf8')
+        .then(value => JSON.parse(value) as { fingerprint?: unknown })
+        .catch(() => null);
+      return marker?.fingerprint === projectionFingerprint
+        ? null
+        : 'The isolated worktree dependency projection is not AO owned or no longer matches the source checkout.';
     }
-    const linkedMetadata = await lstat(destination).catch(() => null);
-    const linkedTarget = linkedMetadata?.isSymbolicLink()
-      ? await realpath(destination).catch(() => null)
-      : null;
-    return linkedTarget === canonicalSource
-      ? null
-      : 'The isolated worktree dependency link is missing or does not match the source checkout.';
+    if (destinationMetadata?.isSymbolicLink()) {
+      const linkedTarget = await realpath(destination).catch(() => null);
+      if (linkedTarget !== canonicalSource) {
+        return 'The isolated worktree dependency link does not match the source checkout.';
+      }
+      await rm(destination);
+    } else if (destinationMetadata) {
+      return 'The isolated worktree dependency path is not an AO owned projection.';
+    }
+    const temporary = join(input.destinationPath, `.ao-node-modules-${process.pid}-${Date.now()}`);
+    try {
+      await cp(canonicalSource, temporary, {
+        recursive: true,
+        force: false,
+        errorOnExist: true,
+        verbatimSymlinks: true,
+        mode: constants.COPYFILE_FICLONE,
+      });
+      await writeFile(join(temporary, DEPENDENCY_PROJECTION_MARKER), `${JSON.stringify({
+        version: 1,
+        fingerprint: projectionFingerprint,
+      })}\n`, { encoding: 'utf8', mode: 0o600 });
+      await rename(temporary, destination);
+      return null;
+    } catch (error) {
+      await rm(temporary, { recursive: true, force: true }).catch(() => undefined);
+      return bounded(`The isolated worktree dependency projection could not be prepared safely: ${
+        error instanceof Error ? error.message : String(error)
+      }`);
+    }
   }
 
   private runGit(repositoryPath: string, args: readonly string[]): Promise<GitResult> {
@@ -220,6 +253,19 @@ export class GitRepositoryWorkspaceAdapter implements RepositoryWorkspaceAdapter
       }));
     });
   }
+}
+
+async function dependencyProjectionFingerprint(
+  canonicalDependencyRoot: string,
+  sourceCheckoutPath: string,
+): Promise<string> {
+  const lockfile = await readFile(join(sourceCheckoutPath, 'package-lock.json')).catch(() => null);
+  const digest = createHash('sha256');
+  digest.update('ao-dependency-projection-v1\0');
+  digest.update(canonicalDependencyRoot);
+  digest.update('\0');
+  if (lockfile) digest.update(lockfile);
+  return digest.digest('hex');
 }
 
 interface StatusEntry {
