@@ -206,3 +206,39 @@ There is no automatic merge, general queue, scheduler, concurrent write Job
 execution, interactive Telegram approval, production authentication, or remote
 deployment in this MVP. Starting the AO web surface still does not start
 CortextOS.
+
+## Conversational Orchestrator
+
+AO Web includes one global **Orchestrator** conversation for natural language
+Job intake. It delegates each message to the dedicated persistent CortextOS
+agent named `ao-orchestrator`. CortextOS owns the provider process, session
+continuity, and conversation records. AO does not create a second model loop or
+store a duplicate transcript in SQLite.
+
+The Orchestrator can list and resolve Projects, create a Job through the normal
+Operator application service, and read current Job state. It receives no raw
+SQLite, Git, repository, worktree, network, approval, completion, or publish
+authority. Its generated Job links come from structured AO tool results. Job
+state displayed beside those links is read from current AO truth.
+
+One Orchestrator serves all Projects. An optional UI Project selection is only
+a hint. Explicit Project references must still resolve to an exact AO Project
+ID, and ambiguity requires a concise clarification rather than a guessed
+mutation.
+
+The web channel stores bounded turn projections and Job links under the
+CortextOS agent state directory. Provider native history remains the continuity
+source after restart. Loading or refreshing the page reads that state and never
+starts the runtime or submits a turn.
+
+The dedicated profile uses the existing authenticated Codex app server. Each
+web message requires one exact provider turn on the persistent Orchestrator
+thread. The thread is read only, denies network, inherits no environment, and
+exposes only the bounded native Agent Operations tool namespace. The profile is
+registered disabled until the separately authorized live proof.
+
+Phase 27B does not consolidate Telegram. Existing AO notification intent and
+deduplication remain unchanged. A later phase can route Telegram inbound and
+outbound through this same CortextOS Orchestrator while keeping AO action
+authority. Attachments, authorized URL inputs, preview, visual review, and
+Approve and Publish remain separate follow on capabilities.

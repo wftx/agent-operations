@@ -98,6 +98,132 @@ beforeEach(() => {
   messageHandler = null;
 });
 
+describe('CodexAppServerPTY Agent Operations Orchestrator tools', () => {
+  it('starts one exact turn on the persistent restricted thread', async () => {
+    requestMock.mockResolvedValue({ result: { turn: { id: 'turn-ao-1', status: 'inProgress' } } });
+    const pty = new CodexAppServerPTY(mockEnv, { tool_profile: 'agent-operations-orchestrator' });
+    Object.assign(pty as unknown as Record<string, unknown>, {
+      _alive: true,
+      _threadId: 'thread-ao-1',
+      _rpc: { request: requestMock },
+    });
+
+    const reference = await pty.startCorrelationSafeTurn(
+      'Create a Job.',
+      'conversation:abc-123',
+      undefined,
+      undefined,
+      { version: 1, repositoryRead: false, agentOperationsControl: true },
+    );
+
+    expect(reference).toMatchObject({
+      provider: 'codex',
+      sessionId: 'thread-ao-1',
+      turnId: 'turn-ao-1',
+      effectiveCapabilities: { agentOperationsControl: true },
+    });
+    expect(requestMock).toHaveBeenCalledWith('turn/start', expect.objectContaining({
+      threadId: 'thread-ao-1',
+      clientUserMessageId: 'conversation:abc-123',
+      sandboxPolicy: { type: 'readOnly', networkAccess: false },
+      environments: [],
+    }));
+    (pty as unknown as { handleRpcMessage(message: unknown): void }).handleRpcMessage({
+      method: 'turn/completed',
+      params: { threadId: 'thread-ao-1', turn: { id: 'turn-ao-1', status: 'completed' } },
+    });
+    await Promise.resolve();
+  });
+
+  it('builds a persistent read only thread with only the bounded AO namespace', async () => {
+    requestMock.mockResolvedValue({ result: { config: { mcp_servers: { example: {} } } } });
+    const pty = new CodexAppServerPTY(mockEnv, { tool_profile: 'agent-operations-orchestrator' });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    const overrides = await (pty as unknown as {
+      persistentThreadOverrides(): Promise<Record<string, unknown>>;
+    }).persistentThreadOverrides();
+
+    expect(overrides).toMatchObject({
+      runtimeWorkspaceRoots: [],
+      approvalPolicy: 'never',
+      sandbox: 'read-only',
+      environments: [],
+      selectedCapabilityRoots: [],
+      config: {
+        features: { shell_tool: false, web_search_request: false },
+        agents: { enabled: false },
+        mcp_servers: { example: { enabled: false } },
+      },
+    });
+    expect(overrides.dynamicTools).toEqual([
+      expect.objectContaining({ name: 'ao' }),
+    ]);
+  });
+
+  it('executes a bounded AO tool only for the exact protected turn', async () => {
+    const execute = vi.fn().mockResolvedValue({ ok: true, data: [], relatedJobIds: [] });
+    const pty = new CodexAppServerPTY(
+      mockEnv,
+      { tool_profile: 'agent-operations-orchestrator' },
+      undefined,
+      execute,
+    );
+    Object.assign(pty as unknown as Record<string, unknown>, {
+      _protectedThreadId: 'thread-1',
+      _protectedTurnId: 'turn-1',
+      _protectedCorrelationId: 'conversation:abc-123',
+      _workspaceToolCapabilities: {
+        version: 1,
+        repositoryRead: false,
+        agentOperationsControl: true,
+      },
+      _rpc: { respond: respondMock },
+    });
+
+    await (pty as unknown as {
+      handleDynamicToolCall(id: number, params: unknown): Promise<void>;
+    }).handleDynamicToolCall(7, {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      callId: 'call-1',
+      namespace: 'ao',
+      tool: 'projects_list',
+      arguments: {},
+    });
+
+    expect(execute).toHaveBeenCalledWith('ao.projects.list', 'conversation:abc-123', {});
+    expect(respondMock).toHaveBeenCalledWith(7, expect.objectContaining({ success: true }));
+  });
+
+  it('denies AO tool calls outside the exact protected turn', async () => {
+    const execute = vi.fn();
+    const pty = new CodexAppServerPTY(
+      mockEnv,
+      { tool_profile: 'agent-operations-orchestrator' },
+      undefined,
+      execute,
+    );
+    Object.assign(pty as unknown as Record<string, unknown>, {
+      _protectedThreadId: 'thread-1',
+      _protectedTurnId: 'turn-1',
+      _protectedCorrelationId: 'conversation:abc-123',
+      _workspaceToolCapabilities: { version: 1, repositoryRead: false, agentOperationsControl: true },
+      _rpc: { respond: respondMock },
+    });
+
+    await (pty as unknown as {
+      handleDynamicToolCall(id: number, params: unknown): Promise<void>;
+    }).handleDynamicToolCall(8, {
+      threadId: 'thread-1', turnId: 'turn-other', callId: 'call-2',
+      namespace: 'ao', tool: 'projects_list', arguments: {},
+    });
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(respondMock).toHaveBeenCalledWith(8, expect.objectContaining({ success: false }));
+  });
+});
+
 describe('CodexAppServerPTY socket path policy', () => {
   it('uses codex.sock in the agent state dir by default', () => {
     const pty = new CodexAppServerPTY(mockEnv, {});

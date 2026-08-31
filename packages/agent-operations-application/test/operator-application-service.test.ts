@@ -311,6 +311,22 @@ describe('OperatorApplicationService', () => {
     });
   });
 
+  it('lets an external bounded tool persist a Job without owning runner execution', async () => {
+    const store = await configuredStore();
+    const orchestration = new FakeOrchestration(store);
+    const application = new OperatorApplicationService(store, orchestration, {
+      now: () => new Date(TIME),
+      deferRunnerWake: true,
+    });
+
+    const started = await application.runOperatorJob(INPUT);
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(started.status).toBe('pending');
+    expect(orchestration.runCalls).toBe(0);
+    expect(await store.getOperatorRunForJob(started.jobId)).toMatchObject({ status: 'pending' });
+  });
+
   it('surfaces durable escalations in Needs Me and excludes them from Done', async () => {
     const store = await configuredStore();
     const application = new OperatorApplicationService(store, new FakeOrchestration(store, 'ESCALATED'), { now: () => new Date(TIME) });

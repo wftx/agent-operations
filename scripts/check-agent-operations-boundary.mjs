@@ -46,7 +46,6 @@ for (const packageEntry of readdirSync(packagesRoot, { withFileTypes: true })) {
 }
 
 for (const file of walk(operatorWebRoot)) {
-  if (file === join(operatorWebRoot, 'server.ts')) continue;
   const source = readFileSync(file, 'utf8');
   for (const match of source.matchAll(importPattern)) {
     const specifier = match[1];

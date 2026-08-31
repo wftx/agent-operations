@@ -1,0 +1,17 @@
+{
+  "agent_name": "{{agent_name}}",
+  "enabled": false,
+  "runtime": "codex-app-server",
+  "tool_profile": "agent-operations-orchestrator",
+  "dangerously_skip_permissions": false,
+  "startup_delay": 0,
+  "max_session_seconds": 255600,
+  "max_crashes_per_day": 10,
+  "working_directory": "",
+  "timezone": "",
+  "telegram_polling": false,
+  "crons": [],
+  "ecosystem": {
+    "local_version_control": { "enabled": false }
+  }
+}

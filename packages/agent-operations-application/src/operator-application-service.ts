@@ -57,6 +57,8 @@ export interface OperatorApplicationServiceOptions {
   readonly operatorRunIdFactory?: () => string;
   readonly humanGuidanceIdFactory?: () => string;
   readonly escalationIdFactory?: () => string;
+  /** Persist mutations without waking this process's runner. Used by bounded external tool adapters. */
+  readonly deferRunnerWake?: boolean;
 }
 
 export const OPERATOR_READ_ONLY_DEFAULTS: OperatorPolicyDefaults = {
@@ -89,6 +91,7 @@ export class OperatorApplicationService implements OperatorApplication {
   private readonly operatorRunIdFactory: () => string;
   private readonly humanGuidanceIdFactory: () => string;
   private readonly escalationIdFactory: () => string;
+  private readonly deferRunnerWake: boolean;
 
   constructor(
     private readonly store: AgentOperationsStateStore,
@@ -102,6 +105,7 @@ export class OperatorApplicationService implements OperatorApplication {
     this.operatorRunIdFactory = options.operatorRunIdFactory ?? (() => createOperatorRunId());
     this.humanGuidanceIdFactory = options.humanGuidanceIdFactory ?? (() => createHumanGuidanceId());
     this.escalationIdFactory = options.escalationIdFactory ?? (() => createEscalationId());
+    this.deferRunnerWake = options.deferRunnerWake ?? false;
     this.runner = new OperatorRunner(store, orchestration, {
       now: this.now,
       ...(options.notifier ? { notifier: options.notifier } : {}),
@@ -161,6 +165,7 @@ export class OperatorApplicationService implements OperatorApplication {
   }
 
   async previewTask(input: OperatorTaskInput): Promise<OperatorTaskPreview> {
+    const title = input.title === undefined ? undefined : boundedRequired(input.title, 'Title', 200);
     const task = boundedRequired(input.task, 'Task', 16_384);
     const acceptanceCriteria = boundedRequired(input.acceptanceCriteria, 'Acceptance criteria', 8_192);
     const projectId = required(input.projectId, 'Project');
@@ -185,6 +190,7 @@ export class OperatorApplicationService implements OperatorApplication {
       project,
       repository,
       runtimeAgentId: runtimeAgentIds[0],
+      ...(title ? { title } : {}),
       task,
       acceptanceCriteria,
       defaults: executionMode === 'repository-write-isolated'
@@ -215,7 +221,7 @@ export class OperatorApplicationService implements OperatorApplication {
         projectId: preview.project.id,
         repositoryId: preview.repository.id,
         preferredRuntimeAgentId: preview.runtimeAgentId,
-        title: taskTitle(preview.task),
+        title: preview.title ?? taskTitle(preview.task),
         description: preview.task,
         acceptanceCriteria: preview.acceptanceCriteria,
         executionMode: preview.executionMode,
@@ -231,7 +237,7 @@ export class OperatorApplicationService implements OperatorApplication {
         createdAt,
         updatedAt: createdAt,
       });
-      void this.runner.wake();
+      if (!this.deferRunnerWake) void this.runner.wake();
       return { jobId: job.id, status: 'pending', startedAt: createdAt };
     } finally {
       this.runReserved = false;

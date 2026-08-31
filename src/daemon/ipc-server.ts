@@ -950,7 +950,7 @@ function isRuntimeExecutionCapabilitiesEnvelope(
   const capabilities = value as Record<string, unknown>;
   return capabilities.version === 1
     && typeof capabilities.repositoryRead === 'boolean'
-    && ['repositoryPatch', 'testRun', 'gitInspect'].every(field =>
+    && ['repositoryPatch', 'testRun', 'gitInspect', 'agentOperationsControl'].every(field =>
       capabilities[field] === undefined || typeof capabilities[field] === 'boolean');
 }
 

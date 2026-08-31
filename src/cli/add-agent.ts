@@ -17,7 +17,7 @@ const NON_CODEX_TEMPLATES = ['orchestrator', 'analyst', 'm2c1-worker', 'hermes']
 
 export const addAgentCommand = new Command('add-agent')
   .argument('<name>', 'Agent name')
-  .option('--template <type>', 'Agent template (orchestrator, analyst, agent, agent-codex)', 'agent')
+  .option('--template <type>', 'Agent template (orchestrator, ao-orchestrator, analyst, agent, agent-codex)', 'agent')
   .option('--org <org>', 'Organization name')
   .option('--instance <id>', 'Instance ID', 'default')
   .option('--runtime <runtime>', `Agent runtime (${VALID_RUNTIMES.join(', ')})`, 'claude-code')
@@ -304,7 +304,7 @@ export const addAgentCommand = new Command('add-agent')
     }
 
     // Update org context.json if this is the orchestrator
-    if (options.template === 'orchestrator') {
+    if (options.template === 'orchestrator' || options.template === 'ao-orchestrator') {
       const contextPath = join(projectRoot, 'orgs', org, 'context.json');
       if (existsSync(contextPath)) {
         try {
@@ -332,8 +332,13 @@ export const addAgentCommand = new Command('add-agent')
     } catch { /* start fresh */ }
 
     if (!enabledAgents[name]) {
+      let enabledByTemplate = true;
+      try {
+        const agentConfig = JSON.parse(readFileSync(configPath, 'utf-8')) as { enabled?: unknown };
+        enabledByTemplate = agentConfig.enabled !== false;
+      } catch { /* malformed config is handled by the normal agent lifecycle */ }
       enabledAgents[name] = {
-        enabled: true,
+        enabled: enabledByTemplate,
         status: 'configured',
         ...(org ? { org } : {}),
       };

@@ -22,6 +22,7 @@ export type { RuntimeStartResult } from '../../agent-operations-contracts/src/in
 export interface OperatorTaskInput {
   readonly projectId: string;
   readonly repositoryId: string;
+  readonly title?: string;
   readonly task: string;
   readonly acceptanceCriteria: string;
   readonly executionMode?: JobExecutionMode;
@@ -47,6 +48,7 @@ export interface OperatorTaskPreview {
   readonly project: DurableProject;
   readonly repository: DurableRepository;
   readonly runtimeAgentId: string;
+  readonly title?: string;
   readonly task: string;
   readonly acceptanceCriteria: string;
   readonly defaults: OperatorPolicyDefaults;
@@ -146,4 +148,69 @@ export interface OperatorApplication {
   cancelEscalatedJob(escalationId: string): Promise<OperatorRunSession>;
   listJobs(filter?: OperatorJobList): Promise<readonly OperatorJobSummary[]>;
   getJobDetail(jobId: string): Promise<OperatorJobDetail>;
+}
+
+export type OrchestratorToolName =
+  | 'ao.projects.list'
+  | 'ao.projects.get'
+  | 'ao.jobs.create'
+  | 'ao.jobs.get'
+  | 'ao.jobs.list'
+  | 'ao.jobs.status';
+
+export interface OrchestratorToolRequest {
+  readonly name: OrchestratorToolName;
+  readonly arguments: Readonly<Record<string, unknown>>;
+}
+
+export interface OrchestratorToolResult {
+  readonly ok: boolean;
+  readonly data?: unknown;
+  readonly error?: { readonly code: string; readonly message: string };
+  readonly relatedJobIds: readonly string[];
+}
+
+export interface OrchestratorTurnInput {
+  readonly message: string;
+  readonly projectId?: string;
+}
+
+export interface OrchestratorConversationTurn {
+  readonly id: string;
+  readonly operatorMessage: string;
+  readonly response?: string;
+  readonly projectId?: string;
+  readonly relatedJobIds: readonly string[];
+  readonly clarificationRequired: boolean;
+  readonly status: 'pending' | 'completed' | 'failed';
+  readonly createdAt: string;
+  readonly completedAt?: string;
+  readonly error?: string;
+  readonly providerSessionId?: string;
+  readonly providerTurnId?: string;
+}
+
+export interface OrchestratorConversationState {
+  readonly agentId: string;
+  /** Stable CortextOS agent session identity. Provider native history remains CortextOS owned. */
+  readonly sessionId: string;
+  readonly runtimeState: 'ready' | 'offline' | 'busy';
+  readonly runtimeReason?: string;
+  readonly turns: readonly OrchestratorConversationTurn[];
+}
+
+export interface OrchestratorTurnResult {
+  readonly agentId: string;
+  readonly sessionId: string;
+  readonly turn: OrchestratorConversationTurn;
+}
+
+export interface OrchestratorConversationRuntime {
+  sendTurn(input: OrchestratorTurnInput): Promise<OrchestratorTurnResult>;
+  getConversationState(): Promise<OrchestratorConversationState>;
+}
+
+export interface OrchestratorConversationService {
+  sendTurn(input: OrchestratorTurnInput): Promise<OrchestratorTurnResult>;
+  getConversationState(): Promise<OrchestratorConversationState>;
 }

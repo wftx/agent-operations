@@ -1,68 +1,38 @@
-import {
-  CortextOSRuntimeAdapter,
-  CortextOSRuntimeLifecycleAdapter,
-} from '../../../packages/cortextos-adapter/src/index.js';
-import { CortextOSExecutionAdapter } from '../../../packages/cortextos-execution-adapter/src/index.js';
-import { CortextOSExecutionObserver } from '../../../packages/cortextos-execution-observer/src/index.js';
-import { GitRepositoryAdapter, GitRepositoryWorkspaceAdapter } from '../../../packages/git-adapter/src/index.js';
-import { OrchestrationService, RepositoryWorkspaceService } from '../../../packages/agent-operations-core/src/index.js';
-import { OperatorApplicationService } from '../../../packages/agent-operations-application/src/index.js';
-import { NoopOperatorNotifier } from '../../../packages/agent-operations-application/src/index.js';
-import { SqliteAgentOperationsStateStore, resolveAgentOperationsStateLocation } from '../../../packages/sqlite-state-adapter/src/index.js';
-import {
-  TelegramOperatorNotifier,
-  loadAgentOperationsTelegramEnvironmentFile,
-  loadTelegramOperatorNotificationConfig,
-} from '../../../packages/telegram-notification-adapter/src/index.js';
+import type {
+  OperatorApplication,
+  OrchestratorConversationService,
+} from '../../../packages/agent-operations-application/src/index.js';
 import { OperatorWebApplication } from './app.js';
 import { createOperatorHttpServer } from './http-server.js';
 
-const host = '127.0.0.1';
-const port = parsePort(process.env['AO_WEB_PORT'] ?? '4310');
-const store = SqliteAgentOperationsStateStore.open();
-const runtime = new CortextOSRuntimeAdapter();
-const runtimeLifecycle = new CortextOSRuntimeLifecycleAdapter({ runtime });
-const repositories = new GitRepositoryAdapter();
-const stateLocation = resolveAgentOperationsStateLocation();
-const repositoryWorkspace = new RepositoryWorkspaceService(
-  store,
-  repositories,
-  new GitRepositoryWorkspaceAdapter({ workspaceRoot: `${stateLocation.stateDirectory}/workspaces` }),
-  { stateDirectory: stateLocation.stateDirectory },
-);
-const orchestration = new OrchestrationService(
-  store,
-  runtime,
-  repositories,
-  new CortextOSExecutionAdapter(),
-  new CortextOSExecutionObserver(),
-  { workspaceService: repositoryWorkspace },
-);
-const notification = loadNotifier();
-const application = new OperatorApplicationService(store, orchestration, {
-  runtime,
-  runtimeLifecycle,
-  notifier: notification.notifier,
-});
-application.startRunner();
-const app = new OperatorWebApplication(application, {
-  telegramConfigured: notification.configured,
-});
-
-const server = createOperatorHttpServer(app, { host, port });
-
-server.listen(port, host, () => {
-  console.log(`Agent Operations is available at http://${host}:${port}`);
-  console.log('Local-only mission control. Viewing and refreshing never Dispatch work.');
-});
-
-async function shutdown(): Promise<void> {
-  server.close();
-  await store.close();
+export interface OperatorWebServerDependencies {
+  readonly operator: OperatorApplication;
+  readonly conversation: OrchestratorConversationService;
+  readonly telegramConfigured: boolean;
+  close(): Promise<void>;
 }
 
-process.once('SIGINT', () => void shutdown());
-process.once('SIGTERM', () => void shutdown());
+export function startOperatorWebServer(dependencies: OperatorWebServerDependencies) {
+  const host = '127.0.0.1';
+  const port = parsePort(process.env['AO_WEB_PORT'] ?? '4310');
+  const app = new OperatorWebApplication(
+    dependencies.operator,
+    dependencies.conversation,
+    { telegramConfigured: dependencies.telegramConfigured },
+  );
+  const server = createOperatorHttpServer(app, { host, port });
+  server.listen(port, host, () => {
+    console.log(`Agent Operations is available at http://${host}:${port}`);
+    console.log('Local only mission control. Viewing and refreshing never Dispatch work.');
+  });
+  const shutdown = async (): Promise<void> => {
+    server.close();
+    await dependencies.close();
+  };
+  process.once('SIGINT', () => void shutdown());
+  process.once('SIGTERM', () => void shutdown());
+  return server;
+}
 
 function parsePort(value: string): number {
   const parsed = Number(value);
@@ -70,18 +40,4 @@ function parsePort(value: string): number {
     throw new Error('AO_WEB_PORT must be an integer from 1 to 65535');
   }
   return parsed;
-}
-
-function loadNotifier() {
-  try {
-    loadAgentOperationsTelegramEnvironmentFile();
-    const config = loadTelegramOperatorNotificationConfig();
-    return {
-      notifier: config ? new TelegramOperatorNotifier(config) : new NoopOperatorNotifier(),
-      configured: config !== null,
-    };
-  } catch (error) {
-    console.warn(`Agent Operations Telegram notifications disabled: ${error instanceof Error ? error.message : String(error)}`);
-    return { notifier: new NoopOperatorNotifier(), configured: false };
-  }
 }

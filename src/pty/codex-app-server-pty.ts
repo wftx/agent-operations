@@ -2,6 +2,7 @@ import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } f
 import { isAbsolute, join, resolve } from 'path';
 import { homedir } from 'os';
 import { randomBytes } from 'crypto';
+import { execFile } from 'node:child_process';
 import type {
   AgentConfig,
   CtxEnv,
@@ -267,6 +268,81 @@ const GIT_INSPECTION_DYNAMIC_TOOLS = [{
   }],
 }] as const;
 
+const AO_ORCHESTRATOR_DYNAMIC_TOOLS = [{
+  type: 'namespace',
+  name: 'ao',
+  description: 'Bounded Agent Operations application commands. Agent Operations remains authoritative.',
+  tools: [
+    {
+      type: 'function', name: 'projects_list', description: 'List available Agent Operations Projects.',
+      inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    },
+    {
+      type: 'function', name: 'projects_get', description: 'Get one Project by exact Agent Operations ID.',
+      inputSchema: {
+        type: 'object', properties: { projectId: { type: 'string' } },
+        required: ['projectId'], additionalProperties: false,
+      },
+    },
+    {
+      type: 'function', name: 'jobs_create', description: 'Create one durable Agent Operations Job.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          projectId: { type: 'string' }, repositoryId: { type: 'string' }, title: { type: 'string' },
+          task: { type: 'string' }, acceptanceCriteria: { type: 'string' },
+          executionMode: { type: 'string', enum: ['repository-read-only', 'repository-write-isolated'] },
+          reviewerRequired: { type: 'boolean', const: true },
+          maxWorkerAttempts: { type: 'integer', const: 2 },
+        },
+        required: ['projectId', 'title', 'task', 'acceptanceCriteria'],
+        additionalProperties: false,
+      },
+    },
+    {
+      type: 'function', name: 'jobs_get', description: 'Get one durable Job by exact ID.',
+      inputSchema: {
+        type: 'object', properties: { jobId: { type: 'string' } },
+        required: ['jobId'], additionalProperties: false,
+      },
+    },
+    {
+      type: 'function', name: 'jobs_list', description: 'List durable Jobs, optionally for one Project.',
+      inputSchema: {
+        type: 'object', properties: { projectId: { type: 'string' } }, additionalProperties: false,
+      },
+    },
+    {
+      type: 'function', name: 'jobs_status', description: 'Get concise current AO Job status.',
+      inputSchema: {
+        type: 'object', properties: { jobId: { type: 'string' } },
+        required: ['jobId'], additionalProperties: false,
+      },
+    },
+    {
+      type: 'function', name: 'conversation_respond', description: 'Return the final bounded response for this web turn.',
+      inputSchema: {
+        type: 'object',
+        properties: { response: { type: 'string' }, clarificationRequired: { type: 'boolean' } },
+        required: ['response'], additionalProperties: false,
+      },
+    },
+  ],
+}] as const;
+
+const AO_TOOL_NAMES = {
+  projects_list: 'ao.projects.list',
+  projects_get: 'ao.projects.get',
+  jobs_create: 'ao.jobs.create',
+  jobs_get: 'ao.jobs.get',
+  jobs_list: 'ao.jobs.list',
+  jobs_status: 'ao.jobs.status',
+  conversation_respond: 'ao.conversation.respond',
+} as const;
+
+type AoToolName = keyof typeof AO_TOOL_NAMES;
+type AoToolExecutor = (tool: string, turnId: string, input: Record<string, unknown>) => Promise<unknown>;
+
 function buildDynamicTools(capabilities?: RuntimeExecutionCapabilitiesEnvelope): unknown[] {
   const tools: unknown[] = [];
   if (capabilities?.repositoryRead) {
@@ -281,6 +357,7 @@ function buildDynamicTools(capabilities?: RuntimeExecutionCapabilitiesEnvelope):
   }
   if (capabilities?.testRun) tools.push(...TEST_DYNAMIC_TOOLS);
   if (capabilities?.gitInspect) tools.push(...GIT_INSPECTION_DYNAMIC_TOOLS);
+  if (capabilities?.agentOperationsControl) tools.push(...AO_ORCHESTRATOR_DYNAMIC_TOOLS);
   return tools;
 }
 
@@ -299,6 +376,71 @@ const SOCKET_PATH_WARN_BYTES = 100;
 const BOOTSTRAP_PATTERN = '[codex-app-server] ready';
 
 const CODEX_ACTIVE_WRITER_PATTERN = 'already has an active writer';
+
+function restrictedCodexConfig(
+  mapping: CodexExecutionPolicyMapping,
+  mcpServers: Record<string, { enabled: false }>,
+): Record<string, unknown> {
+  return {
+    features: {
+      apps: false,
+      auth_elicitation: false,
+      browser_use: false,
+      browser_use_external: false,
+      browser_use_full_cdp_access: false,
+      code_mode: false,
+      code_mode_host: false,
+      computer_use: false,
+      deferred_executor: false,
+      enable_mcp_apps: false,
+      executor_capability_discovery: false,
+      goals: false,
+      guardian_approval: false,
+      hooks: false,
+      image_generation: false,
+      in_app_browser: false,
+      in_app_chat: false,
+      in_app_local_automation: false,
+      memories: false,
+      multi_agent: false,
+      network_proxy: false,
+      plugin_sharing: false,
+      plugins: false,
+      recommended_plugins: false,
+      remote_plugin: false,
+      request_permissions_tool: false,
+      shell_snapshot: false,
+      shell_snapshot_v2: false,
+      shell_tool: false,
+      skill_mcp_dependency_install: false,
+      skill_search: false,
+      standalone_web_search: false,
+      tool_call_mcp_elicitation: false,
+      tool_suggest: false,
+      unified_exec: false,
+      view_image: false,
+      web_search_cached: false,
+      web_search_request: false,
+      workspace_dependencies: false,
+    },
+    agents: { enabled: false },
+    allow_login_shell: false,
+    tools: { web_search: false, view_image: false },
+    shell_environment_policy: {
+      inherit: mapping.shellEnvironmentInherit,
+      experimental_use_profile: false,
+      set: {},
+    },
+    apps: {
+      _default: {
+        enabled: false,
+        destructive_enabled: false,
+        open_world_enabled: false,
+      },
+    },
+    mcp_servers: mcpServers,
+  };
+}
 
 export class CodexThreadOwnershipConflictError extends Error {
   readonly code = 'CODEX_THREAD_OWNERSHIP_CONFLICT';
@@ -340,6 +482,7 @@ export class CodexAppServerPTY {
   private _workspaceToolOperations: WorkspaceToolAuditEvent[] = [];
   private _workspaceToolCapabilities: RuntimeExecutionCapabilitiesEnvelope | null = null;
   private _protectedTurnResultText: string | null = null;
+  private _protectedCorrelationId: string | null = null;
   private _correlationStartPending = false;
   private _writeBuffer = '';
   private _turnQueue: unknown[][] = [];
@@ -366,8 +509,9 @@ export class CodexAppServerPTY {
   private _telegramApi: TelegramAPI | null = null;
   private _chatId: string | null = null;
   private _typingLastSent = 0;
+  private readonly _aoToolExecutor: AoToolExecutor;
 
-  constructor(env: CtxEnv, config: AgentConfig, logPath?: string) {
+  constructor(env: CtxEnv, config: AgentConfig, logPath?: string, aoToolExecutor?: AoToolExecutor) {
     this._env = env;
     this._config = config;
     this._cwd = config.working_directory || env.agentDir || process.cwd();
@@ -379,6 +523,8 @@ export class CodexAppServerPTY {
     this._socketListenArg = socket.listenArg;
     this._socketCwd = socket.cwd;
     this._outputBuffer = new OutputBuffer(1000, logPath, BOOTSTRAP_PATTERN);
+    this._aoToolExecutor = aoToolExecutor ?? ((tool, turnId, input) =>
+      executeAoTool(env.frameworkRoot, env.instanceId, tool, turnId, input));
   }
 
   async spawn(mode: 'fresh' | 'continue', prompt: string): Promise<void> {
@@ -440,6 +586,7 @@ export class CodexAppServerPTY {
     this._workspaceToolOperations = [];
     this._workspaceToolCapabilities = null;
     this._protectedTurnResultText = null;
+    this._protectedCorrelationId = null;
     this._correlationStartPending = false;
     this._turnQueue = [];
     this.rejectTurnCompletion(new Error('Codex app-server stopped'));
@@ -508,7 +655,7 @@ export class CodexAppServerPTY {
     if (executionContext && !executionPolicy) {
       throw new Error('POLICY_UNSUPPORTED: execution context requires a policy-isolated thread');
     }
-    if (executionCapabilities && !executionPolicy) {
+    if (executionCapabilities && !executionPolicy && !this.isAoOrchestratorCapability(executionCapabilities)) {
       throw new Error('POLICY_UNSUPPORTED: execution capabilities require a policy-isolated thread');
     }
     const executionWorkingDirectory = executionContext
@@ -561,6 +708,7 @@ export class CodexAppServerPTY {
         ? { ...executionCapabilities }
         : null;
       this._protectedTurnResultText = null;
+      this._protectedCorrelationId = cleanCorrelationId;
       threadId = policyMapping
         ? await this.startPolicyIsolatedThread(
             policyMapping,
@@ -577,6 +725,7 @@ export class CodexAppServerPTY {
       this._workspaceToolOperations = [];
       this._workspaceToolCapabilities = null;
       this._protectedTurnResultText = null;
+      this._protectedCorrelationId = null;
       if (this._alive && this._turnQueue.length > 0) void this.drainQueue();
       throw new Error(`POLICY_THREAD_SETUP_FAILED: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -601,7 +750,7 @@ export class CodexAppServerPTY {
               sandboxPolicy: policyMapping.sandboxPolicy,
               ...(policyMapping.environments ? { environments: policyMapping.environments } : {}),
             }
-          : TURN_PERMISSION_OVERRIDES),
+          : this.turnPermissionOverrides()),
       });
       const turn = response.result?.turn;
       if (!turn || !validCodexId(turn.id)) {
@@ -671,6 +820,31 @@ export class CodexAppServerPTY {
     } catch {
       return false;
     }
+  }
+
+  private isAoOrchestrator(): boolean {
+    return this._config.tool_profile === 'agent-operations-orchestrator';
+  }
+
+  private isAoOrchestratorCapability(capabilities: RuntimeExecutionCapabilitiesEnvelope): boolean {
+    return this.isAoOrchestrator()
+      && capabilities.agentOperationsControl === true
+      && capabilities.repositoryRead === false
+      && capabilities.repositoryPatch !== true
+      && capabilities.testRun !== true
+      && capabilities.gitInspect !== true;
+  }
+
+  private turnPermissionOverrides(): Record<string, unknown> {
+    return this.isAoOrchestrator()
+      ? {
+          cwd: this._cwd,
+          runtimeWorkspaceRoots: [],
+          approvalPolicy: 'never',
+          sandboxPolicy: { type: 'readOnly', networkAccess: false },
+          environments: [],
+        }
+      : TURN_PERMISSION_OVERRIDES;
   }
 
   private async startPolicyIsolatedThread(
@@ -1064,6 +1238,7 @@ export class CodexAppServerPTY {
   }
 
   private async startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> {
+    const persistentOverrides = await this.persistentThreadOverrides();
     if (mode === 'continue') {
       const persisted = this.readThreadState();
       if (persisted) {
@@ -1071,8 +1246,8 @@ export class CodexAppServerPTY {
           const resumed = await this.request<ThreadResponse>('thread/resume', {
             threadId: persisted.threadId,
             cwd: this._cwd,
-            ...THREAD_PERMISSION_OVERRIDES,
-            config: { features: { goals: true } },
+            ...persistentOverrides,
+            ...(this.isAoOrchestrator() ? {} : { config: { features: { goals: true } } }),
             excludeTurns: true,
             persistExtendedHistory: true,
           });
@@ -1090,8 +1265,8 @@ export class CodexAppServerPTY {
         const resumed = await this.request<ThreadResponse>('thread/resume', {
           threadId: latest,
           cwd: this._cwd,
-          ...THREAD_PERMISSION_OVERRIDES,
-          config: { features: { goals: true } },
+          ...persistentOverrides,
+          ...(this.isAoOrchestrator() ? {} : { config: { features: { goals: true } } }),
           excludeTurns: true,
           persistExtendedHistory: true,
         });
@@ -1102,13 +1277,35 @@ export class CodexAppServerPTY {
 
     const started = await this.request<ThreadResponse>('thread/start', {
       cwd: this._cwd,
-      ...THREAD_PERMISSION_OVERRIDES,
-      config: { features: { goals: true } },
+      ...persistentOverrides,
+      ...(this.isAoOrchestrator() ? {} : { config: { features: { goals: true } } }),
       sessionStartSource: 'startup',
       experimentalRawEvents: false,
       persistExtendedHistory: true,
     });
     this.setThreadId(started.result!.thread.id);
+  }
+
+  private async persistentThreadOverrides(): Promise<Record<string, unknown>> {
+    if (!this.isAoOrchestrator()) return THREAD_PERMISSION_OVERRIDES;
+    const mapping = mapExecutionPolicyToCodex(
+      { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
+      this._cwd,
+    );
+    const mcpServers = await this.readRestrictedMcpServerOverrides(this._cwd);
+    return {
+      runtimeWorkspaceRoots: [],
+      approvalPolicy: 'never',
+      sandbox: 'read-only',
+      environments: [],
+      dynamicTools: buildDynamicTools({
+        version: 1,
+        repositoryRead: false,
+        agentOperationsControl: true,
+      }),
+      selectedCapabilityRoots: [],
+      config: restrictedCodexConfig(mapping, mcpServers),
+    };
   }
 
   private async findLatestThreadForCwd(): Promise<string | null> {
@@ -1189,7 +1386,7 @@ export class CodexAppServerPTY {
   private async startTurn(input: unknown[]): Promise<void> {
     if (!this._threadId) throw new Error('No Codex app-server thread is active');
     const completion = this.createTurnCompletion();
-    await this.request('turn/start', { threadId: this._threadId, input, ...TURN_PERMISSION_OVERRIDES });
+    await this.request('turn/start', { threadId: this._threadId, input, ...this.turnPermissionOverrides() });
     await completion;
   }
 
@@ -1480,6 +1677,10 @@ export class CodexAppServerPTY {
 
   private async handleDynamicToolCall(id: number | string, rawParams: unknown): Promise<void> {
     const params = isRecord(rawParams) ? rawParams as unknown as DynamicToolCallParams : null;
+    if (params?.namespace === 'ao') {
+      await this.handleAoOrchestratorToolCall(id, params);
+      return;
+    }
     if (params?.namespace === 'repository'
       && (params.tool === 'list' || params.tool === 'read' || params.tool === 'search')) {
       this.handleRepositoryToolCall(id, rawParams);
@@ -1556,6 +1757,41 @@ export class CodexAppServerPTY {
     }
   }
 
+  private async handleAoOrchestratorToolCall(
+    id: number | string,
+    params: DynamicToolCallParams,
+  ): Promise<void> {
+    const reply = (success: boolean, value: unknown): void => {
+      this._rpc?.respond(id, {
+        success,
+        contentItems: [{ type: 'inputText', text: JSON.stringify(value) }],
+      });
+    };
+    const tool = params.tool in AO_TOOL_NAMES ? params.tool as AoToolName : null;
+    const exactTurn = params.threadId === this._protectedThreadId
+      && params.turnId === this._protectedTurnId;
+    if (!tool || !exactTurn || !this._protectedCorrelationId
+      || !this._workspaceToolCapabilities?.agentOperationsControl
+      || !this.isAoOrchestrator()) {
+      reply(false, { code: 'CAPABILITY_DENIED', message: 'Agent Operations control capability is unavailable for this exact turn' });
+      return;
+    }
+    const input = isRecord(params.arguments) ? params.arguments : {};
+    try {
+      const result = await this._aoToolExecutor(
+        AO_TOOL_NAMES[tool],
+        this._protectedCorrelationId,
+        input,
+      );
+      reply(!isRecord(result) || result.ok !== false, result);
+    } catch (error) {
+      reply(false, {
+        code: 'AO_TOOL_FAILED',
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   private recordWorkspaceToolOperation(event: WorkspaceToolAuditEvent): void {
     this._workspaceToolOperations = [...this._workspaceToolOperations, event].slice(-100);
     if (!this._protectedThreadId || !this._protectedTurnId) return;
@@ -1619,6 +1855,7 @@ export class CodexAppServerPTY {
     this._workspaceToolOperations = [];
     this._workspaceToolCapabilities = null;
     this._protectedTurnResultText = null;
+    this._protectedCorrelationId = null;
     this._executing = false;
     if (this._alive && this._turnQueue.length > 0) {
       this.drainQueue().catch((error) => {
@@ -2022,6 +2259,43 @@ function normalizeTurnStatus(value: unknown): CorrelatedTurnRecord['status'] {
 function epochSecondsToIso(value: unknown): string | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return undefined;
   return new Date(value * 1000).toISOString();
+}
+
+function executeAoTool(
+  frameworkRoot: string,
+  instanceId: string,
+  tool: string,
+  turnId: string,
+  input: Record<string, unknown>,
+): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      process.execPath,
+      [
+        join(frameworkRoot, 'dist', 'ao-tool.js'),
+        tool,
+        '--turn', turnId,
+        '--input-json', JSON.stringify(input),
+        '--instance', instanceId,
+      ],
+      {
+        cwd: frameworkRoot,
+        env: { ...process.env, CTX_INSTANCE_ID: instanceId, CTX_FRAMEWORK_ROOT: frameworkRoot },
+        timeout: 30_000,
+        maxBuffer: 256 * 1024,
+      },
+      (error, stdout) => {
+        const lastLine = stdout.trim().split('\n').filter(Boolean).at(-1);
+        if (lastLine) {
+          try {
+            resolve(JSON.parse(lastLine));
+            return;
+          } catch { /* report the bounded execution failure below */ }
+        }
+        reject(new Error(error ? `Agent Operations tool failed: ${error.message}` : 'Agent Operations tool returned invalid JSON'));
+      },
+    );
+  });
 }
 
 function sleep(ms: number): Promise<void> {

@@ -2,6 +2,7 @@ import type {
   OperatorApplication,
   OperatorJobList,
   OperatorTaskInput,
+  OrchestratorConversationService,
 } from '../../../packages/agent-operations-application/src/index.js';
 import {
   renderDashboard,
@@ -10,13 +11,26 @@ import {
   renderJobDetail,
   renderJobList,
   renderNeedsMe,
+  renderOrchestrator,
 } from './render.js';
 
 export class OperatorWebApplication {
+  private readonly conversation: OrchestratorConversationService;
+  private readonly options: { readonly telegramConfigured?: boolean };
+
   constructor(
     private readonly application: OperatorApplication,
-    private readonly options: { readonly telegramConfigured?: boolean } = {},
-  ) {}
+    conversationOrOptions: OrchestratorConversationService | { readonly telegramConfigured?: boolean } = {},
+    options: { readonly telegramConfigured?: boolean } = {},
+  ) {
+    if ('sendTurn' in conversationOrOptions) {
+      this.conversation = conversationOrOptions;
+      this.options = options;
+    } else {
+      this.conversation = offlineConversation;
+      this.options = conversationOrOptions;
+    }
+  }
 
   async handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -28,6 +42,22 @@ export class OperatorWebApplication {
           await this.application.getRuntimeStatus(),
           { telegramConfigured: this.options.telegramConfigured ?? false },
         ));
+      }
+      if (request.method === 'GET' && url.pathname === '/orchestrator') {
+        return this.orchestratorPage();
+      }
+      if (request.method === 'POST' && url.pathname === '/orchestrator/turn') {
+        const form = await request.formData();
+        const projectId = textValue(form, 'projectId');
+        try {
+          await this.conversation.sendTurn({
+            message: textValue(form, 'message'),
+            ...(projectId ? { projectId } : {}),
+          });
+          return redirect('/orchestrator');
+        } catch (error) {
+          return this.orchestratorPage(message(error), 400);
+        }
       }
       if (request.method === 'POST' && url.pathname === '/runtime/start') {
         const runtimeStart = await this.application.startRuntime();
@@ -126,7 +156,35 @@ export class OperatorWebApplication {
     const active = filter === 'needs-human' ? 'needs-me' : filter === 'all' ? 'jobs' : filter;
     return html(renderJobList(title, description, await this.application.listJobs(filter), active));
   }
+
+  private async orchestratorPage(error?: string, status = 200): Promise<Response> {
+    const state = await this.conversation.getConversationState();
+    const relatedIds = [...new Set(state.turns.flatMap(turn => turn.relatedJobIds))];
+    const relatedJobs = (await Promise.all(relatedIds.map(async jobId => {
+      try { return (await this.application.getJobDetail(jobId)).summary; }
+      catch { return null; }
+    }))).filter(job => job !== null);
+    return html(renderOrchestrator(
+      state,
+      await this.application.listProjects(),
+      relatedJobs,
+      { ...(error ? { error } : {}) },
+    ), status);
+  }
 }
+
+const offlineConversation: OrchestratorConversationService = {
+  async sendTurn() { throw new Error('The AO Orchestrator conversation service is not configured.'); },
+  async getConversationState() {
+    return {
+      agentId: 'ao-orchestrator',
+      sessionId: 'cortextos:default:ao-orchestrator',
+      runtimeState: 'offline' as const,
+      runtimeReason: 'The AO Orchestrator conversation service is not configured.',
+      turns: [],
+    };
+  },
+};
 
 function parseSelection(value: string): { projectId: string; repositoryId: string } | null {
   if (!value) return null;

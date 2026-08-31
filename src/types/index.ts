@@ -222,6 +222,8 @@ export interface AgentConfig {
    * poller will be skipped regardless.
    */
   telegram_polling?: boolean;
+  /** Restrict a persistent Codex agent to the bounded Agent Operations control tools. */
+  tool_profile?: 'agent-operations-orchestrator';
 }
 
 export interface CronEntry {
@@ -656,6 +658,7 @@ export interface RuntimeExecutionCapabilitiesEnvelope {
   readonly repositoryPatch?: boolean;
   readonly testRun?: boolean;
   readonly gitInspect?: boolean;
+  readonly agentOperationsControl?: boolean;
 }
 
 /** Provider-neutral per-turn execution context supplied by Agent Operations. */
