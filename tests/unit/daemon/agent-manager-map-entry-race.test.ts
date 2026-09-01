@@ -203,6 +203,36 @@ function makeActivityChannel(root: string, org: string, name: string): void {
   );
 }
 
+describe('AgentManager Telegram polling policy', () => {
+  let testDir: string;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-polling-policy-'));
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('does not create a Telegram poller when polling is explicitly disabled', async () => {
+    const agentDir = makeAgentDir(testDir, 'acme', 'specialist', true);
+    writeFileSync(
+      join(agentDir, 'config.json'),
+      JSON.stringify({ name: 'specialist', telegram_polling: false }),
+    );
+    const manager = new AgentManager(
+      'test-instance',
+      join(testDir, 'instance'),
+      join(testDir, 'framework'),
+      'acme',
+    );
+
+    await manager.startAgent('specialist', agentDir);
+
+    expect(entryOf(manager, 'specialist').poller).toBeUndefined();
+  });
+});
+
 describe('AgentManager map-entry race — stopAgent must not evict a replacement registered during its await', () => {
   let testDir: string;
   let am: InstanceType<typeof AgentManager>;
