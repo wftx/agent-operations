@@ -1039,6 +1039,35 @@ describe('OrchestrationService', () => {
     expect(lateObserver.requests).toHaveLength(2);
   });
 
+  it('reconciles the same Reviewer after an observation normalization failure without redispatch', async () => {
+    const setup = await harness([{
+      kind: 'completed', resultText: CORRECT_RESULT,
+    }, {
+      kind: 'completed', resultText: REVISION,
+      toolOperations: [{
+        namespace: 'inputs', operation: 'read', success: false, occurredAt: TIME,
+        inputId: 'input:unavailable', requestedLength: 1_000_000,
+      }],
+    }]);
+    const stopped = await setup.service.runJob(JOB_ID);
+    const escalation = stopped.escalations[0];
+    const reviewer = stopped.reviewerAttempts[0];
+    expect(escalation).toMatchObject({ reason: 'runtime_failure', attemptId: reviewer.id });
+    expect(reviewer.status).toBe('running');
+    const lateObserver = new ScriptedObservationAdapter([{ kind: 'completed', resultText: REVISION }]);
+    const reconciler = new OrchestrationService(
+      setup.store, setup.runtimes, setup.repositories, setup.execution, lateObserver,
+      { now: () => new Date(TIME), outcomeDecisionIdFactory: () => 'outcome:late-reviewer' },
+    );
+
+    const result = await reconciler.reconcileTimedOutExecution(escalation.id);
+
+    expect(result).toMatchObject({ status: 'completed', attemptId: reviewer.id, resultText: REVISION });
+    expect(await setup.store.getAttempt(reviewer.id)).toMatchObject({ status: 'completed' });
+    expect(setup.execution.requests).toHaveLength(2);
+    expect(lateObserver.requests).toHaveLength(1);
+  });
+
   it('imports exact late runtime failure into the same Attempt and never redispatches', async () => {
     const setup = await harness([]);
     const timedOut = await setup.service.runJob(JOB_ID);

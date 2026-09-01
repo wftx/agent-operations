@@ -172,6 +172,40 @@ class LateCompletionOrchestration implements OperatorOrchestrationPort {
   }
 }
 
+class LateReviewerRevisionOrchestration implements OperatorOrchestrationPort {
+  reconcileCalls = 0;
+  runCalls = 0;
+
+  constructor(private readonly store: InMemoryAgentOperationsStateStore) {}
+
+  async preview(): Promise<OrchestrationPreview> {
+    throw new Error('Preview is not used by the late Reviewer fixture');
+  }
+
+  async reconcileTimedOutExecution(escalationId: string): Promise<TimedOutExecutionReconciliation> {
+    this.reconcileCalls += 1;
+    const escalation = (await this.store.getEscalation(escalationId))!;
+    const attempt = (await this.store.getAttempt(escalation.attemptId!))!;
+    await new JobLifecycleService(this.store, { now: () => new Date(TIME) })
+      .completeAttempt(attempt.id, 'Late exact Reviewer completion was imported.');
+    return {
+      status: 'completed', jobId: attempt.jobId, attemptId: attempt.id,
+      dispatchId: 'dispatch:late-reviewer',
+      resultText: JSON.stringify({
+        decision: 'REVISION_REQUIRED',
+        summary: 'The result needs another source check.',
+        feedback: 'Verify the current rendered values before concluding that every number matches.',
+      }),
+      inserted: 1, duplicates: 0, ignoredUnrelated: 0, alreadyReconciled: false,
+    };
+  }
+
+  async runJob(): Promise<OrchestrationReadModel> {
+    this.runCalls += 1;
+    throw new Error('Late Reviewer revision must stop for human guidance');
+  }
+}
+
 describe('OperatorApplicationService', () => {
   it('validates task intake and exposes immutable read-only defaults without mutation', async () => {
     const store = await configuredStore();
@@ -749,6 +783,72 @@ describe('OperatorApplicationService', () => {
     expect((await application.reconcileTimedOutExecution('escalation:late')).status).toBe('done');
     expect(orchestration.reconcileCalls).toBe(1);
     expect(orchestration.runCalls).toBe(1);
+  });
+
+  it('persists a late Reviewer revision and stops in Needs Me without creating a Worker', async () => {
+    const store = await configuredStore();
+    const lifecycle = new JobLifecycleService(store, {
+      now: () => new Date(TIME), jobIdFactory: () => 'job:late-reviewer',
+    });
+    const job = await lifecycle.markJobReady((await lifecycle.createJob({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      preferredRuntimeAgentId: RUNTIME_ID,
+      title: 'Late Reviewer reconciliation',
+      description: INPUT.task,
+      acceptanceCriteria: INPUT.acceptanceCriteria,
+      automaticReadOnlyCompletion: true,
+    })).id);
+    const worker = await lifecycle.createAttempt(job.id, {
+      runtimeAgentId: RUNTIME_ID, executionRole: 'worker',
+    });
+    await lifecycle.startAttempt(worker.id);
+    await lifecycle.completeAttempt(worker.id, 'Bounded Worker result.');
+    const reviewer = await lifecycle.createAttempt(job.id, {
+      runtimeAgentId: RUNTIME_ID, executionRole: 'reviewer',
+    });
+    await lifecycle.startAttempt(reviewer.id);
+    await store.createEscalation({
+      id: 'escalation:late-reviewer', jobId: job.id, attemptId: reviewer.id,
+      reason: 'runtime_failure',
+      summary: 'Runtime observation failed: valid Reviewer evidence could not be normalized',
+      createdAt: TIME,
+    });
+    const run = {
+      id: 'operator-run:late-reviewer', jobId: job.id, status: 'pending' as const,
+      revision: 0, createdAt: TIME, updatedAt: TIME,
+    };
+    await store.createOperatorRun(run);
+    await store.saveOperatorRunTransition({
+      ...run, status: 'running', revision: 1, startedAt: TIME,
+    }, 0);
+    await store.saveOperatorRunTransition({
+      ...run, status: 'needs_human', revision: 2, startedAt: TIME, finishedAt: TIME,
+    }, 1);
+    const orchestration = new LateReviewerRevisionOrchestration(store);
+    const application = new OperatorApplicationService(store, orchestration, {
+      now: () => new Date(TIME), escalationIdFactory: () => 'escalation:reviewer-revision',
+    });
+
+    const result = await application.reconcileTimedOutExecution('escalation:late-reviewer');
+    const reviews = await store.listAttemptReviewsForJob(job.id);
+
+    expect(result.status).toBe('needs-human');
+    expect(await store.getAttempt(reviewer.id)).toMatchObject({ status: 'completed' });
+    expect(reviews).toEqual([expect.objectContaining({
+      workerAttemptId: worker.id,
+      reviewerAttemptId: reviewer.id,
+      decision: 'REVISION_REQUIRED',
+    })]);
+    expect(await store.getEscalation('escalation:late-reviewer'))
+      .toMatchObject({ resolvedAt: TIME });
+    expect(await store.getEscalation('escalation:reviewer-revision')).toMatchObject({
+      reason: 'human_judgment_required', reviewId: reviews[0].id,
+    });
+    expect((await store.listAttemptsForJob(job.id)).filter(value => value.executionRole === 'worker'))
+      .toHaveLength(1);
+    expect(orchestration.reconcileCalls).toBe(1);
+    expect(orchestration.runCalls).toBe(0);
   });
 
   it('records notification failure without changing successful Job truth', async () => {

@@ -14,6 +14,7 @@ import {
   createHumanGuidanceId,
   createWorkerBudgetExtensionId,
   createEscalationId,
+  createAttemptReviewId,
   createOperatorRunId,
   isActiveAttemptStatus,
   isExactCompletionObservation,
@@ -22,6 +23,7 @@ import {
   JobLifecycleService,
   MVP_MAX_WORKER_ATTEMPTS,
   readWorkerExecutionBudget,
+  parseReviewerResult,
   type OrchestrationPreview,
   type OrchestrationReadModel,
   type TimedOutExecutionReconciliation,
@@ -408,6 +410,52 @@ export class OperatorApplicationService implements OperatorApplication {
     }
     const timestamp = this.now().toISOString();
     if (result.status === 'completed') {
+      const reconciledAttempt = await this.store.getAttempt(result.attemptId);
+      if (!reconciledAttempt) throw new Error(`Attempt not found: ${result.attemptId}`);
+      if (reconciledAttempt.executionRole === 'reviewer') {
+        const parsed = parseReviewerResult(result.resultText);
+        const attempts = await this.store.listAttemptsForJob(escalation.jobId);
+        const worker = attempts.find(candidate => candidate.executionRole === 'worker'
+          && candidate.roleSequence === reconciledAttempt.roleSequence);
+        if (!worker) {
+          throw new Error(`Reviewer Attempt ${reconciledAttempt.id} has no matching Worker Attempt`);
+        }
+        const reviews = await this.store.listAttemptReviewsForJob(escalation.jobId);
+        let review = reviews.find(candidate => candidate.reviewerAttemptId === reconciledAttempt.id);
+        if (!review) {
+          review = {
+            id: createAttemptReviewId(),
+            jobId: escalation.jobId,
+            workerAttemptId: worker.id,
+            reviewerAttemptId: reconciledAttempt.id,
+            reviewerRuntimeAgentId: reconciledAttempt.runtimeAgentId!,
+            decision: parsed.decision,
+            summary: parsed.summary,
+            ...(parsed.feedback ? { feedback: parsed.feedback } : {}),
+            createdAt: timestamp,
+          };
+          await this.store.createAttemptReview(review);
+        }
+        if (parsed.decision !== 'PASS') {
+          await this.store.resolveEscalationAndCreateEscalation(
+            escalation.id,
+            timestamp,
+            `Resolved by late exact Reviewer completion of existing Dispatch ${result.dispatchId}; no task was resent.`,
+            {
+              id: this.escalationIdFactory(),
+              jobId: escalation.jobId,
+              attemptId: worker.id,
+              reviewId: review.id,
+              reason: 'human_judgment_required',
+              summary: parsed.decision === 'REVISION_REQUIRED'
+                ? `Reviewer requested revision after late exact reconciliation: ${parsed.feedback ?? parsed.summary}`
+                : parsed.feedback ?? parsed.summary,
+              createdAt: timestamp,
+            },
+          );
+          return toRunSession(existingRun);
+        }
+      }
       const pending: DurableOperatorRun = {
         ...existingRun,
         status: 'pending',

@@ -545,8 +545,8 @@ export class OrchestrationService {
       throw new Error(`Escalation ${escalation.id} is not a recoverable execution observation failure`);
     }
     const attempt = await this.store.getAttempt(escalation.attemptId);
-    if (!attempt || attempt.jobId !== escalation.jobId || attempt.executionRole !== 'worker') {
-      throw new Error(`Escalation ${escalation.id} does not identify its timed-out Worker Attempt`);
+    if (!attempt || attempt.jobId !== escalation.jobId) {
+      throw new Error(`Escalation ${escalation.id} does not identify its timed-out Attempt`);
     }
     const plan = await this.store.getExecutionPlanForAttempt(attempt.id);
     const dispatch = plan ? await this.store.getExecutionDispatchForPlan(plan.id) : null;
@@ -624,11 +624,25 @@ export class OrchestrationService {
           ignoredUnrelated: observed.ignoredUnrelated, alreadyReconciled: false,
         };
       }
+      if (attempt.executionRole === 'reviewer') {
+        try {
+          parseReviewerResult(exactCompletion.resultText);
+        } catch (error) {
+          const reason = `Reviewer returned malformed structured output: ${message(error)}`;
+          await this.resolveAttempt(attempt, exactCompletion, 'failed', undefined, reason);
+          return {
+            status: 'failed', jobId: attempt.jobId, attemptId: attempt.id,
+            dispatchId: dispatch.id, reason,
+            inserted: observed.inserted, duplicates: observed.duplicates,
+            ignoredUnrelated: observed.ignoredUnrelated, alreadyReconciled: false,
+          };
+        }
+      }
       await this.resolveAttempt(
         attempt,
         exactCompletion,
         'completed',
-        'Worker execution completed with a bounded exact result after the observation timeout.',
+        `${attempt.executionRole === 'worker' ? 'Worker' : 'Reviewer'} execution completed with a bounded exact result after the observation timeout.`,
       );
       return {
         status: 'completed', jobId: attempt.jobId, attemptId: attempt.id,
