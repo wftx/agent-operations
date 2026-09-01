@@ -275,6 +275,27 @@ describe('SQLite execution observation persistence', () => {
     await reopened.close();
   });
 
+  it('round trips bounded Input operation metadata without a schema rewrite', async () => {
+    const databasePath = path();
+    const store = open(databasePath);
+    await seedAcceptedDispatch(store);
+    const inputObservation: DurableExecutionObservation = {
+      ...observation(),
+      toolOperations: [{
+        namespace: 'inputs', operation: 'read', success: true, occurredAt: TIME,
+        inputId: 'input:attached', offset: 0, requestedLength: 64,
+        returnedLength: 64, endOfInput: false, byteSize: 128, sha256: 'a'.repeat(64),
+      }],
+    };
+    expect(await store.appendExecutionObservation(inputObservation)).toBe(true);
+    await store.close();
+
+    const reopened = open(databasePath);
+    expect((await reopened.listExecutionObservationsForDispatch('dispatch:observation'))[0]
+      .toolOperations).toEqual(inputObservation.toolOperations);
+    await reopened.close();
+  });
+
   it('enforces exact correlation and evidence associations structurally', async () => {
     const store = open(path());
     await seedAcceptedDispatch(store);

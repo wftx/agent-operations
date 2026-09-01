@@ -105,9 +105,18 @@ interface CorrelatedTurnRecord {
 
 interface InputToolAuditEvent {
   readonly namespace: 'inputs';
-  readonly operation: string;
+  readonly operation: 'list' | 'read' | 'copy_to_repository';
   readonly success: boolean;
   readonly occurredAt: string;
+  readonly inputId?: string;
+  readonly inputIds?: readonly string[];
+  readonly itemCount?: number;
+  readonly offset?: number;
+  readonly requestedLength?: number;
+  readonly returnedLength?: number;
+  readonly endOfInput?: boolean;
+  readonly byteSize?: number;
+  readonly sha256?: string;
   readonly path?: string;
   readonly errorCode?: string;
 }
@@ -1843,30 +1852,94 @@ export class CodexAppServerPTY {
       reply(false, { code: 'CAPABILITY_DENIED', message: 'Input capability is unavailable for this exact turn' });
       return;
     }
+    const tool = params.tool as 'list' | 'read' | 'copy_to_repository';
     try {
+      const args = isRecord(params.arguments) ? params.arguments : {};
       const result = await this._inputToolExecutor(
-        params.tool,
-        isRecord(params.arguments) ? params.arguments : {},
+        tool,
+        args,
         this._protectedInputIds,
         this._protectedRepositoryWriteRoot,
       );
-      const event: InputToolAuditEvent = {
-        namespace: 'inputs', operation: params.tool, success: true,
-        occurredAt: new Date().toISOString(),
-        ...(isRecord(params.arguments) && typeof params.arguments.path === 'string'
-          ? { path: params.arguments.path }
-          : {}),
-      };
-      this._workspaceToolOperations = [...this._workspaceToolOperations, event].slice(-100);
+      const event = this.createInputToolAuditEvent(
+        tool,
+        args,
+        result,
+        true,
+      );
+      this.recordInputToolOperation(event);
       reply(true, result);
     } catch (error) {
-      const event: InputToolAuditEvent = {
-        namespace: 'inputs', operation: params.tool, success: false,
-        occurredAt: new Date().toISOString(), errorCode: 'INPUT_TOOL_FAILED',
-      };
-      this._workspaceToolOperations = [...this._workspaceToolOperations, event].slice(-100);
+      const event = this.createInputToolAuditEvent(
+        tool,
+        isRecord(params.arguments) ? params.arguments : {},
+        undefined,
+        false,
+        'INPUT_TOOL_FAILED',
+      );
+      this.recordInputToolOperation(event);
       reply(false, { code: 'INPUT_TOOL_FAILED', message: error instanceof Error ? error.message : String(error) });
     }
+  }
+
+  private createInputToolAuditEvent(
+    operation: 'list' | 'read' | 'copy_to_repository',
+    args: Record<string, unknown>,
+    result: unknown,
+    success: boolean,
+    errorCode?: string,
+  ): InputToolAuditEvent {
+    const output = isRecord(result) ? result : undefined;
+    const metadata = output && isRecord(output.metadata) ? output.metadata : undefined;
+    const listed = operation === 'list' && Array.isArray(result)
+      ? result.filter(isRecord)
+      : [];
+    const listedInputIds = listed
+      .map(item => typeof item.id === 'string' ? item.id : undefined)
+      .filter((value): value is string => Boolean(value && this._protectedInputIds.includes(value)));
+    const inputId = typeof args.inputId === 'string' && args.inputId.length <= 250
+      ? args.inputId
+      : undefined;
+    const requestedLength = operation === 'read'
+      ? (safeNonnegativeInteger(args.length) ?? 65_536)
+      : undefined;
+    return {
+      namespace: 'inputs', operation, success,
+      occurredAt: new Date().toISOString(),
+      ...(inputId ? { inputId } : {}),
+      ...(operation === 'list' && success
+        ? { inputIds: listedInputIds, itemCount: listedInputIds.length }
+        : {}),
+      ...(operation === 'read' && inputId
+        ? {
+            offset: safeNonnegativeInteger(output?.offset)
+              ?? safeNonnegativeInteger(args.offset)
+              ?? 0,
+            requestedLength,
+            ...(safeNonnegativeInteger(output?.length) !== undefined
+              ? { returnedLength: safeNonnegativeInteger(output?.length) }
+              : {}),
+            ...(typeof output?.endOfInput === 'boolean'
+              ? { endOfInput: output.endOfInput }
+              : {}),
+            ...(safeNonnegativeInteger(metadata?.byteSize) !== undefined
+              ? { byteSize: safeNonnegativeInteger(metadata?.byteSize) }
+              : {}),
+            ...(isSha256(metadata?.sha256) ? { sha256: metadata.sha256 } : {}),
+          }
+        : {}),
+      ...(operation === 'copy_to_repository'
+        && typeof args.path === 'string'
+        ? { path: args.path }
+        : {}),
+      ...(operation === 'copy_to_repository' && safeNonnegativeInteger(output?.byteSize) !== undefined
+        ? { byteSize: safeNonnegativeInteger(output?.byteSize) }
+        : {}),
+      ...(operation === 'copy_to_repository' && isSha256(output?.sha256)
+        ? { sha256: output.sha256 }
+        : {}),
+      ...(errorCode ? { errorCode } : {}),
+    };
   }
 
   private async handleAoOrchestratorToolCall(
@@ -1905,6 +1978,15 @@ export class CodexAppServerPTY {
   }
 
   private recordWorkspaceToolOperation(event: WorkspaceToolAuditEvent): void {
+    this._workspaceToolOperations = [...this._workspaceToolOperations, event].slice(-100);
+    if (!this._protectedThreadId || !this._protectedTurnId) return;
+    this.writeCorrelatedTurnRecord(
+      this._protectedThreadId,
+      { id: this._protectedTurnId, status: 'inProgress' },
+    );
+  }
+
+  private recordInputToolOperation(event: InputToolAuditEvent): void {
     this._workspaceToolOperations = [...this._workspaceToolOperations, event].slice(-100);
     if (!this._protectedThreadId || !this._protectedTurnId) return;
     this.writeCorrelatedTurnRecord(
@@ -2379,6 +2461,16 @@ function normalizeTurnStatus(value: unknown): CorrelatedTurnRecord['status'] {
 function epochSecondsToIso(value: unknown): string | undefined {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return undefined;
   return new Date(value * 1000).toISOString();
+}
+
+function safeNonnegativeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value);
 }
 
 function executeAoTool(

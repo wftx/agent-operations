@@ -930,7 +930,7 @@ describe('OrchestrationService', () => {
     expect(lateObserver.requests[0].externalReference).toBe(dispatch!.externalReference);
   });
 
-  it('reconciles the known oversized observation failure without redispatch', async () => {
+  it('reconciles a generic observation normalization failure without redispatch', async () => {
     const setup = await harness([]);
     const timedOut = await setup.service.runJob(JOB_ID);
     const timeout = timedOut.escalations[0];
@@ -940,11 +940,11 @@ describe('OrchestrationService', () => {
       TIME,
       'Reclassified after deterministic diagnosis.',
       {
-        id: 'escalation:oversized-observation',
+        id: 'escalation:invalid-tool-observation',
         jobId: JOB_ID,
         attemptId: worker.id,
         reason: 'runtime_failure',
-        summary: 'Runtime observation failed: Observation text exceeds 4000 characters',
+        summary: 'Runtime observation failed: Runtime observer returned invalid tool operation evidence',
         createdAt: TIME,
       },
     );
@@ -961,7 +961,7 @@ describe('OrchestrationService', () => {
       { now: () => new Date(TIME), outcomeDecisionIdFactory: () => 'outcome:oversized-observation' },
     );
 
-    const result = await reconciler.reconcileTimedOutExecution('escalation:oversized-observation');
+    const result = await reconciler.reconcileTimedOutExecution('escalation:invalid-tool-observation');
 
     expect(result).toMatchObject({ status: 'completed', attemptId: worker.id });
     expect(setup.execution.requests).toHaveLength(1);

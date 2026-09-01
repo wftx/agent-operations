@@ -1369,7 +1369,7 @@ function boundedOptionalText(value: unknown, field: string, limit: number): stri
 function isRecoverableObservationEscalation(escalation: DurableEscalation): boolean {
   return escalation.reason === 'observation_timeout'
     || (escalation.reason === 'runtime_failure'
-      && escalation.summary.startsWith('Runtime observation failed: Observation text exceeds'));
+      && escalation.summary.startsWith('Runtime observation failed:'));
 }
 
 function samePolicy(

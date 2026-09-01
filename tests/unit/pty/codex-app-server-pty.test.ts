@@ -1308,7 +1308,17 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
         ? { result: { thread: { id: 'thread-input' } } }
         : { result: { turn: { id: 'turn-input', status: 'inProgress' } } };
     });
-    const executeInput = vi.fn().mockResolvedValue([{ id: 'input:allowed' }]);
+    const executeInput = vi.fn().mockResolvedValue({
+      metadata: {
+        id: 'input:allowed', byteSize: 128, sha256: 'a'.repeat(64),
+        storageReference: '/must/not/appear',
+      },
+      offset: 4,
+      length: 12,
+      endOfInput: true,
+      encoding: 'base64',
+      data: 'c2VjcmV0',
+    });
     const pty = new CodexAppServerPTY(mockEnv, {}, undefined, undefined, executeInput);
     Object.assign(pty as unknown as Record<string, unknown>, {
       _alive: true, _threadId: 'thread-1',
@@ -1327,9 +1337,14 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
     await (pty as unknown as { handleDynamicToolCall(id: number, params: unknown): Promise<void> })
       .handleDynamicToolCall(81, {
         threadId: 'thread-input', turnId: 'turn-input', namespace: 'inputs', tool: 'read',
-        arguments: { inputId: 'input:allowed' },
+        arguments: { inputId: 'input:allowed', offset: 4, length: 12 },
       });
-    expect(executeInput).toHaveBeenCalledWith('read', { inputId: 'input:allowed' }, ['input:allowed'], undefined);
+    expect(executeInput).toHaveBeenCalledWith(
+      'read',
+      { inputId: 'input:allowed', offset: 4, length: 12 },
+      ['input:allowed'],
+      undefined,
+    );
     await (pty as unknown as { handleDynamicToolCall(id: number, params: unknown): Promise<void> })
       .handleDynamicToolCall(82, {
         threadId: 'thread-other', turnId: 'turn-input', namespace: 'inputs', tool: 'read',
@@ -1341,6 +1356,62 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
       method: 'turn/completed', params: { threadId: 'thread-input', turn: { id: 'turn-input', status: 'completed' } },
     });
     await flush();
+    const record = String(atomicWriteSyncMock.mock.calls.at(-1)?.[1]);
+    expect(record).toContain('"operation":"read"');
+    expect(record).toContain('"inputId":"input:allowed"');
+    expect(record).toContain('"offset":4');
+    expect(record).toContain('"requestedLength":12');
+    expect(record).toContain('"returnedLength":12');
+    expect(record).toContain(`"sha256":"${'a'.repeat(64)}"`);
+    expect(record).not.toContain('c2VjcmV0');
+    expect(record).not.toContain('/must/not/appear');
+  });
+
+  it('audits bounded Input list and isolated copy metadata without raw bytes', async () => {
+    requestMock.mockImplementation(async (method: string) => {
+      if (method === 'config/read') return { result: { config: { mcp_servers: {} } } };
+      return method === 'thread/start'
+        ? { result: { thread: { id: 'thread-copy' } } }
+        : { result: { turn: { id: 'turn-copy', status: 'inProgress' } } };
+    });
+    const executeInput = vi.fn().mockImplementation(async (tool: string) => tool === 'list'
+      ? [{ id: 'input:allowed', storageReference: '/must/not/appear' }]
+      : { inputId: 'input:allowed', path: 'public/reference.png', byteSize: 128, sha256: 'b'.repeat(64) });
+    const pty = new CodexAppServerPTY(mockEnv, {}, undefined, undefined, executeInput);
+    Object.assign(pty as unknown as Record<string, unknown>, {
+      _alive: true, _threadId: 'thread-1',
+      _rpc: { request: requestMock, respondError: respondErrorMock, respond: respondMock },
+    });
+    const root = process.cwd();
+    await pty.startCorrelationSafeTurn(
+      'copy attached input', 'dispatch-plan:copy',
+      { version: 1, filesystem: 'workspace-write', network: 'deny', environment: 'empty' },
+      {
+        workingDirectory: root, repositoryReadRoot: root,
+        repositoryWriteRoot: root, inputIds: ['input:allowed'],
+      },
+      { version: 1, repositoryRead: true, repositoryPatch: true, inputRead: true },
+    );
+    const call = (id: number, tool: string, args: Record<string, unknown>) =>
+      (pty as unknown as { handleDynamicToolCall(id: number, params: unknown): Promise<void> })
+        .handleDynamicToolCall(id, {
+          threadId: 'thread-copy', turnId: 'turn-copy', namespace: 'inputs', tool, arguments: args,
+        });
+    await call(91, 'list', {});
+    await call(92, 'copy_to_repository', { inputId: 'input:allowed', path: 'public/reference.png' });
+    rpc(pty).handleRpcMessage({
+      method: 'turn/completed', params: { threadId: 'thread-copy', turn: { id: 'turn-copy', status: 'completed' } },
+    });
+    await flush();
+
+    const record = String(atomicWriteSyncMock.mock.calls.at(-1)?.[1]);
+    expect(record).toContain('"operation":"list"');
+    expect(record).toContain('"inputIds":["input:allowed"]');
+    expect(record).toContain('"itemCount":1');
+    expect(record).toContain('"operation":"copy_to_repository"');
+    expect(record).toContain('"path":"public/reference.png"');
+    expect(record).toContain('"byteSize":128');
+    expect(record).not.toContain('/must/not/appear');
   });
 
   it('serves repository dynamic calls only for the exact protected turn and audits metadata without contents', () => {

@@ -81,6 +81,7 @@ export class ExecutionObservationService {
         ignoredUnrelated++;
         continue;
       }
+      validateObservationInputBoundary(normalized, chain.plan);
       const observation: DurableExecutionObservation = {
         ...normalized,
         id: createExecutionObservationId(
@@ -151,7 +152,7 @@ export class ExecutionObservationService {
   }
 }
 
-function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservation {
+export function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservation {
   if (!isRecord(value)) throw new Error('Runtime observer returned a malformed observation');
   const source = boundedRequired(value.source, 'Observation source', MAX_SOURCE_LENGTH);
   const sourceEventId = boundedRequired(value.sourceEventId, 'Observation source event ID', MAX_REFERENCE_LENGTH);
@@ -189,7 +190,9 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
         && (typeof executionContext.repositoryWriteRoot !== 'string'
           || !executionContext.repositoryWriteRoot.startsWith('/')
           || resolve(executionContext.repositoryWriteRoot) !== executionContext.repositoryWriteRoot
-          || executionContext.repositoryWriteRoot.length > MAX_WORKING_DIRECTORY_LENGTH)))) {
+          || executionContext.repositoryWriteRoot.length > MAX_WORKING_DIRECTORY_LENGTH))
+      || (executionContext.inputIds !== undefined
+        && !isValidInputIdList(executionContext.inputIds)))) {
     throw new Error('Runtime observer returned an invalid execution working directory');
   }
   const effectivePolicy = value.effectivePolicy;
@@ -206,7 +209,7 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
     && (!isRecord(effectiveCapabilities)
       || effectiveCapabilities.version !== 1
       || typeof effectiveCapabilities.repositoryRead !== 'boolean'
-      || ['repositoryPatch', 'testRun', 'gitInspect'].some(field =>
+      || ['repositoryPatch', 'testRun', 'gitInspect', 'inputRead'].some(field =>
         effectiveCapabilities[field] !== undefined
         && typeof effectiveCapabilities[field] !== 'boolean'))) {
     throw new Error('Runtime observer returned invalid effective execution capabilities');
@@ -227,6 +230,14 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
     && executionContext?.repositoryWriteRoot !== undefined) {
     throw new Error('Repository write root cannot be present when repository patch is disabled');
   }
+  if (effectiveCapabilities?.inputRead === true
+    && (!executionContext || !Array.isArray(executionContext.inputIds)
+      || executionContext.inputIds.length === 0)) {
+    throw new Error('Input-read evidence requires an exact non-empty Input allowlist');
+  }
+  if (effectiveCapabilities?.inputRead !== true && executionContext?.inputIds !== undefined) {
+    throw new Error('Input allowlist cannot be present when Input-read capability is disabled');
+  }
   if (correlation !== 'exact' && (executionContext !== undefined
     || effectivePolicy !== undefined || effectiveCapabilities !== undefined)) {
     throw new Error('Only exact runtime observations may carry execution context evidence');
@@ -235,7 +246,12 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
   if (resultText && (correlation !== 'exact' || kind !== 'turn-completed')) {
     throw new Error('Execution result text requires exact turn-completion evidence');
   }
-  const toolOperations = normalizeToolOperations(value.toolOperations);
+  const toolOperations = normalizeToolOperations(
+    value.toolOperations,
+    executionContext,
+    effectivePolicy,
+    effectiveCapabilities,
+  );
   if (toolOperations && correlation !== 'exact') {
     throw new Error('Only exact runtime observations may carry tool operation evidence');
   }
@@ -269,6 +285,9 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
             ...(executionContext.repositoryWriteRoot
               ? { repositoryWriteRoot: String(executionContext.repositoryWriteRoot) }
               : {}),
+            ...(Array.isArray(executionContext.inputIds)
+              ? { inputIds: executionContext.inputIds.map(String) }
+              : {}),
           },
         }
       : {}),
@@ -296,6 +315,9 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
             ...(effectiveCapabilities.gitInspect !== undefined
               ? { gitInspect: Boolean(effectiveCapabilities.gitInspect) }
               : {}),
+            ...(effectiveCapabilities.inputRead !== undefined
+              ? { inputRead: Boolean(effectiveCapabilities.inputRead) }
+              : {}),
           },
         }
       : {}),
@@ -303,19 +325,32 @@ function normalizeRuntimeObservation(value: unknown): RuntimeExecutionObservatio
   };
 }
 
-function normalizeToolOperations(value: unknown): RuntimeExecutionObservation['toolOperations'] | undefined {
+function normalizeToolOperations(
+  value: unknown,
+  executionContext: Record<string, unknown> | undefined,
+  effectivePolicy: Record<string, unknown> | undefined,
+  effectiveCapabilities: Record<string, unknown> | undefined,
+): RuntimeExecutionObservation['toolOperations'] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value) || value.length > 100) {
     throw new Error('Runtime observer returned invalid tool operation evidence');
   }
   return value.map(item => {
     if (!isRecord(item)
-      || !['repository', 'test', 'git'].includes(String(item.namespace))
+      || !['repository', 'test', 'git', 'inputs'].includes(String(item.namespace))
       || typeof item.operation !== 'string' || !item.operation.trim()
       || typeof item.success !== 'boolean'
       || typeof item.occurredAt !== 'string'
       || Number.isNaN(new Date(item.occurredAt).getTime())) {
       throw new Error('Runtime observer returned invalid tool operation evidence');
+    }
+    if (item.namespace === 'inputs') {
+      return normalizeInputToolOperation(
+        item,
+        executionContext,
+        effectivePolicy,
+        effectiveCapabilities,
+      );
     }
     const stdout = boundedToolOutput(item.stdout);
     const stderr = boundedToolOutput(item.stderr);
@@ -345,6 +380,178 @@ function normalizeToolOperations(value: unknown): RuntimeExecutionObservation['t
       ...(ephemeralArtifacts ? { ephemeralArtifacts } : {}),
     };
   });
+}
+
+function normalizeInputToolOperation(
+  item: Record<string, unknown>,
+  executionContext: Record<string, unknown> | undefined,
+  effectivePolicy: Record<string, unknown> | undefined,
+  effectiveCapabilities: Record<string, unknown> | undefined,
+): NonNullable<RuntimeExecutionObservation['toolOperations']>[number] {
+  if (effectiveCapabilities?.inputRead !== true
+    || !executionContext || !isValidInputIdList(executionContext.inputIds)) {
+    throw new Error('Input tool evidence requires an exact Input-read allowlist');
+  }
+  for (const forbidden of ['data', 'storageReference', 'raw', 'bytes', 'stdout', 'stderr']) {
+    if (item[forbidden] !== undefined) {
+      throw new Error('Input tool evidence cannot expose Input contents or storage paths');
+    }
+  }
+  const operation = boundedRequired(item.operation, 'Tool operation', 100);
+  if (!['list', 'read', 'copy_to_repository'].includes(operation)) {
+    throw new Error(`Runtime observer returned an unsupported Input operation: ${operation}`);
+  }
+  const attachedInputIds = executionContext.inputIds as string[];
+  const occurredAt = String(item.occurredAt);
+  const success = Boolean(item.success);
+  const errorCode = boundedOptional(item.errorCode, 100);
+
+  if (operation === 'list') {
+    const inputIds = item.inputIds === undefined
+      ? undefined
+      : normalizeInputIds(item.inputIds);
+    if (inputIds && !sameStringSet(inputIds, attachedInputIds)) {
+      throw new Error('Input list evidence does not match the exact attached Input allowlist');
+    }
+    const itemCount = item.itemCount === undefined
+      ? undefined
+      : boundedInteger(item.itemCount, 'Input list item count', 0, 20);
+    if (itemCount !== undefined && itemCount !== (inputIds?.length ?? attachedInputIds.length)) {
+      throw new Error('Input list evidence item count does not match its Input identities');
+    }
+    return {
+      namespace: 'inputs', operation, success, occurredAt,
+      ...(inputIds ? { inputIds } : {}),
+      ...(itemCount !== undefined ? { itemCount } : {}),
+      ...(errorCode ? { errorCode } : {}),
+    };
+  }
+
+  const inputId = item.inputId === undefined && attachedInputIds.length === 1
+    ? attachedInputIds[0]
+    : normalizeInputId(item.inputId);
+  if (!inputId || !attachedInputIds.includes(inputId)) {
+    throw new Error('Input tool evidence identifies an unattached Input');
+  }
+
+  if (operation === 'read') {
+    const offset = optionalBoundedInteger(item.offset, 'Input read offset', 0, Number.MAX_SAFE_INTEGER);
+    const requestedLength = optionalBoundedInteger(item.requestedLength, 'Input read requested length', 1, 65_536);
+    const returnedLength = optionalBoundedInteger(item.returnedLength, 'Input read returned length', 0, 65_536);
+    if (returnedLength !== undefined && requestedLength !== undefined && returnedLength > requestedLength) {
+      throw new Error('Input read evidence returned more bytes than requested');
+    }
+    const endOfInput = item.endOfInput === undefined
+      ? undefined
+      : requiredBoolean(item.endOfInput, 'Input read end marker');
+    const byteSize = optionalBoundedInteger(item.byteSize, 'Input byte size', 0, Number.MAX_SAFE_INTEGER);
+    const sha256 = optionalSha256(item.sha256);
+    return {
+      namespace: 'inputs', operation, success, occurredAt, inputId,
+      ...(offset !== undefined ? { offset } : {}),
+      ...(requestedLength !== undefined ? { requestedLength } : {}),
+      ...(returnedLength !== undefined ? { returnedLength } : {}),
+      ...(endOfInput !== undefined ? { endOfInput } : {}),
+      ...(byteSize !== undefined ? { byteSize } : {}),
+      ...(sha256 ? { sha256 } : {}),
+      ...(errorCode ? { errorCode } : {}),
+    };
+  }
+
+  if (effectiveCapabilities?.repositoryPatch !== true
+    || effectivePolicy?.filesystem !== 'workspace-write'
+    || executionContext.repositoryWriteRoot !== executionContext.workingDirectory) {
+    throw new Error('Input copy evidence requires the exact isolated repository write boundary');
+  }
+  const path = boundedRequired(item.path, 'Input copy destination path', 1_024);
+  if (!isSafeRepositoryRelativePath(path)) {
+    throw new Error('Input copy evidence contains an invalid repository-relative destination');
+  }
+  const byteSize = optionalBoundedInteger(item.byteSize, 'Input byte size', 0, Number.MAX_SAFE_INTEGER);
+  const sha256 = optionalSha256(item.sha256);
+  return {
+    namespace: 'inputs', operation, success, occurredAt, inputId, path,
+    ...(byteSize !== undefined ? { byteSize } : {}),
+    ...(sha256 ? { sha256 } : {}),
+    ...(errorCode ? { errorCode } : {}),
+  };
+}
+
+function validateObservationInputBoundary(
+  observation: RuntimeExecutionObservation,
+  plan: DurableExecutionPlan,
+): void {
+  if (observation.correlation !== 'exact') return;
+  const planned = [...(plan.inputIds ?? [])];
+  const observed = [...(observation.executionContext?.inputIds ?? [])];
+  if ((planned.length > 0 || observed.length > 0) && !sameStringSet(planned, observed)) {
+    throw new Error('Runtime observation Input allowlist does not match the immutable Execution Plan');
+  }
+}
+
+function isValidInputIdList(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 20) return false;
+  const normalized = value.map(normalizeInputId);
+  return normalized.every((item): item is string => Boolean(item))
+    && new Set(normalized).size === normalized.length;
+}
+
+function normalizeInputIds(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 20) {
+    throw new Error('Input list evidence contains an invalid Input identity collection');
+  }
+  const normalized = value.map(normalizeInputId);
+  if (normalized.some(item => !item) || new Set(normalized).size !== normalized.length) {
+    throw new Error('Input list evidence contains invalid or duplicate Input identities');
+  }
+  return normalized as string[];
+}
+
+function normalizeInputId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const clean = value.trim();
+  return /^input:[A-Za-z0-9-]{1,200}$/.test(clean) ? clean : undefined;
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length
+    && [...left].sort().every((value, index) => value === [...right].sort()[index]);
+}
+
+function optionalBoundedInteger(
+  value: unknown,
+  field: string,
+  minimum: number,
+  maximum: number,
+): number | undefined {
+  return value === undefined ? undefined : boundedInteger(value, field, minimum, maximum);
+}
+
+function boundedInteger(value: unknown, field: string, minimum: number, maximum: number): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${field} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return value;
+}
+
+function requiredBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== 'boolean') throw new Error(`${field} must be boolean`);
+  return value;
+}
+
+function optionalSha256(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/i.test(value)) {
+    throw new Error('Input evidence SHA-256 is invalid');
+  }
+  return value.toLowerCase();
+}
+
+function isSafeRepositoryRelativePath(value: string): boolean {
+  return !value.startsWith('/')
+    && !value.includes('\\')
+    && !value.includes('\0')
+    && resolve('/', value) === `/${value}`;
 }
 
 function normalizeEphemeralArtifacts(value: unknown) {

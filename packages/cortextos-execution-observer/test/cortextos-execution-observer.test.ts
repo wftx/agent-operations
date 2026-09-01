@@ -176,6 +176,38 @@ describe('CortextOSExecutionObserver', () => {
     });
   });
 
+  it('preserves bounded Input operations and exact Input allowlist evidence', async () => {
+    const ctxRoot = root();
+    const directory = join(ctxRoot, 'state', 'coder', 'codex-turns', 'thread-1');
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, 'turn-1.json'), JSON.stringify({
+      version: 1, provider: 'codex', threadId: 'thread-1', turnId: 'turn-1',
+      status: 'completed', observedAt: TIME, completedAt: TIME,
+      workingDirectory: '/tmp/agent-operations', inputIds: ['input:attached'],
+      effectivePolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
+      effectiveCapabilities: { version: 1, repositoryRead: false, inputRead: true },
+      toolOperations: [{
+        namespace: 'inputs', operation: 'read', success: true, occurredAt: TIME,
+        inputId: 'input:attached', offset: 0, requestedLength: 64,
+        returnedLength: 64, endOfInput: false, byteSize: 128, sha256: 'a'.repeat(64),
+      }],
+      resultText: 'bounded final result',
+    }));
+    const observer = new CortextOSExecutionObserver({ runtimeAdapter: runtime(), ctxRoot });
+
+    const observation = (await observer.observe({ ...REQUEST, externalReference: EXACT_REFERENCE })).at(-1);
+
+    expect(observation).toMatchObject({
+      correlation: 'exact',
+      executionContext: { inputIds: ['input:attached'] },
+      effectiveCapabilities: { inputRead: true },
+      toolOperations: [{
+        namespace: 'inputs', operation: 'read', inputId: 'input:attached', returnedLength: 64,
+      }],
+    });
+    expect(JSON.stringify(observation)).not.toContain('storageReference');
+  });
+
   it.each([
     ['inProgress', 'runtime-running'],
     ['failed', 'runtime-crashed'],

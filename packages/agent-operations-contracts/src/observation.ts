@@ -65,6 +65,17 @@ export interface RuntimeToolOperation {
   readonly operation: string;
   readonly success: boolean;
   readonly occurredAt: string;
+  /** AO Input identity used by a bounded read or worktree copy. */
+  readonly inputId?: string;
+  /** Attached Input identities returned by a bounded list operation. */
+  readonly inputIds?: readonly string[];
+  readonly itemCount?: number;
+  readonly offset?: number;
+  readonly requestedLength?: number;
+  readonly returnedLength?: number;
+  readonly endOfInput?: boolean;
+  readonly byteSize?: number;
+  readonly sha256?: string;
   readonly path?: string;
   readonly commandId?: string;
   readonly command?: string;

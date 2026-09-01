@@ -14,12 +14,16 @@ import {
   ExecutionPlanningService,
   JobLifecycleService,
 } from '../src/index.js';
+import { normalizeRuntimeObservation } from '../src/execution-observation-service.js';
 
 const TIME = '2026-08-21T20:00:00.000Z';
 const PROJECT_ID = 'agent-operations';
 const RUNTIME_ID = 'engineering/coder';
 
-async function harness(fixtures: readonly RuntimeExecutionObservation[] = []) {
+async function harness(
+  fixtures: readonly RuntimeExecutionObservation[] = [],
+  options: { readonly withInput?: boolean } = {},
+) {
   const store = new InMemoryAgentOperationsStateStore();
   await store.applyProjectConfiguration({
     project: { id: PROJECT_ID, name: 'Agent Operations', createdAt: TIME, updatedAt: TIME },
@@ -39,6 +43,15 @@ async function harness(fixtures: readonly RuntimeExecutionObservation[] = []) {
   });
   await lifecycle.markJobReady(job.id);
   const attempt = await lifecycle.createAttempt(job.id);
+  if (options.withInput) {
+    await store.createInput({
+      id: 'input:attached', displayName: 'reference.png', mimeType: 'image/png', byteSize: 128,
+      sha256: 'a'.repeat(64), sourceType: 'uploaded-file', projectId: PROJECT_ID,
+      storageReference: '/private/ao/input', ingestionState: 'complete', validationState: 'valid',
+      createdAt: TIME,
+    });
+    await store.attachInputsToJob(job.id, ['input:attached']);
+  }
   const plan = await new ExecutionPlanningService(store, {
     now: () => new Date(TIME),
     planIdFactory: () => 'plan:observation',
@@ -47,6 +60,9 @@ async function harness(fixtures: readonly RuntimeExecutionObservation[] = []) {
     attemptId: attempt.id,
     instruction: 'Produce bounded completion evidence.',
     requestedPolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
+    ...(options.withInput
+      ? { requestedCapabilities: { version: 1 as const, repositoryRead: false, inputRead: true } }
+      : {}),
   });
   const prepared = {
     id: 'dispatch:observation',
@@ -116,6 +132,97 @@ RuntimeExecutionObservation {
 }
 
 describe('ExecutionObservationService', () => {
+  it('accepts bounded Input list and read evidence for the exact attached allowlist', async () => {
+    const setup = await harness([{
+      ...exact(),
+      executionContext: { workingDirectory: '/tmp/ao-input', inputIds: ['input:attached'] },
+      effectivePolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
+      effectiveCapabilities: { version: 1, repositoryRead: false, inputRead: true },
+      toolOperations: [{
+        namespace: 'inputs', operation: 'list', success: true, occurredAt: TIME,
+        inputIds: ['input:attached'], itemCount: 1,
+      }, {
+        namespace: 'inputs', operation: 'read', success: true, occurredAt: TIME,
+        inputId: 'input:attached', offset: 0, requestedLength: 65_536,
+        returnedLength: 128, endOfInput: true, byteSize: 128, sha256: 'a'.repeat(64),
+      }],
+    }], { withInput: true });
+
+    const result = await setup.observations.observeAttemptExecution(setup.attempt.id);
+
+    expect(result.detail.observations[0]).toMatchObject({
+      executionContext: { inputIds: ['input:attached'] },
+      effectiveCapabilities: { inputRead: true },
+      toolOperations: [
+        { namespace: 'inputs', operation: 'list', inputIds: ['input:attached'], itemCount: 1 },
+        { namespace: 'inputs', operation: 'read', inputId: 'input:attached', returnedLength: 128 },
+      ],
+    });
+  });
+
+  it('rejects Input evidence for an identity outside the immutable Plan allowlist', async () => {
+    const setup = await harness([{
+      ...exact(),
+      executionContext: { workingDirectory: '/tmp/ao-input', inputIds: ['input:other'] },
+      effectivePolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
+      effectiveCapabilities: { version: 1, repositoryRead: false, inputRead: true },
+      toolOperations: [{
+        namespace: 'inputs', operation: 'read', success: true, occurredAt: TIME,
+        inputId: 'input:other',
+      }],
+    }], { withInput: true });
+
+    await expect(setup.observations.observeAttemptExecution(setup.attempt.id))
+      .rejects.toThrow('immutable Execution Plan');
+  });
+
+  it('normalizes bounded isolated Input copy evidence without Input contents or storage paths', () => {
+    const normalized = normalizeRuntimeObservation({
+      ...exact(),
+      executionContext: {
+        workingDirectory: '/tmp/ao-worktree', repositoryReadRoot: '/tmp/ao-worktree',
+        repositoryWriteRoot: '/tmp/ao-worktree', inputIds: ['input:attached'],
+      },
+      effectivePolicy: { version: 1, filesystem: 'workspace-write', network: 'deny', environment: 'empty' },
+      effectiveCapabilities: {
+        version: 1, repositoryRead: true, repositoryPatch: true, inputRead: true,
+      },
+      toolOperations: [{
+        namespace: 'inputs', operation: 'copy_to_repository', success: true, occurredAt: TIME,
+        inputId: 'input:attached', path: 'public/reference.png', byteSize: 128,
+        sha256: 'a'.repeat(64),
+      }],
+    });
+
+    expect(normalized.toolOperations?.[0]).toEqual({
+      namespace: 'inputs', operation: 'copy_to_repository', success: true, occurredAt: TIME,
+      inputId: 'input:attached', path: 'public/reference.png', byteSize: 128,
+      sha256: 'a'.repeat(64),
+    });
+    expect(JSON.stringify(normalized)).not.toContain('storageReference');
+    expect(JSON.stringify(normalized)).not.toContain('data');
+  });
+
+  it.each([
+    ['unknown operation', { namespace: 'inputs', operation: 'delete', success: true, occurredAt: TIME }],
+    ['malformed Input ID', { namespace: 'inputs', operation: 'read', success: true, occurredAt: TIME, inputId: '../input' }],
+    ['raw Input data', { namespace: 'inputs', operation: 'read', success: true, occurredAt: TIME, inputId: 'input:attached', data: 'raw' }],
+    ['escaping copy path', { namespace: 'inputs', operation: 'copy_to_repository', success: true, occurredAt: TIME, inputId: 'input:attached', path: '../escape.png' }],
+  ])('rejects %s in Input operation evidence', (_label, operation) => {
+    expect(() => normalizeRuntimeObservation({
+      ...exact(),
+      executionContext: {
+        workingDirectory: '/tmp/ao-worktree', repositoryReadRoot: '/tmp/ao-worktree',
+        repositoryWriteRoot: '/tmp/ao-worktree', inputIds: ['input:attached'],
+      },
+      effectivePolicy: { version: 1, filesystem: 'workspace-write', network: 'deny', environment: 'empty' },
+      effectiveCapabilities: {
+        version: 1, repositoryRead: true, repositoryPatch: true, inputRead: true,
+      },
+      toolOperations: [operation],
+    })).toThrow();
+  });
+
   it('persists exact correlated turn completion without completing the Attempt', async () => {
     const setup = await harness([exact()]);
     const result = await setup.observations.observeAttemptExecution(setup.attempt.id);

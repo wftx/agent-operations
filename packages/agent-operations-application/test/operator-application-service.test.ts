@@ -662,9 +662,9 @@ describe('OperatorApplicationService', () => {
   it.each([
     ['observation timeout', 'observation_timeout' as const, 'Observation timed out.'],
     [
-      'known oversized observation failure',
+      'generic observation normalization failure',
       'runtime_failure' as const,
-      'Runtime observation failed: Observation text exceeds 4000 characters',
+      'Runtime observation failed: Runtime observer returned invalid tool operation evidence',
     ],
   ])('atomically resolves a late exact %s, resumes the same run, and is idempotent', async (
     _label,
