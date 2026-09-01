@@ -686,7 +686,7 @@ export class OperatorApplicationService implements OperatorApplication {
       const plan = attempt ? await this.store.getExecutionPlanForAttempt(attempt.id) : null;
       const dispatch = plan ? await this.store.getExecutionDispatchForPlan(plan.id) : null;
       const outcome = attempt ? await this.store.getAttemptOutcomeDecision(attempt.id) : null;
-      if (attempt?.executionRole === 'worker'
+      if (attempt
         && (attempt.status === 'running' || outcome !== null)
         && dispatch?.status === 'accepted'
         && Boolean(dispatch.externalReference)) return ['reconcile-execution'];

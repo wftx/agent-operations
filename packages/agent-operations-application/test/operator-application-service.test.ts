@@ -807,6 +807,36 @@ describe('OperatorApplicationService', () => {
     const reviewer = await lifecycle.createAttempt(job.id, {
       runtimeAgentId: RUNTIME_ID, executionRole: 'reviewer',
     });
+    const reviewerPlan = await new ExecutionPlanningService(store, {
+      now: () => new Date(TIME), planIdFactory: () => 'plan:late-reviewer',
+    }).prepareExecutionPlan({
+      projectId: PROJECT_ID,
+      attemptId: reviewer.id,
+      instruction: 'Review the bounded Worker result.',
+      requestedPolicy: RESTRICTED_TEXT_EXECUTION_POLICY,
+      requestedCapabilities: REPOSITORY_READ_EXECUTION_CAPABILITIES,
+    });
+    const prepared = {
+      id: 'dispatch:late-reviewer', executionPlanId: reviewerPlan.id,
+      attemptId: reviewer.id, jobId: job.id, runtimeAgentId: RUNTIME_ID,
+      idempotencyKey: createExecutionDispatchIdempotencyKey(reviewerPlan.id),
+      status: 'prepared' as const, revision: 0, createdAt: TIME, updatedAt: TIME,
+    };
+    await store.createExecutionDispatch(prepared);
+    const submitting = {
+      ...prepared, status: 'submitting' as const, revision: 1, submittedAt: TIME,
+    };
+    await store.saveExecutionDispatchTransition(submitting, 0);
+    await store.saveExecutionDispatchTransition({
+      ...submitting,
+      status: 'accepted',
+      revision: 2,
+      effectivePolicy: RESTRICTED_TEXT_EXECUTION_POLICY,
+      effectiveCapabilities: REPOSITORY_READ_EXECUTION_CAPABILITIES,
+      externalReference: 'cortextos:codex-turn:v1:reviewer-thread:reviewer-turn',
+      acceptedAt: TIME,
+      resolvedAt: TIME,
+    }, 1);
     await lifecycle.startAttempt(reviewer.id);
     await store.createEscalation({
       id: 'escalation:late-reviewer', jobId: job.id, attemptId: reviewer.id,
@@ -830,6 +860,8 @@ describe('OperatorApplicationService', () => {
       now: () => new Date(TIME), escalationIdFactory: () => 'escalation:reviewer-revision',
     });
 
+    expect((await application.getJobDetail(job.id)).escalationActions['escalation:late-reviewer'])
+      .toEqual(['reconcile-execution']);
     const result = await application.reconcileTimedOutExecution('escalation:late-reviewer');
     const reviews = await store.listAttemptReviewsForJob(job.id);
 
