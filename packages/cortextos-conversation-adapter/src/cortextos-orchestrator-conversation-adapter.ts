@@ -30,6 +30,10 @@ interface StoredTurn extends OrchestratorConversationTurn {
 
 type RequestSender = (request: Record<string, unknown>) => Promise<unknown>;
 
+/** Catalog required by the Phase 27C AO Web conversation contract. */
+export const EXPECTED_AO_ORCHESTRATOR_TOOL_CATALOG_REVISION =
+  'sha256:85bca3441a06e127d569ff70f85f1267e95ffcb9d9a7e429cbfee2f465e26b77';
+
 export interface CortextOSOrchestratorConversationAdapterOptions {
   readonly instanceId?: string;
   readonly agentName?: string;
@@ -171,6 +175,12 @@ export class CortextOSOrchestratorConversationAdapter implements OrchestratorCon
       const agent = response.data.find(candidate => isRecord(candidate) && candidate.name === this.agentName);
       if (!isRecord(agent)) return { state: 'offline', reason: `CortextOS agent ${this.agentName} is not registered.` };
       if (agent.status !== 'running') return { state: 'offline', reason: `CortextOS agent ${this.agentName} is not running.` };
+      if (agent.toolCatalogRevision !== EXPECTED_AO_ORCHESTRATOR_TOOL_CATALOG_REVISION) {
+        return {
+          state: 'offline',
+          reason: 'The AO Orchestrator runtime tool catalog is outdated. Restart CortextOS from the current application build.',
+        };
+      }
       return this.state.list().some(turn => turn.status === 'pending')
         ? { state: 'busy', reason: 'The AO Orchestrator is already handling a turn.' }
         : { state: 'ready' };

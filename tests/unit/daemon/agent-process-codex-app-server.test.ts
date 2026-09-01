@@ -32,6 +32,7 @@ vi.mock('../../../src/pty/agent-pty.js', () => ({
 }));
 
 vi.mock('../../../src/pty/codex-app-server-pty.js', () => ({
+  AO_ORCHESTRATOR_TOOL_CATALOG_REVISION: 'sha256:test-catalog',
   CodexAppServerPTY: function CodexAppServerPTY() { return mockCodexAppServerPty; },
 }));
 
@@ -126,6 +127,14 @@ beforeEach(() => {
 });
 
 describe('AgentProcess codex-app-server runtime', () => {
+  it('advertises the exact bounded tool catalog for the dedicated AO Orchestrator', () => {
+    const ap = new AgentProcess('ao-orchestrator', mockEnv, {
+      runtime: 'codex-app-server',
+      tool_profile: 'agent-operations-orchestrator',
+    });
+    expect(ap.getStatus().toolCatalogRevision).toBe('sha256:test-catalog');
+  });
+
   it('selects CodexAppServerPTY for runtime codex-app-server', async () => {
     const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
     await ap.start();

@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   CortextOSConversationStateRepository,
   CortextOSOrchestratorConversationAdapter,
+  EXPECTED_AO_ORCHESTRATOR_TOOL_CATALOG_REVISION,
 } from '../src/index.js';
 
 const roots: string[] = [];
@@ -80,6 +81,25 @@ describe('CortextOSOrchestratorConversationAdapter', () => {
     expect(requests).toEqual(['status']);
   });
 
+  it('fails closed before injection when the live runtime tool catalog is stale or absent', async () => {
+    const root = temporaryRoot();
+    let injections = 0;
+    const adapter = new CortextOSOrchestratorConversationAdapter({
+      ctxRoot: root,
+      requestSender: async request => {
+        if (request.type === 'inject-agent') injections += 1;
+        return { success: true, data: [{ name: 'ao-orchestrator', status: 'running', pid: 24680 }] };
+      },
+    });
+
+    await expect(adapter.sendTurn({ message: 'Create a Job.' })).rejects.toThrow('tool catalog is outdated');
+    expect(injections).toBe(0);
+    await expect(adapter.getConversationState()).resolves.toMatchObject({
+      runtimeState: 'offline',
+      runtimeReason: expect.stringContaining('Restart CortextOS'),
+    });
+  });
+
   it('reconciles an expired pending turn after web process restart', async () => {
     const root = temporaryRoot();
     const state = new CortextOSConversationStateRepository(root, 'ao-orchestrator');
@@ -133,7 +153,15 @@ describe('CortextOSOrchestratorConversationAdapter', () => {
 });
 
 function readyInventory() {
-  return { success: true, data: [{ name: 'ao-orchestrator', status: 'running', pid: 24680 }] };
+  return {
+    success: true,
+    data: [{
+      name: 'ao-orchestrator',
+      status: 'running',
+      pid: 24680,
+      toolCatalogRevision: EXPECTED_AO_ORCHESTRATOR_TOOL_CATALOG_REVISION,
+    }],
+  };
 }
 
 function temporaryRoot(): string {

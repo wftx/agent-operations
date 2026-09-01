@@ -10,7 +10,10 @@ import type {
   RuntimeExecutionPolicyEnvelope,
 } from '../types/index.js';
 import { AgentPTY } from '../pty/agent-pty.js';
-import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
+import {
+  AO_ORCHESTRATOR_TOOL_CATALOG_REVISION,
+  CodexAppServerPTY,
+} from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
 import { OpencodePTY, opencodeSessionExists } from '../pty/opencode-pty.js';
 import { MessageDedup, injectMessage as injectMessageIntoPty } from '../pty/inject.js';
@@ -629,6 +632,9 @@ export class AgentProcess {
       sessionStart: this.sessionStart?.toISOString(),
       crashCount: this.crashCount,
       model: this.config.model,
+      ...(this.config.tool_profile === 'agent-operations-orchestrator'
+        ? { toolCatalogRevision: AO_ORCHESTRATOR_TOOL_CATALOG_REVISION }
+        : {}),
       awaitingConfirmation:
         this.pty && 'isAwaitingInteractiveConfirmation' in this.pty
           ? this.pty.isAwaitingInteractiveConfirmation()

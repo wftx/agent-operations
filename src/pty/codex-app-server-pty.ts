@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { isAbsolute, join, resolve } from 'path';
 import { homedir } from 'os';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { execFile } from 'node:child_process';
 import type {
   AgentConfig,
@@ -49,6 +49,7 @@ interface ThreadState {
   threadId: string;
   cwd: string;
   updatedAt: string;
+  toolCatalogRevision?: string;
 }
 
 interface SocketPointer {
@@ -278,7 +279,7 @@ const GIT_INSPECTION_DYNAMIC_TOOLS = [{
   }],
 }] as const;
 
-const AO_ORCHESTRATOR_DYNAMIC_TOOLS = [{
+export const AO_ORCHESTRATOR_DYNAMIC_TOOLS = [{
   type: 'namespace',
   name: 'ao',
   description: 'Bounded Agent Operations application commands. Agent Operations remains authoritative.',
@@ -351,6 +352,11 @@ const AO_ORCHESTRATOR_DYNAMIC_TOOLS = [{
     },
   ],
 }] as const;
+
+/** Exact identity of the dynamic tool schema installed on persistent AO Orchestrator threads. */
+export const AO_ORCHESTRATOR_TOOL_CATALOG_REVISION = `sha256:${createHash('sha256')
+  .update(JSON.stringify(AO_ORCHESTRATOR_DYNAMIC_TOOLS))
+  .digest('hex')}`;
 
 const AO_TOOL_NAMES = {
   projects_list: 'ao.projects.list',
@@ -1296,7 +1302,9 @@ export class CodexAppServerPTY {
     const persistentOverrides = await this.persistentThreadOverrides();
     if (mode === 'continue') {
       const persisted = this.readThreadState();
-      if (persisted) {
+      const persistedCatalogMatches = !this.isAoOrchestrator()
+        || persisted?.toolCatalogRevision === AO_ORCHESTRATOR_TOOL_CATALOG_REVISION;
+      if (persisted && persistedCatalogMatches) {
         try {
           const resumed = await this.request<ThreadResponse>('thread/resume', {
             threadId: persisted.threadId,
@@ -1313,9 +1321,16 @@ export class CodexAppServerPTY {
           if (normalized instanceof CodexThreadOwnershipConflictError) throw normalized;
           this._outputBuffer.push(`[codex-app-server] persisted resume failed: ${err}\n`);
         }
+      } else if (persisted && this.isAoOrchestrator()) {
+        this._outputBuffer.push(
+          '[codex-app-server] persisted AO Orchestrator tool catalog is stale; starting a new thread\n',
+        );
       }
 
-      const latest = await this.findLatestThreadForCwd();
+      // A discovered provider thread has no trusted local catalog identity.
+      // Persistent AO Orchestrator threads may only resume from the exact
+      // catalog-bound state written by this adapter.
+      const latest = this.isAoOrchestrator() ? null : await this.findLatestThreadForCwd();
       if (latest) {
         const resumed = await this.request<ThreadResponse>('thread/resume', {
           threadId: latest,
@@ -2086,6 +2101,9 @@ export class CodexAppServerPTY {
       threadId,
       cwd: this._cwd,
       updatedAt: new Date().toISOString(),
+      ...(this.isAoOrchestrator()
+        ? { toolCatalogRevision: AO_ORCHESTRATOR_TOOL_CATALOG_REVISION }
+        : {}),
     };
     writeFileSync(this._threadStatePath, `${JSON.stringify(state, null, 2)}\n`, 'utf-8');
   }

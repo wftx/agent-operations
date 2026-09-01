@@ -251,6 +251,12 @@ thread. The thread is read only, denies network, inherits no environment, and
 exposes only the bounded native Agent Operations tool namespace. The profile is
 registered disabled until the separately authorized live proof.
 
+The persistent thread state is bound to an exact hash of that native tool
+catalog. CortextOS starts a new provider thread when the saved catalog hash is
+stale, while AO Web rejects a running daemon that does not advertise the
+catalog required by the current application build. This makes an application
+restart requirement explicit instead of silently omitting newly added tools.
+
 Phase 27B does not consolidate Telegram. Existing AO notification intent and
 deduplication remain unchanged. A later phase can route Telegram inbound and
 outbound through this same CortextOS Orchestrator while keeping AO action

@@ -868,6 +868,8 @@ export interface AgentStatus {
   sessionStart?: string;
   crashCount?: number;
   model?: string;
+  /** Exact dynamic tool schema loaded by a persistent bounded agent, when applicable. */
+  toolCatalogRevision?: string;
   awaitingConfirmation?: boolean; // first-run observability fix: PTY parked on an
   // interactive first-run prompt past the auto-accept backstop (wedged, not bootstrapped)
   dormant?: boolean; // silent-dormancy fix: enabled agent whose heartbeat is stale

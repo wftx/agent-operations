@@ -67,10 +67,15 @@ vi.mock('../../../src/bus/event.js', () => ({
 }));
 
 const {
+  AO_ORCHESTRATOR_DYNAMIC_TOOLS,
+  AO_ORCHESTRATOR_TOOL_CATALOG_REVISION,
   CodexAppServerPTY,
   CodexThreadOwnershipConflictError,
   mapExecutionPolicyToCodex,
 } = await import('../../../src/pty/codex-app-server-pty.js');
+const { EXPECTED_AO_ORCHESTRATOR_TOOL_CATALOG_REVISION } = await import(
+  '../../../packages/cortextos-conversation-adapter/src/index.js'
+);
 
 const mockEnv = {
   instanceId: 'test',
@@ -173,6 +178,51 @@ describe('CodexAppServerPTY Agent Operations Orchestrator tools', () => {
     expect(overrides.dynamicTools).toEqual([
       expect.objectContaining({ name: 'ao' }),
     ]);
+    const ao = AO_ORCHESTRATOR_DYNAMIC_TOOLS[0];
+    expect(ao.tools.map(tool => tool.name)).toEqual([
+      'projects_list',
+      'projects_get',
+      'inputs_list',
+      'inputs_get',
+      'jobs_create',
+      'jobs_get',
+      'jobs_list',
+      'jobs_status',
+      'conversation_respond',
+    ]);
+    const createJob = ao.tools.find(tool => tool.name === 'jobs_create');
+    expect(createJob?.inputSchema).toMatchObject({
+      properties: { inputIds: { type: 'array', items: { type: 'string' }, maxItems: 20 } },
+    });
+    expect(AO_ORCHESTRATOR_TOOL_CATALOG_REVISION)
+      .toBe(EXPECTED_AO_ORCHESTRATOR_TOOL_CATALOG_REVISION);
+  });
+
+  it('starts a fresh persistent Orchestrator thread when saved catalog identity is stale', async () => {
+    fsMocks.existsSync.mockReturnValue(true);
+    fsMocks.readFileSync.mockReturnValue(JSON.stringify({
+      threadId: 'stale-thread',
+      cwd: '/tmp/fw/orgs/acme/agents/codex-app-agent',
+      updatedAt: '2026-08-31T00:00:00Z',
+    }));
+    requestMock.mockImplementation(async method => method === 'config/read'
+      ? { result: { config: { mcp_servers: {} } } }
+      : { result: { thread: { id: 'current-thread' } } });
+    const pty = new CodexAppServerPTY(mockEnv, { tool_profile: 'agent-operations-orchestrator' });
+    (pty as unknown as { _rpc: { request: typeof requestMock } })._rpc = { request: requestMock };
+
+    await (pty as unknown as { startOrResumeThread(mode: 'fresh' | 'continue'): Promise<void> })
+      .startOrResumeThread('continue');
+
+    expect(requestMock.mock.calls.some(([method]) => method === 'thread/resume')).toBe(false);
+    expect(requestMock).toHaveBeenCalledWith('thread/start', expect.objectContaining({
+      dynamicTools: AO_ORCHESTRATOR_DYNAMIC_TOOLS,
+    }));
+    expect(fsMocks.writeFileSync).toHaveBeenCalledWith(
+      expect.stringContaining('codex-app-server-thread.json'),
+      expect.stringContaining(`\"toolCatalogRevision\": \"${AO_ORCHESTRATOR_TOOL_CATALOG_REVISION}\"`),
+      'utf-8',
+    );
   });
 
   it('executes a bounded AO tool only for the exact protected turn', async () => {

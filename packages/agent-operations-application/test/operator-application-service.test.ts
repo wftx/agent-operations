@@ -328,6 +328,45 @@ describe('OperatorApplicationService', () => {
     expect(await store.getOperatorRunForJob(started.jobId)).toMatchObject({ status: 'pending' });
   });
 
+  it('durably attaches only the exact requested Input IDs to a newly created Job', async () => {
+    const store = await configuredStore();
+    await store.createInput({
+      id: 'input:attached',
+      displayName: 'reference.png',
+      mimeType: 'image/png',
+      byteSize: 42,
+      sha256: 'a'.repeat(64),
+      sourceType: 'uploaded-file',
+      projectId: PROJECT_ID,
+      storageReference: '/private/ao-inputs/attached',
+      ingestionState: 'complete',
+      validationState: 'valid',
+      createdAt: TIME,
+    });
+    await store.createInput({
+      id: 'input:unattached',
+      displayName: 'other.png',
+      mimeType: 'image/png',
+      byteSize: 84,
+      sha256: 'b'.repeat(64),
+      sourceType: 'uploaded-file',
+      projectId: PROJECT_ID,
+      storageReference: '/private/ao-inputs/unattached',
+      ingestionState: 'complete',
+      validationState: 'valid',
+      createdAt: TIME,
+    });
+    const application = new OperatorApplicationService(store, new FakeOrchestration(store), {
+      now: () => new Date(TIME),
+      deferRunnerWake: true,
+    });
+
+    const started = await application.runOperatorJob({ ...INPUT, inputIds: ['input:attached'] });
+
+    expect(await store.listJobInputIds(started.jobId)).toEqual(['input:attached']);
+    expect(await store.listJobInputIds(started.jobId)).not.toContain('input:unattached');
+  });
+
   it('surfaces durable escalations in Needs Me and excludes them from Done', async () => {
     const store = await configuredStore();
     const application = new OperatorApplicationService(store, new FakeOrchestration(store, 'ESCALATED'), { now: () => new Date(TIME) });

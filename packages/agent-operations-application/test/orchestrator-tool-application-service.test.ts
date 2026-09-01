@@ -108,6 +108,15 @@ describe('OrchestratorToolApplicationService', () => {
     expect(operator.runOperatorJob).toHaveBeenCalledWith(expect.objectContaining({ inputIds: ['input:brief'] }));
     expect(created.ok).toBe(true);
   });
+
+  it('returns bounded Input metadata without exposing its physical storage reference', async () => {
+    const tools = new OrchestratorToolApplicationService(fakeOperator(), fakeInputs());
+    const result = await tools.execute({ name: 'ao.inputs.get', arguments: { inputId: 'input:brief' } });
+
+    expect(result).toMatchObject({ ok: true, data: { id: 'input:brief', sha256: 'a'.repeat(64) } });
+    expect(result.data).not.toHaveProperty('storageReference');
+    expect(result.data).not.toHaveProperty('path');
+  });
 });
 
 function validCreate(overrides: Record<string, unknown> = {}) {
