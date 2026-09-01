@@ -436,7 +436,12 @@ function normalizeInputToolOperation(
 
   if (operation === 'read') {
     const offset = optionalBoundedInteger(item.offset, 'Input read offset', 0, Number.MAX_SAFE_INTEGER);
-    const requestedLength = optionalBoundedInteger(item.requestedLength, 'Input read requested length', 1, 65_536);
+    const requestedLength = optionalBoundedInteger(
+      item.requestedLength,
+      'Input read requested length',
+      success ? 1 : 0,
+      success ? 65_536 : Number.MAX_SAFE_INTEGER,
+    );
     const returnedLength = optionalBoundedInteger(item.returnedLength, 'Input read returned length', 0, 65_536);
     if (returnedLength !== undefined && requestedLength !== undefined && returnedLength > requestedLength) {
       throw new Error('Input read evidence returned more bytes than requested');

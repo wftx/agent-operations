@@ -203,6 +203,38 @@ describe('ExecutionObservationService', () => {
     expect(JSON.stringify(normalized)).not.toContain('data');
   });
 
+  it('preserves an out of range read request as bounded failed operation evidence', () => {
+    const normalized = normalizeRuntimeObservation({
+      ...exact(),
+      executionContext: { workingDirectory: '/tmp/ao-input', inputIds: ['input:attached'] },
+      effectivePolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
+      effectiveCapabilities: { version: 1, repositoryRead: false, inputRead: true },
+      toolOperations: [{
+        namespace: 'inputs', operation: 'read', success: false, occurredAt: TIME,
+        inputId: 'input:attached', offset: 0, requestedLength: 1_000_000,
+        errorCode: 'INPUT_TOOL_FAILED',
+      }],
+    });
+
+    expect(normalized.toolOperations?.[0]).toMatchObject({
+      namespace: 'inputs', operation: 'read', success: false,
+      requestedLength: 1_000_000, errorCode: 'INPUT_TOOL_FAILED',
+    });
+  });
+
+  it('rejects an oversized read range reported as successful', () => {
+    expect(() => normalizeRuntimeObservation({
+      ...exact(),
+      executionContext: { workingDirectory: '/tmp/ao-input', inputIds: ['input:attached'] },
+      effectivePolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
+      effectiveCapabilities: { version: 1, repositoryRead: false, inputRead: true },
+      toolOperations: [{
+        namespace: 'inputs', operation: 'read', success: true, occurredAt: TIME,
+        inputId: 'input:attached', offset: 0, requestedLength: 1_000_000,
+      }],
+    })).toThrow('Input read requested length');
+  });
+
   it.each([
     ['unknown operation', { namespace: 'inputs', operation: 'delete', success: true, occurredAt: TIME }],
     ['malformed Input ID', { namespace: 'inputs', operation: 'read', success: true, occurredAt: TIME, inputId: '../input' }],
