@@ -224,15 +224,18 @@ export class AgentManager {
     const instanceEnabled = this.readInstanceEnableList();
 
     for (const { name, dir, org, config } of agentDirs) {
-      // Per-agent config.json `enabled: false` (existing behavior, unchanged)
-      if (config.enabled === false) {
-        console.log(`[agent-manager] Skipping disabled agent: ${name} (per-agent config.json)`);
+      const entry = instanceEnabled[name];
+      // An explicit instance-level choice is authoritative. This lets a
+      // packaged profile remain dormant by default while `cortextos enable`
+      // keeps it enabled across daemon restarts.
+      if (entry?.enabled === false) {
+        console.log(`[agent-manager] Skipping disabled agent: ${name} (enabled-agents.json)`);
         continue;
       }
-      // Instance-level enabled-agents.json `enabled: false` (BUG-028 fix)
-      const entry = instanceEnabled[name];
-      if (entry && entry.enabled === false) {
-        console.log(`[agent-manager] Skipping disabled agent: ${name} (enabled-agents.json)`);
+      // Without an instance-level override, preserve the existing per-agent
+      // default behavior.
+      if (config.enabled === false && entry?.enabled !== true) {
+        console.log(`[agent-manager] Skipping disabled agent: ${name} (per-agent config.json)`);
         continue;
       }
       // BUG-043 fix: pass the per-agent org so startAgent can use it instead
@@ -728,10 +731,12 @@ export class AgentManager {
     // operator asked to stop for the life of the daemon.
     // Guarded on OUR teardown rather than on map identity: a start that was merely
     // superseded still owns a live process that needs its checker.
-    if (!ownEntry.stopped) {
+    if (!ownEntry.stopped && config.startup_behavior !== 'idle-conversation') {
       checker.start().catch(err => {
         console.error(`[${name}] Fast checker error:`, err);
       });
+    } else if (!ownEntry.stopped) {
+      log('Idle conversational startup: automatic inbox polling disabled');
     }
 
     // Register Telegram slash commands at startup (fix for issue #1)

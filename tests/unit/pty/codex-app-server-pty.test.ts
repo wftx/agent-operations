@@ -99,6 +99,20 @@ beforeEach(() => {
 });
 
 describe('CodexAppServerPTY Agent Operations Orchestrator tools', () => {
+  it('initializes a persistent thread without creating a turn for an empty startup prompt', async () => {
+    const pty = new CodexAppServerPTY(mockEnv, { tool_profile: 'agent-operations-orchestrator' });
+    vi.spyOn(pty as never, 'startAppServerWithRetry').mockResolvedValue(undefined);
+    vi.spyOn(pty as never, 'connectRpc').mockResolvedValue(undefined);
+    vi.spyOn(pty as never, 'initializeRpc').mockResolvedValue(undefined);
+    vi.spyOn(pty as never, 'startOrResumeThread').mockResolvedValue(undefined);
+    const queueTurn = vi.spyOn(pty as never, 'queueTurn').mockImplementation(() => {});
+
+    await pty.spawn('fresh', '');
+
+    expect(pty.isAlive()).toBe(true);
+    expect(queueTurn).not.toHaveBeenCalled();
+  });
+
   it('starts one exact turn on the persistent restricted thread', async () => {
     requestMock.mockResolvedValue({ result: { turn: { id: 'turn-ao-1', status: 'inProgress' } } });
     const pty = new CodexAppServerPTY(mockEnv, { tool_profile: 'agent-operations-orchestrator' });

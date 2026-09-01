@@ -155,6 +155,13 @@ export interface EcosystemConfig {
 
 export interface AgentConfig {
   startup_delay?: number;
+  /**
+   * Provider startup behavior. Defaults to bootstrap when absent.
+   * idle-conversation initializes the persistent runtime without submitting a
+   * startup prompt or starting the daemon inbox poller. Explicit IPC or other
+   * direct inbound conversation paths remain available.
+   */
+  startup_behavior?: 'bootstrap' | 'idle-conversation';
   max_session_seconds?: number;
   max_crashes_per_day?: number;
   /**

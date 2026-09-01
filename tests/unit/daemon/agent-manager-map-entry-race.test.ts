@@ -231,6 +231,25 @@ describe('AgentManager Telegram polling policy', () => {
 
     expect(entryOf(manager, 'specialist').poller).toBeUndefined();
   });
+
+  it('does not start inbox polling for an idle conversational agent', async () => {
+    const agentDir = makeAgentDir(testDir, 'acme', 'specialist');
+    writeFileSync(
+      join(agentDir, 'config.json'),
+      JSON.stringify({ name: 'specialist', startup_behavior: 'idle-conversation' }),
+    );
+    const manager = new AgentManager(
+      'test-instance',
+      join(testDir, 'instance'),
+      join(testDir, 'framework'),
+      'acme',
+    );
+
+    await manager.startAgent('specialist', agentDir);
+
+    const checker = entryOf(manager, 'specialist').checker as { startCount: number };
+    expect(checker.startCount).toBe(0);
+  });
 });
 
 describe('AgentManager map-entry race — stopAgent must not evict a replacement registered during its await', () => {

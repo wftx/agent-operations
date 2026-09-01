@@ -130,8 +130,66 @@ describe('AgentProcess codex-app-server runtime', () => {
     const ap = new AgentProcess('codex-app-agent', mockEnv, { runtime: 'codex-app-server' });
     await ap.start();
 
-    expect(mockCodexAppServerPty.spawn).toHaveBeenCalledWith('fresh', expect.any(String));
+    expect(mockCodexAppServerPty.spawn).toHaveBeenCalledWith(
+      'fresh',
+      expect.stringContaining('You are starting a new session.'),
+    );
     expect(ap.getStatus().pid).toBe(24680);
+  });
+
+  it('starts an idle conversational runtime without a bootstrap provider prompt', async () => {
+    const ap = new AgentProcess('codex-app-agent', mockEnv, {
+      runtime: 'codex-app-server',
+      startup_behavior: 'idle-conversation',
+    });
+
+    await ap.start();
+
+    expect(mockCodexAppServerPty.spawn).toHaveBeenCalledWith('fresh', '');
+    expect(ap.getStatus()).toMatchObject({ status: 'running', pid: 24680 });
+  });
+
+  it('submits exactly one correlated turn after an idle conversational start', async () => {
+    const ap = new AgentProcess('codex-app-agent', mockEnv, {
+      runtime: 'codex-app-server',
+      startup_behavior: 'idle-conversation',
+    });
+
+    await ap.start();
+    await expect(ap.injectCorrelatedMessageDetailed(
+      'one explicit conversation',
+      'conversation:idle-first',
+    )).resolves.toMatchObject({
+      ok: true,
+      provider: 'codex',
+      sessionId: 'thread-1',
+      turnId: 'turn-1',
+    });
+
+    expect(mockCodexAppServerPty.spawn).toHaveBeenCalledOnce();
+    expect(mockCodexAppServerPty.spawn).toHaveBeenCalledWith('fresh', '');
+    expect(mockCodexAppServerPty.startCorrelationSafeTurn).toHaveBeenCalledOnce();
+    expect(mockCodexAppServerPty.startCorrelationSafeTurn).toHaveBeenCalledWith(
+      'one explicit conversation',
+      'conversation:idle-first',
+      undefined,
+      undefined,
+      undefined,
+    );
+  });
+
+  it('does not submit an unsolicited prompt when an idle runtime resumes', async () => {
+    const codexThreadPath = '/tmp/test-ctx/state/codex-app-agent/codex-app-server-thread.json';
+    fsMocks.existsSync.mockImplementation((path: string) => path === codexThreadPath);
+    const ap = new AgentProcess('codex-app-agent', mockEnv, {
+      runtime: 'codex-app-server',
+      startup_behavior: 'idle-conversation',
+    });
+
+    await ap.start();
+
+    expect(mockCodexAppServerPty.spawn).toHaveBeenCalledWith('continue', '');
+    expect(mockCodexAppServerPty.startCorrelationSafeTurn).not.toHaveBeenCalled();
   });
 
   it('halts without recovery when Codex reports an externally owned thread', async () => {

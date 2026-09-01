@@ -106,8 +106,7 @@ describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
   });
 
   it('still respects per-agent config.json enabled: false (existing behavior)', async () => {
-    // Per-agent config.json takes precedence — this is the legacy behavior we
-    // explicitly preserved in the BUG-028 fix
+    // With no instance-level override, preserve the legacy profile behavior.
     writeFileSync(
       join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice', 'config.json'),
       JSON.stringify({ enabled: false }),
@@ -121,6 +120,26 @@ describe('AgentManager.discoverAndStart - BUG-028 fix', () => {
     expect(startSpy).toHaveBeenCalledTimes(1);
     // BUG-043: startAgent now accepts a 4th `org` argument
     expect(startSpy).toHaveBeenCalledWith('bob', expect.any(String), expect.any(Object), 'acme');
+  });
+
+  it('persists an explicit instance-level enable across daemon restart', async () => {
+    writeFileSync(
+      join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice', 'config.json'),
+      JSON.stringify({ enabled: false }),
+    );
+    writeFileSync(
+      join(ctxRoot, 'config', 'enabled-agents.json'),
+      JSON.stringify({ alice: { enabled: true, org: 'acme' } }),
+    );
+
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
+
+    await am.discoverAndStart();
+
+    expect(startSpy).toHaveBeenCalledTimes(2);
+    const namesStarted = startSpy.mock.calls.map(call => call[0]).sort();
+    expect(namesStarted).toEqual(['alice', 'bob']);
   });
 
   it('handles corrupt enabled-agents.json by defaulting to enabled-all', async () => {

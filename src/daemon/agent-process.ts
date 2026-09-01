@@ -166,9 +166,11 @@ export class AgentProcess {
     // immediate exit-0-on-continue wedge (opencode --continue re-attach loop).
     this.lastSpawnMode = mode;
     this.lastStartAtMs = Date.now();
-    const prompt = mode === 'fresh'
-      ? this.buildStartupPrompt()
-      : this.buildContinuePrompt();
+    const prompt = this.config.startup_behavior === 'idle-conversation'
+      ? ''
+      : mode === 'fresh'
+        ? this.buildStartupPrompt()
+        : this.buildContinuePrompt();
 
     this.log(`Starting in ${mode} mode`);
     this.status = 'starting';

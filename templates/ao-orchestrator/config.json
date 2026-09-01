@@ -5,6 +5,7 @@
   "tool_profile": "agent-operations-orchestrator",
   "dangerously_skip_permissions": false,
   "startup_delay": 0,
+  "startup_behavior": "idle-conversation",
   "max_session_seconds": 255600,
   "max_crashes_per_day": 10,
   "working_directory": "",

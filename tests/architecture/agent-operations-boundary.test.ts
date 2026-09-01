@@ -35,6 +35,7 @@ describe('Agent Operations import boundary', () => {
       runtime: 'codex-app-server',
       tool_profile: 'agent-operations-orchestrator',
       dangerously_skip_permissions: false,
+      startup_behavior: 'idle-conversation',
       telegram_polling: false,
       crons: [],
     });
