@@ -51,24 +51,53 @@ export function renderOrchestrator(
 
 export function renderProjects(projects: readonly ProjectOnboardingResult[]): string {
   const cards = projects.length ? projects.map(project => `<article class="card" id="${escapeAttr(project.project.id)}">
-    <div class="card-head"><div><p class="eyebrow">${escapeHtml(project.profile.resourceSummary)}</p><h2>${escapeHtml(project.project.name)}</h2><p>${escapeHtml(project.project.description ?? 'No description')}</p></div><span class="status ${project.profile.capabilities.repositoryReadOnlyJobs === 'available' ? 'done' : 'neutral'}">${project.profile.capabilities.repositoryReadOnlyJobs === 'available' ? 'Repository ready' : 'Context ready'}</span></div>
-    <dl class="facts"><div><dt>Resources</dt><dd>${escapeHtml([...project.repositories.map(value => value.name), ...project.localFolders.map(value => value.canonicalPath)].join(', ') || 'None')}</dd></div><div><dt>Stack</dt><dd>${escapeHtml(project.profile.detectedStack.join(', ') || 'Not detected')}</dd></div><div><dt>Package manager</dt><dd>${escapeHtml(project.profile.packageManager ?? 'Not detected')}</dd></div><div><dt>Capabilities</dt><dd>Conversation and Inputs ready. Repository read and isolated write: ${project.profile.capabilities.repositoryReadOnlyJobs}.</dd></div></dl>
+    <div class="card-head"><div><p class="eyebrow">${escapeHtml(project.repositoryReadiness.length ? 'Git repository detected' : project.localFolders.length ? 'Local folder' : 'No resource attached')}</p><h2>${escapeHtml(project.project.name)}</h2><p>${escapeHtml(project.project.description ?? 'No description')}</p></div><span class="status ${project.profile.capabilities.repositoryReadOnlyJobs === 'available' ? 'done' : 'neutral'}">${project.profile.capabilities.repositoryReadOnlyJobs === 'available' ? 'Repository ready' : 'Context ready'}</span></div>
+    ${renderProjectResource(project)}
+    <dl class="facts"><div><dt>Stack</dt><dd>${escapeHtml(project.profile.detectedStack.join(', ') || 'Not detected')}</dd></div><div><dt>Package manager</dt><dd>${escapeHtml(project.profile.packageManager ?? 'Not detected')}</dd></div></dl>
     ${project.profile.warnings.length ? `<div class="alert error">${project.profile.warnings.map(escapeHtml).join('<br>')}</div>` : ''}
-  </article>`).join('') : '<div class="empty"><h2>No Projects yet</h2><p>Add a Project with a Git repository, local folder, or no attached resource.</p></div>';
+  </article>`).join('') : '<div class="empty"><h2>No Projects yet</h2><p>Add a local folder or start without files.</p></div>';
   return layout('Projects', `<header class="page-head"><div><p class="eyebrow">Project context</p><h1>Projects</h1><p>Provider neutral readiness profiles for work managed by Agent Operations.</p></div><a class="refresh" href="/projects/new">Add Project</a></header><section class="stack">${cards}</section>`, 'projects');
 }
 
 export function renderNewProject(error?: string): string {
-  return layout('Add Project', `<a class="back" href="/projects">Back to Projects</a><header class="page-head"><div><p class="eyebrow">Project onboarding</p><h1>Add a Project</h1><p>Attach an existing Git repository, a local folder, or start with context only.</p></div></header>
+  return layout('Add Project', `<a class="back" href="/projects">Back to Projects</a><header class="page-head"><div><p class="eyebrow">Project onboarding</p><h1>Add a Project</h1><p>Choose the folder for this Project. AO will detect Git and available capabilities automatically.</p></div></header>
     <form method="post" action="/projects" class="task-form">
       ${error ? `<div class="alert error">${escapeHtml(error)}</div>` : ''}
       <label>Name<input name="name" maxlength="200" required></label>
       <label>Description<input name="description" maxlength="2000"></label>
-      <label>Resource type<select name="resourceType" required><option value="git-repository">Existing Git repository</option><option value="local-folder">Existing local folder</option><option value="none">No resource</option></select></label>
-      <label>Local path<input name="path" placeholder="/absolute/path/to/project"></label>
+      <label>Project files<select id="project-resource-type" name="resourceType" required><option value="local-folder">Add Local Folder</option><option value="none">Start Without Files</option></select></label>
+      <label id="project-folder-path">Local folder path<input name="path" placeholder="/absolute/path/to/project" required></label>
       <p class="muted">AO performs bounded read only inspection. It does not install dependencies, execute discovered commands, or create a worktree during onboarding.</p>
       <div class="actions"><button>Add Project</button></div>
-    </form>`, 'projects');
+    </form>
+    <script>(()=>{const type=document.getElementById('project-resource-type');const label=document.getElementById('project-folder-path');const input=label.querySelector('input');const update=()=>{const files=type.value==='local-folder';label.hidden=!files;input.required=files};type.addEventListener('change',update);update()})();</script>`, 'projects');
+}
+
+function renderProjectResource(project: ProjectOnboardingResult): string {
+  if (project.repositoryReadiness.length) {
+    const repositoryRead = project.profile.capabilities.repositoryReadOnlyJobs === 'available' ? 'Available' : 'Unavailable';
+    const isolatedChanges = project.profile.capabilities.isolatedCodeChangeJobs === 'available' ? 'Available' : 'Unavailable';
+    return project.repositoryReadiness.map(repository => `<dl class="facts">
+      <div><dt>Detected resource</dt><dd>Git repository</dd></div>
+      <div><dt>Folder</dt><dd>${escapeHtml(repository.canonicalPath)}</dd></div>
+      <div><dt>Remote</dt><dd>${escapeHtml(repository.canonicalRemote ?? 'No remote configured')}</dd></div>
+      <div><dt>Branch</dt><dd>${escapeHtml(repository.detachedHead ? 'Detached HEAD' : repository.branch ?? 'Not detected')}</dd></div>
+      <div><dt>HEAD</dt><dd>${escapeHtml(repository.headCommit?.slice(0, 12) ?? 'Not detected')}</dd></div>
+      <div><dt>Working tree</dt><dd>${escapeHtml(repository.workingTree)}</dd></div>
+      <div><dt>Repository read</dt><dd>${repositoryRead}</dd></div>
+      <div><dt>Isolated code changes</dt><dd>${isolatedChanges}</dd></div>
+    </dl>`).join('');
+  }
+  if (project.localFolders.length) {
+    return `<dl class="facts">
+      <div><dt>Detected resource</dt><dd>Local folder</dd></div>
+      <div><dt>Folder</dt><dd>${escapeHtml(project.localFolders.map(value => value.canonicalPath).join(', '))}</dd></div>
+      <div><dt>Git repository</dt><dd>Not detected</dd></div>
+      <div><dt>File and context access</dt><dd>Available</dd></div>
+      <div><dt>Repository code change Jobs</dt><dd>Unavailable</dd></div>
+    </dl>`;
+  }
+  return '<dl class="facts"><div><dt>Files</dt><dd>No folder attached</dd></div><div><dt>Conversation and Inputs</dt><dd>Available</dd></div></dl>';
 }
 
 export function renderDashboard(

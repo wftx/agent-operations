@@ -10,7 +10,9 @@ Agent Operations already has authoritative logical Git repository identities, in
 
 ## Decision
 
-A Project is durable operator context. It may associate with an existing Git repository, an existing local folder, or no resource. Git Projects reuse the existing repository and checkout binding model. Local folders have installation scoped resource records. Resource free Projects still support conversation and Inputs, but repository execution remains unavailable.
+A Project is durable operator context. The operator may add a local folder or start without files. AO classifies the selected folder through bounded read only inspection. When the folder is a Git repository or worktree, the Project reuses the existing logical repository and installation local checkout binding model. Otherwise it receives an installation scoped local folder resource record. Projects without files still support conversation and Inputs, but repository execution remains unavailable.
+
+This simpler operator choice does not merge the underlying resource concepts. Logical Git identity, checkout binding, repository observation, and local folder state remain distinct durable records. Git detection preserves configured remote identity when present and records branch, HEAD, and working tree state without mutation. A repository without a remote retains a machine local identity. A parent folder that merely contains nested repositories remains a local folder. Nested repositories may be reported as inspection findings, but AO does not create bindings for them without explicit operator selection.
 
 Each Project has a provider neutral Profile. Bounded inspection records detected stack clues, package manager, candidate build, test, preview, and publish commands, documentation, warnings, constraints, and capability readiness. Inspection never executes a discovered command. Provider specific files such as `CLAUDE.md` may enrich the Profile but do not define it. A missing `AGENTS.md` is reported as a suggestion, not created automatically.
 

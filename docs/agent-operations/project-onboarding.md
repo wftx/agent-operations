@@ -1,12 +1,15 @@
 # Project Onboarding
 
-AO Web can add a Project with one of three starting resources:
+AO Web can add a Project with one of two operator choices:
 
-* Existing Git repository: AO inspects the selected checkout and reuses the logical repository and installation local checkout binding model. Repository read only and isolated code change Jobs are available when runtime configuration is also ready.
-* Existing local folder: AO records an installation local folder association and bounded Profile. Repository Jobs remain unavailable.
-* No resource: AO records context only. Orchestrator conversation and Inputs remain available.
+* Add Local Folder: AO performs bounded read only inspection and automatically determines whether the selected directory is a Git repository or worktree. A detected repository reuses the logical repository and installation local checkout binding model. An ordinary folder receives an installation local folder association instead.
+* Start Without Files: AO records context only. Orchestrator conversation and Inputs remain available.
 
-The readiness Profile records detected stack clues, package manager, candidate commands, deployment clues, documentation, warnings, known constraints, and current capability availability. Candidate commands are informational until a later authorized validation runs.
+Git detection records configured remote identity when present, branch or detached HEAD, current commit, and dirty or clean state. It does not change the checkout. A Git repository without a remote retains a machine local logical identity. Repository read only and isolated code change Jobs become available for a valid Git backed resource. They remain unavailable for an ordinary local folder.
+
+If the selected ordinary folder contains nested Git repositories, AO reports their relative paths but keeps the selected folder as a normal local folder. It does not silently bind a nested repository. The operator must explicitly select that nested repository in a separate onboarding action.
+
+The readiness Profile records the detected resource classification, stack clues, package manager, candidate commands, deployment clues, documentation, warnings, known constraints, and current capability availability. Candidate commands are informational until a later authorized validation runs.
 
 ## Documentation
 

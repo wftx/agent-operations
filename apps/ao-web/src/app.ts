@@ -93,13 +93,13 @@ export class OperatorWebApplication {
         if (!this.projects) throw new Error('Project onboarding is not configured.');
         const form = await request.formData();
         const resourceType = textValue(form, 'resourceType');
-        if (!['git-repository', 'local-folder', 'none'].includes(resourceType)) throw new Error('Invalid Project Resource type');
+        if (!['local-folder', 'none'].includes(resourceType)) throw new Error('Invalid Project Resource type');
         const result = await this.projects.createProject({
           name: textValue(form, 'name'),
           description: textValue(form, 'description'),
           resource: resourceType === 'none'
             ? { type: 'none' }
-            : { type: resourceType as 'git-repository' | 'local-folder', path: textValue(form, 'path') },
+            : { type: 'local-folder', path: textValue(form, 'path') },
         });
         return redirect(`/projects#${encodeURIComponent(result.project.id)}`);
       }

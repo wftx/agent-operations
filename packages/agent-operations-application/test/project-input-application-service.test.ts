@@ -37,27 +37,36 @@ describe('Project and Input application services', () => {
 
   it('onboards Git, local folder, and resource free Projects without executing discovered commands', async () => {
     const store = new InMemoryAgentOperationsStateStore();
-    const repositories: RepositoryInventoryAdapter = { inspectRepository: async () => ({
+    const repositories: RepositoryInventoryAdapter = { inspectRepository: async path => path === '/projects/example' ? ({
       id: 'remote:github.com/example/site', identityKind: 'remote', name: 'site',
-      checkoutPath: '/projects/example', repositoryRoot: '/projects/example', availability: 'available',
+      checkoutPath: path, repositoryRoot: path, availability: 'available',
       branch: 'main', detachedHead: false, headCommit: 'a'.repeat(40), workingTree: 'clean',
       remotes: [{ name: 'origin', fetchUrl: 'https://github.com/example/site.git', identity: { host: 'github.com', repositoryPath: 'example/site', canonical: 'github.com/example/site' } }],
       primaryRemote: { name: 'origin', fetchUrl: 'https://github.com/example/site.git', identity: { host: 'github.com', repositoryPath: 'example/site', canonical: 'github.com/example/site' } },
       observedAt: TIME,
+    }) : ({
+      id: 'local:notes', identityKind: 'local', name: 'notes', checkoutPath: path,
+      availability: 'not-a-repository', detachedHead: false, workingTree: 'unknown', remotes: [],
+      observedAt: TIME, reason: 'Path is not inside a Git repository',
     }) };
-    const inspector: ProjectResourceInspectionAdapter = { inspectLocalFolder: async () => profile };
+    const inspector: ProjectResourceInspectionAdapter = { inspectLocalFolder: async path => ({
+      ...profile, canonicalPath: path, fingerprint: path === '/projects/example' ? 'a'.repeat(64) : 'b'.repeat(64),
+    }) };
     let sequence = 0;
     const projects = new ProjectApplicationService(store, repositories, inspector, {
       now: () => new Date(TIME), projectIdFactory: () => `project:${++sequence}`,
     });
 
-    const git = await projects.createProject({ name: 'Site', resource: { type: 'git-repository', path: '/projects/example' } });
-    const folder = await projects.createProject({ name: 'Notes', resource: { type: 'local-folder', path: '/projects/example' } });
+    const git = await projects.createProject({ name: 'Site', resource: { type: 'local-folder', path: '/projects/example' } });
+    const folder = await projects.createProject({ name: 'Notes', resource: { type: 'local-folder', path: '/projects/notes' } });
     const context = await projects.createProject({ name: 'Strategy', resource: { type: 'none' } });
 
     expect(git.repositories[0]?.id).toBe('remote:github.com/example/site');
+    expect(git.repositoryReadiness[0]).toMatchObject({
+      canonicalRemote: 'github.com/example/site', branch: 'main', workingTree: 'clean',
+    });
     expect(git.profile.capabilities.isolatedCodeChangeJobs).toBe('available');
-    expect(folder.localFolders[0]).toMatchObject({ canonicalPath: '/projects/example', availability: 'available' });
+    expect(folder.localFolders[0]).toMatchObject({ canonicalPath: '/projects/notes', availability: 'available' });
     expect(folder.profile.capabilities.repositoryReadOnlyJobs).toBe('unavailable');
     expect(context.profile.resourceSummary).toBe('No resource attached');
     expect(context.profile.capabilities.inputs).toBe('available');

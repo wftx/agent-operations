@@ -18,6 +18,8 @@ import type {
   DurableLocalFolderResource,
   DurableProjectProfile,
   InputMetadata,
+  RepositoryAvailability,
+  WorkingTreeState,
 } from '../../agent-operations-contracts/src/index.js';
 
 export type { RuntimeStartResult } from '../../agent-operations-contracts/src/index.js';
@@ -47,7 +49,19 @@ export interface ProjectOnboardingResult {
   readonly project: DurableProject;
   readonly repositories: readonly DurableRepository[];
   readonly localFolders: readonly DurableLocalFolderResource[];
+  readonly repositoryReadiness: readonly ProjectRepositoryReadiness[];
   readonly profile: DurableProjectProfile;
+}
+
+export interface ProjectRepositoryReadiness {
+  readonly repositoryId: string;
+  readonly canonicalPath: string;
+  readonly canonicalRemote?: string;
+  readonly availability: RepositoryAvailability;
+  readonly branch?: string;
+  readonly detachedHead: boolean;
+  readonly headCommit?: string;
+  readonly workingTree: WorkingTreeState;
 }
 
 export interface ProjectApplication {
