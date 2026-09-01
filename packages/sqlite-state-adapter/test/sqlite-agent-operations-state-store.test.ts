@@ -89,11 +89,49 @@ describe('SQLite Agent Operations state store', () => {
       { version: 10, name: 'daily-operator-runs-guidance-and-notifications' },
       { version: 11, name: 'late-execution-reconciliation' },
       { version: 12, name: 'isolated-write-job-workspaces' },
+      { version: 13, name: 'project-onboarding-and-job-inputs' },
     ]);
     database.close();
 
     const reopened = open(databasePath);
     expect(await reopened.getInstallation()).toMatchObject({ id: INSTALLATION_ID, createdAt: TIME });
+    await reopened.close();
+  });
+
+  it('persists Project Resources, Profiles, and immutable Input associations across reopen', async () => {
+    const databasePath = temporaryPath('state.db');
+    const store = open(databasePath);
+    await store.applyProjectConfiguration(configuration());
+    await store.createLocalFolderResource({
+      id: `resource:folder:${'a'.repeat(64)}`, projectId: 'ao', installationId: INSTALLATION_ID,
+      canonicalPath: '/projects/context', fingerprint: 'b'.repeat(64), availability: 'available',
+      firstSeenAt: TIME, lastSeenAt: TIME,
+    });
+    await store.saveProjectProfile({
+      projectId: 'ao', resourceSummary: 'Existing Git repository', detectedStack: ['Node.js'],
+      packageManager: 'npm', buildCommandCandidates: ['npm run build'], testCommandCandidates: [],
+      previewCommandCandidates: [], deploymentClues: [], documentation: [],
+      capabilities: {
+        repositoryReadOnlyJobs: 'available', isolatedCodeChangeJobs: 'available',
+        boundedFileInspection: 'available', inputs: 'available', orchestratorConversation: 'available',
+        build: 'detected-unvalidated', preview: 'unknown', publish: 'unknown',
+      },
+      warnings: [], knownConstraints: [], agentsFileSuggestion: true, inspectedAt: TIME, revision: 0,
+    });
+    await store.createInput({
+      id: 'input:one', displayName: 'brief.pdf', mimeType: 'application/pdf', byteSize: 42,
+      sha256: 'c'.repeat(64), sourceType: 'uploaded-file', projectId: 'ao',
+      storageReference: '/private/ao/inputs/one/content', ingestionState: 'complete',
+      validationState: 'valid', createdAt: TIME,
+    });
+    await store.associateInputsWithConversation('conversation:one', ['input:one']);
+    await store.close();
+
+    const reopened = open(databasePath);
+    expect(await reopened.listLocalFolderResources('ao')).toHaveLength(1);
+    expect(await reopened.getProjectProfile('ao')).toMatchObject({ projectId: 'ao', detectedStack: ['Node.js'] });
+    expect(await reopened.getInput('input:one')).toMatchObject({ displayName: 'brief.pdf', byteSize: 42 });
+    expect(await reopened.listConversationInputIds('conversation:one')).toEqual(['input:one']);
     await reopened.close();
   });
 
@@ -269,7 +307,7 @@ describe('SQLite Agent Operations state store', () => {
       installationIdFactory: () => INSTALLATION_ID,
       now: () => new Date(TIME),
       additionalMigrations: [{
-        version: 13,
+        version: 14,
         name: 'deliberate-test-failure',
         up: database => {
           database.exec('CREATE TABLE should_rollback (id TEXT)');
@@ -283,7 +321,7 @@ describe('SQLite Agent Operations state store', () => {
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'should_rollback'",
     ).get()).toBeUndefined();
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }]);
     database.close();
 
     const corruptPath = temporaryPath('corrupt.db');

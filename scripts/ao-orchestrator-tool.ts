@@ -7,6 +7,8 @@ import { CortextOSConversationStateRepository } from '../packages/cortextos-conv
 const TOOL_NAMES = new Set<OrchestratorToolName>([
   'ao.projects.list',
   'ao.projects.get',
+  'ao.inputs.list',
+  'ao.inputs.get',
   'ao.jobs.create',
   'ao.jobs.get',
   'ao.jobs.list',

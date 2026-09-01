@@ -34,7 +34,7 @@ async function readBody(request: IncomingMessage): Promise<Buffer> {
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
-    if (size > 64 * 1024) throw new Error('Operator request body exceeds 64 KiB');
+    if (size > 12 * 1024 * 1024) throw new Error('Operator request body exceeds 12 MiB');
     chunks.push(buffer);
   }
   return Buffer.concat(chunks);

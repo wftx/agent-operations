@@ -28,6 +28,7 @@ interface CorrelatedTurnRecord {
   readonly workingDirectory?: string;
   readonly repositoryReadRoot?: string;
   readonly repositoryWriteRoot?: string;
+  readonly inputIds?: readonly string[];
   readonly effectivePolicy?: {
     readonly version: 1;
     readonly filesystem: 'none' | 'read-only' | 'workspace-write';
@@ -40,6 +41,7 @@ interface CorrelatedTurnRecord {
     readonly repositoryPatch?: boolean;
     readonly testRun?: boolean;
     readonly gitInspect?: boolean;
+    readonly inputRead?: boolean;
   };
   readonly repositoryReadOperations?: readonly {
     readonly operation: 'list' | 'read' | 'search';
@@ -208,6 +210,7 @@ export class CortextOSExecutionObserver implements RuntimeExecutionObservationAd
             ...(record.repositoryWriteRoot
               ? { repositoryWriteRoot: record.repositoryWriteRoot }
               : {}),
+            ...(record.inputIds?.length ? { inputIds: [...record.inputIds] } : {}),
           }
         : undefined;
       const effectivePolicy = parseExecutionPolicy(record.effectivePolicy);
@@ -292,7 +295,7 @@ function parseExecutionCapabilities(
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const capabilities = value as Record<string, unknown>;
   if (capabilities.version !== 1 || typeof capabilities.repositoryRead !== 'boolean') return undefined;
-  for (const field of ['repositoryPatch', 'testRun', 'gitInspect'] as const) {
+  for (const field of ['repositoryPatch', 'testRun', 'gitInspect', 'inputRead'] as const) {
     if (capabilities[field] !== undefined && typeof capabilities[field] !== 'boolean') return undefined;
   }
   return {
@@ -303,6 +306,7 @@ function parseExecutionCapabilities(
       : {}),
     ...(capabilities.testRun !== undefined ? { testRun: capabilities.testRun as boolean } : {}),
     ...(capabilities.gitInspect !== undefined ? { gitInspect: capabilities.gitInspect as boolean } : {}),
+    ...(capabilities.inputRead !== undefined ? { inputRead: capabilities.inputRead as boolean } : {}),
   };
 }
 

@@ -41,6 +41,7 @@ export interface RuntimeExecutionCapabilities {
   readonly repositoryPatch?: boolean;
   readonly testRun?: boolean;
   readonly gitInspect?: boolean;
+  readonly inputRead?: boolean;
 }
 
 export const NO_RUNTIME_EXECUTION_CAPABILITIES: RuntimeExecutionCapabilities = {
@@ -77,6 +78,8 @@ export interface RuntimeExecutionContext {
   readonly repositoryReadRoot?: string;
   /** Present only for an isolated write Worker and equal to workingDirectory. */
   readonly repositoryWriteRoot?: string;
+  /** Immutable AO Input allowlist resolved from the Job, never model supplied. */
+  readonly inputIds?: readonly string[];
 }
 
 export const RESTRICTED_TEXT_EXECUTION_POLICY: RuntimeExecutionPolicy = {
@@ -118,7 +121,7 @@ export function createRuntimeExecutionCapabilities(
   if (typeof capabilities.repositoryRead !== 'boolean') {
     throw new Error('Runtime repository-read capability must be boolean');
   }
-  for (const field of ['repositoryPatch', 'testRun', 'gitInspect'] as const) {
+  for (const field of ['repositoryPatch', 'testRun', 'gitInspect', 'inputRead'] as const) {
     if (capabilities[field] !== undefined && typeof capabilities[field] !== 'boolean') {
       throw new Error(`Runtime ${field} capability must be boolean`);
     }
@@ -131,6 +134,7 @@ export function createRuntimeExecutionCapabilities(
       : {}),
     ...(capabilities.testRun !== undefined ? { testRun: capabilities.testRun } : {}),
     ...(capabilities.gitInspect !== undefined ? { gitInspect: capabilities.gitInspect } : {}),
+    ...(capabilities.inputRead !== undefined ? { inputRead: capabilities.inputRead } : {}),
   };
 }
 
@@ -142,7 +146,8 @@ export function isRuntimeExecutionCapabilitiesNoBroaderThan(
     && (!effective.repositoryRead || requested.repositoryRead)
     && (!effective.repositoryPatch || requested.repositoryPatch === true)
     && (!effective.testRun || requested.testRun === true)
-    && (!effective.gitInspect || requested.gitInspect === true);
+    && (!effective.gitInspect || requested.gitInspect === true)
+    && (!effective.inputRead || requested.inputRead === true);
 }
 
 /** True when effective authority is equal to or narrower than requested authority. */
@@ -223,6 +228,7 @@ export interface DurableExecutionPlan {
   readonly checkoutBindingId?: string;
   /** Present only when execution targets an AO-owned isolated Job worktree. */
   readonly repositoryWorkspaceId?: string;
+  readonly inputIds?: readonly string[];
   readonly input: ExecutionInputEnvelope;
   /** Absent only for truthful legacy Plans created before policy schema v6. */
   readonly requestedPolicy?: RuntimeExecutionPolicy;
@@ -279,6 +285,8 @@ export type ExecutionPreflightFindingCode =
   | 'test-run-capability-unsupported'
   | 'git-inspection-capability-supported'
   | 'git-inspection-capability-unsupported'
+  | 'input-read-capability-supported'
+  | 'input-read-capability-unsupported'
   | 'repository-workspace-valid'
   | 'repository-workspace-invalid'
   | 'repository-read-root-valid'

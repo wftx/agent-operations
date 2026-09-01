@@ -103,6 +103,7 @@ export class ExecutionPreflightService {
       ['repositoryPatch', 'repository-write-tools', 'repository-write-capability-supported', 'repository-write-capability-unsupported'],
       ['testRun', 'test-run-tools', 'test-run-capability-supported', 'test-run-capability-unsupported'],
       ['gitInspect', 'git-inspection-tools', 'git-inspection-capability-supported', 'git-inspection-capability-unsupported'],
+      ['inputRead', 'input-read-tools', 'input-read-capability-supported', 'input-read-capability-unsupported'],
     ] as const;
     for (const [field, capability, passCode, failCode] of optional) {
       if (requested[field] !== true) continue;
@@ -470,6 +471,9 @@ export class ExecutionPreflightService {
             workingDirectory: observedRoot,
             repositoryReadRoot: observedRoot,
             ...(writeExecution ? { repositoryWriteRoot: observedRoot } : {}),
+            ...(effectiveCapabilities?.inputRead && plan.inputIds?.length
+              ? { inputIds: [...plan.inputIds] }
+              : {}),
           }
         : null;
     } catch (error) {

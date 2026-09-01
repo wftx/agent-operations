@@ -15,6 +15,9 @@ import type {
   RuntimeStartResult,
   JobExecutionMode,
   DurableRepositoryWorkspace,
+  DurableLocalFolderResource,
+  DurableProjectProfile,
+  InputMetadata,
 } from '../../agent-operations-contracts/src/index.js';
 
 export type { RuntimeStartResult } from '../../agent-operations-contracts/src/index.js';
@@ -26,6 +29,52 @@ export interface OperatorTaskInput {
   readonly task: string;
   readonly acceptanceCriteria: string;
   readonly executionMode?: JobExecutionMode;
+  readonly inputIds?: readonly string[];
+}
+
+export type CreateProjectResourceInput =
+  | { readonly type: 'git-repository'; readonly path: string }
+  | { readonly type: 'local-folder'; readonly path: string }
+  | { readonly type: 'none' };
+
+export interface CreateProjectInput {
+  readonly name: string;
+  readonly description?: string;
+  readonly resource: CreateProjectResourceInput;
+}
+
+export interface ProjectOnboardingResult {
+  readonly project: DurableProject;
+  readonly repositories: readonly DurableRepository[];
+  readonly localFolders: readonly DurableLocalFolderResource[];
+  readonly profile: DurableProjectProfile;
+}
+
+export interface ProjectApplication {
+  createProject(input: CreateProjectInput): Promise<ProjectOnboardingResult>;
+  getProject(projectId: string): Promise<ProjectOnboardingResult>;
+  listProjects(): Promise<readonly ProjectOnboardingResult[]>;
+}
+
+export interface CreateUploadedInputRequest {
+  readonly displayName: string;
+  readonly mimeType?: string;
+  readonly bytes: Uint8Array;
+  readonly projectId?: string;
+}
+
+export interface CreateUrlInputRequest {
+  readonly url: string;
+  readonly projectId?: string;
+}
+
+export interface InputApplication {
+  createUploadedInput(input: CreateUploadedInputRequest): Promise<InputMetadata>;
+  createUrlInput(input: CreateUrlInputRequest): Promise<InputMetadata>;
+  getInput(inputId: string): Promise<InputMetadata>;
+  listInputs(projectId?: string): Promise<readonly InputMetadata[]>;
+  readInput(inputId: string): Promise<Uint8Array>;
+  associateWithConversation(conversationId: string, inputIds: readonly string[]): Promise<void>;
 }
 
 export interface OperatorPolicyDefaults {
@@ -54,6 +103,7 @@ export interface OperatorTaskPreview {
   readonly defaults: OperatorPolicyDefaults;
   readonly executionMode?: JobExecutionMode;
   readonly executionAuthorized: false;
+  readonly inputIds?: readonly string[];
 }
 
 export type OperatorRunStatus = 'pending' | 'running' | 'done' | 'needs-human' | 'failed' | 'cancelled';
@@ -131,6 +181,7 @@ export interface OperatorJobDetail {
   readonly finalReview?: DurableAttemptReview;
   readonly completedAt?: string;
   readonly repositoryWorkspace?: DurableRepositoryWorkspace;
+  readonly inputs?: readonly InputMetadata[];
 }
 
 export type OperatorJobList = 'all' | 'running' | 'needs-human' | 'done';
@@ -153,6 +204,8 @@ export interface OperatorApplication {
 export type OrchestratorToolName =
   | 'ao.projects.list'
   | 'ao.projects.get'
+  | 'ao.inputs.list'
+  | 'ao.inputs.get'
   | 'ao.jobs.create'
   | 'ao.jobs.get'
   | 'ao.jobs.list'
@@ -173,6 +226,7 @@ export interface OrchestratorToolResult {
 export interface OrchestratorTurnInput {
   readonly message: string;
   readonly projectId?: string;
+  readonly inputIds?: readonly string[];
 }
 
 export interface OrchestratorConversationTurn {
@@ -180,6 +234,7 @@ export interface OrchestratorConversationTurn {
   readonly operatorMessage: string;
   readonly response?: string;
   readonly projectId?: string;
+  readonly inputIds?: readonly string[];
   readonly relatedJobIds: readonly string[];
   readonly clarificationRequired: boolean;
   readonly status: 'pending' | 'completed' | 'failed';

@@ -666,6 +666,7 @@ export interface RuntimeExecutionCapabilitiesEnvelope {
   readonly testRun?: boolean;
   readonly gitInspect?: boolean;
   readonly agentOperationsControl?: boolean;
+  readonly inputRead?: boolean;
 }
 
 /** Provider-neutral per-turn execution context supplied by Agent Operations. */
@@ -673,6 +674,7 @@ export interface RuntimeExecutionContextEnvelope {
   readonly workingDirectory: string;
   readonly repositoryReadRoot?: string;
   readonly repositoryWriteRoot?: string;
+  readonly inputIds?: readonly string[];
 }
 
 export type IPCCommandType =

@@ -1,4 +1,7 @@
 import type {
+  AgentOperationsStateStore,
+} from '../../agent-operations-contracts/src/index.js';
+import type {
   OrchestratorConversationRuntime,
   OrchestratorConversationService,
   OrchestratorConversationState,
@@ -8,14 +11,36 @@ import type {
 
 /** Thin application boundary. CortextOS owns the session and conversation records. */
 export class OrchestratorConversationApplicationService implements OrchestratorConversationService {
-  constructor(private readonly runtime: OrchestratorConversationRuntime) {}
+  constructor(
+    private readonly runtime: OrchestratorConversationRuntime,
+    private readonly store?: AgentOperationsStateStore,
+  ) {}
 
   async sendTurn(input: OrchestratorTurnInput): Promise<OrchestratorTurnResult> {
     const message = requiredText(input.message, 'Message', 16_384);
     const projectId = input.projectId === undefined
       ? undefined
       : requiredText(input.projectId, 'Project ID', 500);
-    return this.runtime.sendTurn({ message, ...(projectId ? { projectId } : {}) });
+    const inputIds = [...new Set(input.inputIds ?? [])];
+    if (inputIds.length > 20) throw new Error('A conversation turn supports at most 20 Inputs');
+    if (this.store) {
+      for (const inputId of inputIds) {
+        const durableInput = await this.store.getInput(inputId);
+        if (!durableInput) throw new Error(`Input not found: ${inputId}`);
+        if (projectId && durableInput.projectId && durableInput.projectId !== projectId) {
+          throw new Error(`Input ${inputId} belongs to another Project`);
+        }
+      }
+    } else if (inputIds.length) {
+      throw new Error('Conversation Inputs are not configured');
+    }
+    const result = await this.runtime.sendTurn({
+      message,
+      ...(projectId ? { projectId } : {}),
+      ...(inputIds.length ? { inputIds } : {}),
+    });
+    if (this.store && inputIds.length) await this.store.associateInputsWithConversation(result.turn.id, inputIds);
+    return result;
   }
 
   getConversationState(): Promise<OrchestratorConversationState> {

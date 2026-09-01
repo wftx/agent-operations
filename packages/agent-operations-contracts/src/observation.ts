@@ -61,7 +61,7 @@ export interface RuntimeExecutionObservation {
 }
 
 export interface RuntimeToolOperation {
-  readonly namespace: 'repository' | 'test' | 'git';
+  readonly namespace: 'repository' | 'test' | 'git' | 'inputs';
   readonly operation: string;
   readonly success: boolean;
   readonly occurredAt: string;

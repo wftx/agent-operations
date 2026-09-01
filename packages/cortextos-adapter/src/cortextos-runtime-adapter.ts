@@ -79,6 +79,7 @@ function capabilitiesFor(provider: RuntimeProvider): readonly RuntimeCapability[
         'exact-turn-correlation',
         'execution-working-directory',
         'repository-read-tools',
+        'input-read-tools',
         'repository-write-tools',
         'test-run-tools',
         'git-inspection-tools',

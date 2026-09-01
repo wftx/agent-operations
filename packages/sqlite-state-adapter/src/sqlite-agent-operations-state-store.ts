@@ -48,6 +48,12 @@ import type {
   JobExecutionMode,
   RepositoryWorkspaceState,
   RuntimeToolOperation,
+  DurableLocalFolderResource,
+  DurableProjectProfile,
+  ProjectDocumentationEntry,
+  ProjectCapabilityReadiness,
+  DurableInput,
+  InputSourceType,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   createRepositoryCheckoutBindingId,
@@ -72,8 +78,54 @@ export interface SqliteAgentOperationsStateStoreOptions {
 interface ProjectRow {
   id: string;
   name: string;
+  description?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+interface LocalFolderRow {
+  id: string;
+  project_id: string;
+  installation_id: string;
+  canonical_path: string;
+  fingerprint: string;
+  availability: 'available' | 'unavailable';
+  first_seen_at: string;
+  last_seen_at: string;
+}
+
+interface ProjectProfileRow {
+  project_id: string;
+  resource_summary: string;
+  detected_stack_json: string;
+  package_manager: string | null;
+  build_commands_json: string;
+  test_commands_json: string;
+  preview_commands_json: string;
+  deployment_clues_json: string;
+  documentation_json: string;
+  capabilities_json: string;
+  warnings_json: string;
+  known_constraints_json: string;
+  agents_file_suggestion: number;
+  inspected_at: string;
+  revision: number;
+}
+
+interface InputRow {
+  id: string;
+  display_name: string;
+  mime_type: string;
+  byte_size: number;
+  sha256: string;
+  source_type: InputSourceType;
+  original_url: string | null;
+  final_url: string | null;
+  project_id: string | null;
+  storage_reference: string;
+  ingestion_state: 'complete';
+  validation_state: 'valid';
+  created_at: string;
 }
 
 interface RepositoryRow {
@@ -176,6 +228,7 @@ interface ExecutionPlanRow {
   requested_repository_patch?: number | null;
   requested_test_run?: number | null;
   requested_git_inspect?: number | null;
+  requested_input_read?: number | null;
   job_revision: number;
   attempt_revision: number;
   created_at: string;
@@ -198,6 +251,7 @@ interface ExecutionDispatchRow {
   effective_repository_patch?: number | null;
   effective_test_run?: number | null;
   effective_git_inspect?: number | null;
+  effective_input_read?: number | null;
   external_reference: string | null;
   message: string | null;
   revision: number;
@@ -234,6 +288,7 @@ interface ExecutionObservationRow {
   effective_repository_patch?: number | null;
   effective_test_run?: number | null;
   effective_git_inspect?: number | null;
+  effective_input_read?: number | null;
   tool_operations_json?: string | null;
   observed_at: string;
   recorded_at: string;
@@ -342,7 +397,71 @@ function rejectDuplicates(values: readonly string[], field: string): void {
 }
 
 function toProject(row: ProjectRow): DurableProject {
-  return { id: row.id, name: row.name, createdAt: row.created_at, updatedAt: row.updated_at };
+  return {
+    id: row.id,
+    name: row.name,
+    ...(row.description ? { description: row.description } : {}),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toLocalFolder(row: LocalFolderRow): DurableLocalFolderResource {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    installationId: row.installation_id,
+    canonicalPath: row.canonical_path,
+    fingerprint: row.fingerprint,
+    availability: row.availability,
+    firstSeenAt: row.first_seen_at,
+    lastSeenAt: row.last_seen_at,
+  };
+}
+
+function jsonArray<T>(value: string, field: string): readonly T[] {
+  const parsed = JSON.parse(value) as unknown;
+  if (!Array.isArray(parsed)) throw new Error(`Invalid ${field} JSON in Agent Operations state`);
+  return parsed as T[];
+}
+
+function toProjectProfile(row: ProjectProfileRow): DurableProjectProfile {
+  const capabilities = JSON.parse(row.capabilities_json) as ProjectCapabilityReadiness;
+  return {
+    projectId: row.project_id,
+    resourceSummary: row.resource_summary,
+    detectedStack: jsonArray<string>(row.detected_stack_json, 'detected stack'),
+    ...(row.package_manager ? { packageManager: row.package_manager } : {}),
+    buildCommandCandidates: jsonArray<string>(row.build_commands_json, 'build commands'),
+    testCommandCandidates: jsonArray<string>(row.test_commands_json, 'test commands'),
+    previewCommandCandidates: jsonArray<string>(row.preview_commands_json, 'preview commands'),
+    deploymentClues: jsonArray<string>(row.deployment_clues_json, 'deployment clues'),
+    documentation: jsonArray<ProjectDocumentationEntry>(row.documentation_json, 'documentation'),
+    capabilities,
+    warnings: jsonArray<string>(row.warnings_json, 'warnings'),
+    knownConstraints: jsonArray<string>(row.known_constraints_json, 'known constraints'),
+    agentsFileSuggestion: row.agents_file_suggestion === 1,
+    inspectedAt: row.inspected_at,
+    revision: row.revision,
+  };
+}
+
+function toInput(row: InputRow): DurableInput {
+  return {
+    id: row.id,
+    displayName: row.display_name,
+    mimeType: row.mime_type,
+    byteSize: row.byte_size,
+    sha256: row.sha256,
+    sourceType: row.source_type,
+    ...(row.original_url ? { originalUrl: row.original_url } : {}),
+    ...(row.final_url ? { finalUrl: row.final_url } : {}),
+    ...(row.project_id ? { projectId: row.project_id } : {}),
+    storageReference: row.storage_reference,
+    ingestionState: row.ingestion_state,
+    validationState: row.validation_state,
+    createdAt: row.created_at,
+  };
 }
 
 function toRepository(row: RepositoryRow): DurableRepository {
@@ -442,7 +561,7 @@ function toAttempt(row: AttemptRow): DurableJobAttempt {
   };
 }
 
-function toExecutionPlan(row: ExecutionPlanRow): DurableExecutionPlan {
+function toExecutionPlan(row: ExecutionPlanRow, inputIds: readonly string[] = []): DurableExecutionPlan {
   return {
     id: row.id,
     attemptId: row.attempt_id,
@@ -455,6 +574,7 @@ function toExecutionPlan(row: ExecutionPlanRow): DurableExecutionPlan {
     ...(row.repository_workspace_id
       ? { repositoryWorkspaceId: row.repository_workspace_id }
       : {}),
+    ...(inputIds.length ? { inputIds } : {}),
     input: { version: row.input_version, instruction: row.instruction },
     ...(row.requested_policy_version && row.requested_filesystem
       && row.requested_network && row.requested_environment
@@ -476,6 +596,7 @@ function toExecutionPlan(row: ExecutionPlanRow): DurableExecutionPlan {
             ...(row.requested_repository_patch === 1 ? { repositoryPatch: true } : {}),
             ...(row.requested_test_run === 1 ? { testRun: true } : {}),
             ...(row.requested_git_inspect === 1 ? { gitInspect: true } : {}),
+            ...(row.requested_input_read === 1 ? { inputRead: true } : {}),
           },
         }
       : {}),
@@ -514,6 +635,7 @@ function toExecutionDispatch(row: ExecutionDispatchRow): DurableExecutionDispatc
             ...(row.effective_repository_patch === 1 ? { repositoryPatch: true } : {}),
             ...(row.effective_test_run === 1 ? { testRun: true } : {}),
             ...(row.effective_git_inspect === 1 ? { gitInspect: true } : {}),
+            ...(row.effective_input_read === 1 ? { inputRead: true } : {}),
           },
         }
       : {}),
@@ -572,6 +694,7 @@ function toExecutionObservation(row: ExecutionObservationRow): DurableExecutionO
             ...(row.effective_repository_patch === 1 ? { repositoryPatch: true } : {}),
             ...(row.effective_test_run === 1 ? { testRun: true } : {}),
             ...(row.effective_git_inspect === 1 ? { gitInspect: true } : {}),
+            ...(row.effective_input_read === 1 ? { inputRead: true } : {}),
           },
         }
       : {}),
@@ -725,6 +848,7 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
   private readonly supportsDailyOperator: boolean;
   private readonly supportsLateExecutionReconciliation: boolean;
   private readonly supportsIsolatedWriteWorkspaces: boolean;
+  private readonly supportsProjectInputs: boolean;
 
   private constructor(databasePath: string, database: Database.Database) {
     this.databasePath = databasePath;
@@ -749,6 +873,9 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     ).get() as unknown) !== undefined;
     this.supportsIsolatedWriteWorkspaces = (database.prepare(
       "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'repository_workspaces'",
+    ).get() as unknown) !== undefined;
+    this.supportsProjectInputs = (database.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'inputs'",
     ).get() as unknown) !== undefined;
   }
 
@@ -799,10 +926,18 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     this.validateConfiguration(configuration);
     const apply = this.database.transaction(() => {
       const { project, repositories, checkoutBindings, runtimeAgentIds } = configuration;
-      this.database.prepare(`
-        INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at
-      `).run(project.id, project.name, project.createdAt, project.updatedAt);
+      if (this.supportsProjectInputs) {
+        this.database.prepare(`
+          INSERT INTO projects (id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name, description = excluded.description, updated_at = excluded.updated_at
+        `).run(project.id, project.name, project.description ?? null, project.createdAt, project.updatedAt);
+      } else {
+        this.database.prepare(`
+          INSERT INTO projects (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at
+        `).run(project.id, project.name, project.createdAt, project.updatedAt);
+      }
 
       for (const repository of repositories) {
         const existing = this.database.prepare(
@@ -923,6 +1058,168 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     return (this.database.prepare(
       'SELECT agent_id FROM project_runtime_agents WHERE project_id = ? ORDER BY agent_id',
     ).all(projectId) as Array<{ agent_id: string }>).map(row => row.agent_id);
+  }
+
+  async createLocalFolderResource(resource: DurableLocalFolderResource): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsProjectInputs) throw new Error('Project Resources require Agent Operations schema v13');
+    requireNonEmpty(resource.id, 'Project Resource ID');
+    requireNonEmpty(resource.canonicalPath, 'Project Resource canonical path');
+    requireNonEmpty(resource.fingerprint, 'Project Resource fingerprint');
+    const installation = await this.getInstallation();
+    if (resource.installationId !== installation.id) throw new Error('Project Resource belongs to another installation');
+    if (!await this.getProject(resource.projectId)) throw new Error(`Project not found: ${resource.projectId}`);
+    try {
+      this.database.prepare(`
+        INSERT INTO project_local_folders
+          (id, project_id, installation_id, canonical_path, fingerprint, availability, first_seen_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        resource.id, resource.projectId, resource.installationId, resource.canonicalPath,
+        resource.fingerprint, resource.availability, resource.firstSeenAt, resource.lastSeenAt,
+      );
+    } catch (error) {
+      throw new Error(`Could not create local folder resource: ${(error as Error).message}`);
+    }
+  }
+
+  async listLocalFolderResources(projectId?: string): Promise<readonly DurableLocalFolderResource[]> {
+    this.assertOpen();
+    if (!this.supportsProjectInputs) return [];
+    const rows = projectId
+      ? this.database.prepare('SELECT * FROM project_local_folders WHERE project_id = ? ORDER BY id').all(projectId)
+      : this.database.prepare('SELECT * FROM project_local_folders ORDER BY id').all();
+    return (rows as LocalFolderRow[]).map(toLocalFolder);
+  }
+
+  async saveProjectProfile(profile: DurableProjectProfile): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsProjectInputs) throw new Error('Project Profiles require Agent Operations schema v13');
+    if (!await this.getProject(profile.projectId)) throw new Error(`Project not found: ${profile.projectId}`);
+    const existing = this.database.prepare('SELECT revision FROM project_profiles WHERE project_id = ?')
+      .get(profile.projectId) as { revision: number } | undefined;
+    if (profile.revision !== (existing ? existing.revision + 1 : 0)) {
+      throw new Error(`Stale Project Profile revision for ${profile.projectId}`);
+    }
+    this.database.prepare(`
+      INSERT INTO project_profiles (
+        project_id, resource_summary, detected_stack_json, package_manager,
+        build_commands_json, test_commands_json, preview_commands_json,
+        deployment_clues_json, documentation_json, capabilities_json,
+        warnings_json, known_constraints_json, agents_file_suggestion, inspected_at, revision
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(project_id) DO UPDATE SET
+        resource_summary=excluded.resource_summary, detected_stack_json=excluded.detected_stack_json,
+        package_manager=excluded.package_manager, build_commands_json=excluded.build_commands_json,
+        test_commands_json=excluded.test_commands_json, preview_commands_json=excluded.preview_commands_json,
+        deployment_clues_json=excluded.deployment_clues_json, documentation_json=excluded.documentation_json,
+        capabilities_json=excluded.capabilities_json, warnings_json=excluded.warnings_json,
+        known_constraints_json=excluded.known_constraints_json,
+        agents_file_suggestion=excluded.agents_file_suggestion, inspected_at=excluded.inspected_at,
+        revision=excluded.revision
+    `).run(
+      profile.projectId, profile.resourceSummary, JSON.stringify(profile.detectedStack),
+      profile.packageManager ?? null, JSON.stringify(profile.buildCommandCandidates),
+      JSON.stringify(profile.testCommandCandidates), JSON.stringify(profile.previewCommandCandidates),
+      JSON.stringify(profile.deploymentClues), JSON.stringify(profile.documentation),
+      JSON.stringify(profile.capabilities), JSON.stringify(profile.warnings),
+      JSON.stringify(profile.knownConstraints), profile.agentsFileSuggestion ? 1 : 0,
+      profile.inspectedAt, profile.revision,
+    );
+  }
+
+  async getProjectProfile(projectId: string): Promise<DurableProjectProfile | null> {
+    this.assertOpen();
+    if (!this.supportsProjectInputs) return null;
+    const row = this.database.prepare('SELECT * FROM project_profiles WHERE project_id = ?')
+      .get(projectId) as ProjectProfileRow | undefined;
+    return row ? toProjectProfile(row) : null;
+  }
+
+  async createInput(input: DurableInput): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsProjectInputs) throw new Error('Inputs require Agent Operations schema v13');
+    if (!input.id.startsWith('input:')) throw new Error(`Invalid Input ID: ${input.id}`);
+    requireNonEmpty(input.displayName, 'Input display name');
+    if (!/^[a-f0-9]{64}$/.test(input.sha256) || input.byteSize < 0) throw new Error(`Invalid Input evidence: ${input.id}`);
+    if (input.projectId && !await this.getProject(input.projectId)) throw new Error(`Project not found: ${input.projectId}`);
+    this.database.prepare(`
+      INSERT INTO inputs (
+        id, display_name, mime_type, byte_size, sha256, source_type, original_url,
+        final_url, project_id, storage_reference, ingestion_state, validation_state, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.id, input.displayName, input.mimeType, input.byteSize, input.sha256,
+      input.sourceType, input.originalUrl ?? null, input.finalUrl ?? null,
+      input.projectId ?? null, input.storageReference, input.ingestionState,
+      input.validationState, input.createdAt,
+    );
+  }
+
+  async getInput(id: string): Promise<DurableInput | null> {
+    this.assertOpen();
+    if (!this.supportsProjectInputs) return null;
+    const row = this.database.prepare('SELECT * FROM inputs WHERE id = ?').get(id) as InputRow | undefined;
+    return row ? toInput(row) : null;
+  }
+
+  async listInputs(projectId?: string): Promise<readonly DurableInput[]> {
+    this.assertOpen();
+    if (!this.supportsProjectInputs) return [];
+    const rows = projectId
+      ? this.database.prepare('SELECT * FROM inputs WHERE project_id = ? ORDER BY created_at, id').all(projectId)
+      : this.database.prepare('SELECT * FROM inputs ORDER BY created_at, id').all();
+    return (rows as InputRow[]).map(toInput);
+  }
+
+  async associateInputsWithConversation(conversationId: string, inputIds: readonly string[]): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsProjectInputs) throw new Error('Conversation Inputs require Agent Operations schema v13');
+    requireNonEmpty(conversationId, 'Conversation ID');
+    rejectDuplicates(inputIds, 'Input ID');
+    const insert = this.database.prepare(
+      'INSERT INTO conversation_inputs (conversation_id, input_id) VALUES (?, ?)',
+    );
+    const apply = this.database.transaction(() => {
+      for (const inputId of inputIds) insert.run(conversationId, inputId);
+    });
+    apply();
+  }
+
+  async listConversationInputIds(conversationId: string): Promise<readonly string[]> {
+    this.assertOpen();
+    if (!this.supportsProjectInputs) return [];
+    return (this.database.prepare(
+      'SELECT input_id FROM conversation_inputs WHERE conversation_id = ? ORDER BY input_id',
+    ).all(conversationId) as Array<{ input_id: string }>).map(row => row.input_id);
+  }
+
+  async attachInputsToJob(jobId: string, inputIds: readonly string[]): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsProjectInputs) throw new Error('Job Inputs require Agent Operations schema v13');
+    rejectDuplicates(inputIds, 'Input ID');
+    const job = await this.getJob(jobId);
+    if (!job) throw new Error(`Job not found: ${jobId}`);
+    const insert = this.database.prepare('INSERT INTO job_inputs (job_id, input_id) VALUES (?, ?)');
+    const apply = this.database.transaction(() => {
+      for (const inputId of inputIds) {
+        const input = this.database.prepare('SELECT project_id FROM inputs WHERE id = ?')
+          .get(inputId) as { project_id: string | null } | undefined;
+        if (!input) throw new Error(`Input not found: ${inputId}`);
+        if (input.project_id && input.project_id !== job.projectId) {
+          throw new Error(`Input ${inputId} belongs to another Project`);
+        }
+        insert.run(jobId, inputId);
+      }
+    });
+    apply();
+  }
+
+  async listJobInputIds(jobId: string): Promise<readonly string[]> {
+    this.assertOpen();
+    if (!this.supportsProjectInputs) return [];
+    return (this.database.prepare('SELECT input_id FROM job_inputs WHERE job_id = ? ORDER BY input_id')
+      .all(jobId) as Array<{ input_id: string }>).map(row => row.input_id);
   }
 
   async recordRepositoryObservation(observation: DurableRepositoryObservation): Promise<void> {
@@ -1440,6 +1737,17 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         throw new Error(`Invalid Execution Plan Repository Workspace: ${plan.id}`);
       }
     }
+    if (this.supportsProjectInputs) {
+      rejectDuplicates(plan.inputIds ?? [], 'Execution Plan Input ID');
+      for (const inputId of plan.inputIds ?? []) {
+        const attached = this.database.prepare(
+          'SELECT 1 FROM job_inputs WHERE job_id = ? AND input_id = ?',
+        ).get(plan.jobId, inputId);
+        if (!attached) throw new Error(`Execution Plan Input is not attached to Job: ${inputId}`);
+      }
+    } else if (plan.inputIds?.length || plan.requestedCapabilities?.inputRead) {
+      throw new Error('Execution Plan Inputs require Agent Operations schema v13');
+    }
     try {
       const common = [
         plan.id,
@@ -1522,6 +1830,14 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(...common);
       }
+      if (this.supportsProjectInputs) {
+        this.database.prepare('UPDATE execution_plans SET requested_input_read = ? WHERE id = ?')
+          .run(plan.requestedCapabilities?.inputRead ? 1 : 0, plan.id);
+        const insertInput = this.database.prepare(
+          'INSERT INTO execution_plan_inputs (execution_plan_id, input_id) VALUES (?, ?)',
+        );
+        for (const inputId of plan.inputIds ?? []) insertInput.run(plan.id, inputId);
+      }
     } catch (error) {
       throw new Error(`Could not create Execution Plan ${plan.id}: ${(error as Error).message}`);
     }
@@ -1531,14 +1847,21 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     this.assertOpen();
     const row = this.database.prepare('SELECT * FROM execution_plans WHERE id = ?')
       .get(id) as ExecutionPlanRow | undefined;
-    return row ? toExecutionPlan(row) : null;
+    return row ? toExecutionPlan(row, this.listExecutionPlanInputIds(id)) : null;
   }
 
   async getExecutionPlanForAttempt(attemptId: string): Promise<DurableExecutionPlan | null> {
     this.assertOpen();
     const row = this.database.prepare('SELECT * FROM execution_plans WHERE attempt_id = ?')
       .get(attemptId) as ExecutionPlanRow | undefined;
-    return row ? toExecutionPlan(row) : null;
+    return row ? toExecutionPlan(row, this.listExecutionPlanInputIds(row.id)) : null;
+  }
+
+  private listExecutionPlanInputIds(planId: string): readonly string[] {
+    if (!this.supportsProjectInputs) return [];
+    return (this.database.prepare(
+      'SELECT input_id FROM execution_plan_inputs WHERE execution_plan_id = ? ORDER BY input_id',
+    ).all(planId) as Array<{ input_id: string }>).map(value => value.input_id);
   }
 
   async createExecutionDispatch(dispatch: DurableExecutionDispatch): Promise<void> {
@@ -1742,6 +2065,11 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
             WHERE id = ? AND revision = ?
           `).run(...common, dispatch.id, expectedRevision);
       if (result.changes !== 1) throw new Error(`Stale Execution Dispatch revision for ${dispatch.id}`);
+      if (this.supportsProjectInputs) {
+        this.database.prepare('UPDATE execution_dispatches SET effective_input_read = ? WHERE id = ?')
+          .run(dispatch.effectiveCapabilities?.inputRead === undefined
+            ? null : dispatch.effectiveCapabilities.inputRead ? 1 : 0, dispatch.id);
+      }
     } catch (error) {
       throw new Error(`Could not transition Execution Dispatch ${dispatch.id}: ${(error as Error).message}`);
     }
@@ -1902,6 +2230,11 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
              output_summary, observed_at, recorded_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(...common, observation.observedAt, observation.recordedAt);
+      }
+      if (this.supportsProjectInputs) {
+        this.database.prepare('UPDATE execution_observations SET effective_input_read = ? WHERE id = ?')
+          .run(observation.effectiveCapabilities?.inputRead === undefined
+            ? null : observation.effectiveCapabilities.inputRead ? 1 : 0, observation.id);
       }
       return true;
     } catch (error) {

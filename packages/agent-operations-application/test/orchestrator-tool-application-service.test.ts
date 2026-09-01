@@ -3,6 +3,7 @@ import type {
   OperatorApplication,
   OperatorJobDetail,
   OperatorProjectOption,
+  InputApplication,
 } from '../src/index.js';
 import { OrchestratorToolApplicationService } from '../src/index.js';
 
@@ -93,6 +94,20 @@ describe('OrchestratorToolApplicationService', () => {
       relatedJobIds: ['job:created'],
     });
   });
+
+  it('lists Input metadata and attaches exact Input IDs to Job creation', async () => {
+    const operator = fakeOperator();
+    const inputs = fakeInputs();
+    const tools = new OrchestratorToolApplicationService(operator, inputs);
+    const listed = await tools.execute({ name: 'ao.inputs.list', arguments: { projectId: PROJECT.project.id } });
+    const created = await tools.execute({
+      name: 'ao.jobs.create',
+      arguments: validCreate({ inputIds: ['input:brief'] }),
+    });
+    expect(listed).toMatchObject({ ok: true, data: [{ id: 'input:brief', displayName: 'brief.pdf' }] });
+    expect(operator.runOperatorJob).toHaveBeenCalledWith(expect.objectContaining({ inputIds: ['input:brief'] }));
+    expect(created.ok).toBe(true);
+  });
 });
 
 function validCreate(overrides: Record<string, unknown> = {}) {
@@ -132,5 +147,16 @@ function fakeOperator(): OperatorApplication {
     cancelEscalatedJob: vi.fn(),
     listJobs: vi.fn(async () => []),
     getJobDetail: vi.fn(async () => detail),
+  };
+}
+
+function fakeInputs(): InputApplication {
+  const metadata = {
+    id: 'input:brief', displayName: 'brief.pdf', mimeType: 'application/pdf', byteSize: 42,
+    sha256: 'a'.repeat(64), sourceType: 'uploaded-file' as const, projectId: PROJECT.project.id, createdAt: TIME,
+  };
+  return {
+    createUploadedInput: vi.fn(), createUrlInput: vi.fn(), readInput: vi.fn(), associateWithConversation: vi.fn(),
+    getInput: vi.fn(async () => metadata), listInputs: vi.fn(async () => [metadata]),
   };
 }

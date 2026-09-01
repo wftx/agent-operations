@@ -1,10 +1,14 @@
 import {
   NoopOperatorNotifier,
   OperatorApplicationService,
+  ProjectApplicationService,
+  InputApplicationService,
   OrchestratorConversationApplicationService,
   OrchestratorToolApplicationService,
   type OperatorApplication,
   type OrchestratorConversationService,
+  type ProjectApplication,
+  type InputApplication,
 } from '../../agent-operations-application/src/index.js';
 import { OrchestrationService, RepositoryWorkspaceService } from '../../agent-operations-core/src/index.js';
 import {
@@ -16,6 +20,11 @@ import { CortextOSExecutionAdapter } from '../../cortextos-execution-adapter/src
 import { CortextOSExecutionObserver } from '../../cortextos-execution-observer/src/index.js';
 import { GitRepositoryAdapter, GitRepositoryWorkspaceAdapter } from '../../git-adapter/src/index.js';
 import {
+  FileInputObjectStorage,
+  LocalProjectResourceInspector,
+  SecureAuthorizedUrlInputFetcher,
+} from '../../project-input-adapter/src/index.js';
+import {
   SqliteAgentOperationsStateStore,
   resolveAgentOperationsStateLocation,
 } from '../../sqlite-state-adapter/src/index.js';
@@ -24,6 +33,8 @@ import {
   loadAgentOperationsTelegramEnvironmentFile,
   loadTelegramOperatorNotificationConfig,
 } from '../../telegram-notification-adapter/src/index.js';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 export interface AgentOperationsCompositionOptions {
   readonly startRunner?: boolean;
@@ -35,6 +46,8 @@ export interface AgentOperationsComposition {
   readonly operator: OperatorApplication;
   readonly conversation: OrchestratorConversationService;
   readonly tools: OrchestratorToolApplicationService;
+  readonly projects: ProjectApplication;
+  readonly inputs: InputApplication;
   readonly telegramConfigured: boolean;
   close(): Promise<void>;
 }
@@ -44,10 +57,19 @@ export function createAgentOperationsComposition(
   options: AgentOperationsCompositionOptions = {},
 ): AgentOperationsComposition {
   const store = SqliteAgentOperationsStateStore.open();
-  const runtime = new CortextOSRuntimeAdapter();
-  const runtimeLifecycle = new CortextOSRuntimeLifecycleAdapter({ runtime });
+  const frameworkRoot = resolveFrameworkRoot();
+  const runtime = new CortextOSRuntimeAdapter({ frameworkRoot });
+  const runtimeLifecycle = new CortextOSRuntimeLifecycleAdapter({ runtime, frameworkRoot });
   const repositories = new GitRepositoryAdapter();
   const stateLocation = resolveAgentOperationsStateLocation();
+  const projects = new ProjectApplicationService(store, repositories, new LocalProjectResourceInspector(), {
+    runtimeAgentIds: ['agent-operations/rehearsal'],
+  });
+  const inputs = new InputApplicationService(
+    store,
+    new FileInputObjectStorage(`${stateLocation.stateDirectory}/inputs`),
+    new SecureAuthorizedUrlInputFetcher(),
+  );
   const repositoryWorkspace = new RepositoryWorkspaceService(
     store,
     repositories,
@@ -71,8 +93,9 @@ export function createAgentOperationsComposition(
   });
   const conversation = new OrchestratorConversationApplicationService(
     new CortextOSOrchestratorConversationAdapter(),
+    store,
   );
-  const tools = new OrchestratorToolApplicationService(operator);
+  const tools = new OrchestratorToolApplicationService(operator, inputs);
   let runnerTimer: ReturnType<typeof setInterval> | null = null;
   if (options.startRunner) {
     operator.startRunner();
@@ -86,12 +109,24 @@ export function createAgentOperationsComposition(
     operator,
     conversation,
     tools,
+    projects,
+    inputs,
     telegramConfigured: notification.configured,
     async close() {
       if (runnerTimer) clearInterval(runnerTimer);
       await store.close();
     },
   };
+}
+
+/** Stable in source and bundled dist execution. Never falls back silently to caller CWD. */
+function resolveFrameworkRoot(): string {
+  const configured = process.env.CTX_FRAMEWORK_ROOT ?? process.env.CTX_PROJECT_ROOT;
+  const candidates = [configured, resolve(__dirname, '../../..'), resolve(__dirname, '..')]
+    .filter((value): value is string => Boolean(value));
+  const root = candidates.find(candidate => existsSync(resolve(candidate, 'package.json')));
+  if (!root) throw new Error('Agent Operations framework root is unavailable. Set CTX_FRAMEWORK_ROOT explicitly.');
+  return resolve(root);
 }
 
 function loadNotifier() {

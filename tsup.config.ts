@@ -4,6 +4,7 @@ export default defineConfig({
   entry: {
     cli: 'src/cli/index.ts',
     'ao-tool': 'scripts/ao-orchestrator-tool.ts',
+    'ao-input-tool': 'scripts/ao-job-input-tool.ts',
     daemon: 'src/daemon/index.ts',
     'hooks/hook-permission-telegram': 'src/hooks/hook-permission-telegram.ts',
     'hooks/hook-ask-telegram': 'src/hooks/hook-ask-telegram.ts',

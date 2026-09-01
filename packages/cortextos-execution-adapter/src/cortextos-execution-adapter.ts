@@ -103,7 +103,8 @@ export class CortextOSExecutionAdapter implements RuntimeExecutionAdapter {
           if (request.executionContext
             && (executionContext?.workingDirectory !== request.executionContext.workingDirectory
               || executionContext?.repositoryReadRoot !== request.executionContext.repositoryReadRoot
-              || executionContext?.repositoryWriteRoot !== request.executionContext.repositoryWriteRoot)) {
+              || executionContext?.repositoryWriteRoot !== request.executionContext.repositoryWriteRoot
+              || JSON.stringify(executionContext?.inputIds ?? []) !== JSON.stringify(request.executionContext.inputIds ?? []))) {
             return { status: 'uncertain', code: 'SUBMISSION_UNCERTAIN', message: 'CortextOS did not prove the requested execution working directory.' };
           }
           try {
@@ -295,6 +296,9 @@ function parseExecutionContext(value: unknown): RuntimeDispatchRequest['executio
     ...(typeof value.repositoryWriteRoot === 'string'
       ? { repositoryWriteRoot: value.repositoryWriteRoot }
       : {}),
+    ...(Array.isArray(value.inputIds) && value.inputIds.every(item => typeof item === 'string')
+      ? { inputIds: value.inputIds as string[] }
+      : {}),
   };
 }
 
@@ -304,7 +308,7 @@ function parseExecutionCapabilities(
   if (!isRecord(value) || value.version !== 1 || typeof value.repositoryRead !== 'boolean') {
     return null;
   }
-  for (const field of ['repositoryPatch', 'testRun', 'gitInspect'] as const) {
+  for (const field of ['repositoryPatch', 'testRun', 'gitInspect', 'inputRead'] as const) {
     if (value[field] !== undefined && typeof value[field] !== 'boolean') return null;
   }
   return {
@@ -313,6 +317,7 @@ function parseExecutionCapabilities(
     ...(value.repositoryPatch !== undefined ? { repositoryPatch: value.repositoryPatch as boolean } : {}),
     ...(value.testRun !== undefined ? { testRun: value.testRun as boolean } : {}),
     ...(value.gitInspect !== undefined ? { gitInspect: value.gitInspect as boolean } : {}),
+    ...(value.inputRead !== undefined ? { inputRead: value.inputRead as boolean } : {}),
   };
 }
 

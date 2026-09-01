@@ -128,6 +128,24 @@ describe('ExecutionPlanningService', () => {
     expect(plan.checkoutBindingId).toBeUndefined();
   });
 
+  it('copies only the Job attached immutable Input allowlist into an input capable Plan', async () => {
+    const { store, lifecycle, planning } = await harness();
+    const attempt = await readyAttempt(lifecycle);
+    await store.createInput({
+      id: 'input:brief', displayName: 'brief.bin', mimeType: 'application/octet-stream', byteSize: 3,
+      sha256: 'a'.repeat(64), sourceType: 'uploaded-file', projectId: PROJECT_ID,
+      storageReference: '/private/input', ingestionState: 'complete', validationState: 'valid', createdAt: TIME,
+    });
+    await store.attachInputsToJob(attempt.jobId, ['input:brief']);
+    const plan = await planning.prepareExecutionPlan({
+      projectId: PROJECT_ID, attemptId: attempt.id, instruction: 'Use the attached brief.',
+      requestedPolicy: POLICY, requestedCapabilities: { version: 1, repositoryRead: true, inputRead: true },
+    });
+    expect(plan.inputIds).toEqual(['input:brief']);
+    expect(plan.requestedCapabilities?.inputRead).toBe(true);
+    expect(await store.getExecutionPlan(plan.id)).toMatchObject({ inputIds: ['input:brief'] });
+  });
+
   it('requires explicit selection when a repository has multiple installation-local checkouts', async () => {
     const first = binding('/repos/ao-one');
     const second = binding('/repos/ao-two');

@@ -2,13 +2,17 @@ import type {
   OperatorApplication,
   OperatorJobDetail,
   OperatorProjectOption,
+  InputApplication,
   OrchestratorToolRequest,
   OrchestratorToolResult,
 } from './types.js';
 
 /** The complete mutable authority exposed to the conversational Orchestrator. */
 export class OrchestratorToolApplicationService {
-  constructor(private readonly operator: OperatorApplication) {}
+  constructor(
+    private readonly operator: OperatorApplication,
+    private readonly inputs?: InputApplication,
+  ) {}
 
   async execute(request: OrchestratorToolRequest): Promise<OrchestratorToolResult> {
     try {
@@ -18,6 +22,14 @@ export class OrchestratorToolApplicationService {
         case 'ao.projects.get': {
           const project = await this.requireProject(text(request.arguments, 'projectId'));
           return success(projectView(project));
+        }
+        case 'ao.inputs.list': {
+          if (!this.inputs) throw new Error('Input tools are not configured');
+          return success(await this.inputs.listInputs(optionalText(request.arguments, 'projectId')));
+        }
+        case 'ao.inputs.get': {
+          if (!this.inputs) throw new Error('Input tools are not configured');
+          return success(await this.inputs.getInput(text(request.arguments, 'inputId')));
         }
         case 'ao.jobs.create':
           return await this.createJob(request.arguments);
@@ -83,6 +95,7 @@ export class OrchestratorToolApplicationService {
       task: text(argumentsValue, 'task'),
       acceptanceCriteria: text(argumentsValue, 'acceptanceCriteria'),
       executionMode,
+      inputIds: stringArray(argumentsValue, 'inputIds'),
     });
     return success({
       jobId: session.jobId,
@@ -125,6 +138,7 @@ function jobView(detail: OperatorJobDetail) {
     stage: detail.summary.currentStage,
     needsHuman: detail.summary.needsHuman,
     latestReviewDecision: detail.summary.latestReviewDecision,
+    inputs: detail.inputs ?? [],
   };
 }
 
@@ -143,6 +157,18 @@ function optionalText(value: Readonly<Record<string, unknown>>, field: string): 
   if (candidate === undefined || candidate === null || candidate === '') return undefined;
   if (typeof candidate !== 'string' || !candidate.trim()) throw new Error(`${field} must be text`);
   return candidate.trim();
+}
+
+function stringArray(value: Readonly<Record<string, unknown>>, field: string): readonly string[] {
+  const candidate = value[field];
+  if (candidate === undefined) return [];
+  if (!Array.isArray(candidate) || candidate.some(item => typeof item !== 'string' || !item.trim())) {
+    throw new Error(`${field} must be an array of Input IDs`);
+  }
+  const values = candidate.map(item => (item as string).trim());
+  if (new Set(values).size !== values.length) throw new Error(`${field} contains duplicate Input IDs`);
+  if (values.length > 20) throw new Error(`${field} exceeds 20 Inputs`);
+  return values;
 }
 
 function classify(error: unknown): string {

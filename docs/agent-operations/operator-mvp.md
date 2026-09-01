@@ -240,5 +240,21 @@ registered disabled until the separately authorized live proof.
 Phase 27B does not consolidate Telegram. Existing AO notification intent and
 deduplication remain unchanged. A later phase can route Telegram inbound and
 outbound through this same CortextOS Orchestrator while keeping AO action
-authority. Attachments, authorized URL inputs, preview, visual review, and
-Approve and Publish remain separate follow on capabilities.
+authority. Preview, visual review, and Approve and Publish remain separate
+follow on capabilities.
+
+## Projects and Inputs
+
+Projects provide durable operator context and are not limited to repositories.
+A Project may use an existing Git repository, an existing local folder, or no
+attached resource. Onboarding performs bounded read only inspection to create a
+readiness Profile. It does not execute discovered commands, install
+dependencies, create a worktree, or run a provider.
+
+Files uploaded in AO Web and URLs explicitly authorized by the operator become
+immutable AO Inputs outside source repositories. Input metadata records size
+and hash without exposing the AO storage path. Conversation turns and Jobs
+reference exact Input IDs. Workers and Reviewers can inspect only the Inputs
+attached to that exact execution. An isolated write Worker may copy an attached
+Input into its worktree through the bounded Input tool, but it receives no
+access to unrelated Inputs or the operator's primary checkout.

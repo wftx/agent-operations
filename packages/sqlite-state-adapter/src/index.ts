@@ -18,6 +18,7 @@ export {
   INITIAL_SCHEMA_VERSION,
   JOB_SCHEMA_VERSION,
   ISOLATED_WRITE_WORKSPACE_SCHEMA_VERSION,
+  PROJECT_ONBOARDING_INPUTS_SCHEMA_VERSION,
   applyStateMigrations,
   type SqliteStateMigration,
 } from './migrations.js';

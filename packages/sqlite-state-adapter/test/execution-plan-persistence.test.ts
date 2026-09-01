@@ -171,7 +171,7 @@ describe('SQLite Execution Plan persistence', () => {
     expect(() => SqliteAgentOperationsStateStore.open({
       databasePath,
       additionalMigrations: [{
-        version: 13,
+        version: 14,
         name: 'deliberate-v7-failure',
         up: database => {
           database.exec('CREATE TABLE should_rollback_v5 (id TEXT)');
@@ -184,7 +184,7 @@ describe('SQLite Execution Plan persistence', () => {
     expect(database.prepare("SELECT name FROM sqlite_master WHERE name='should_rollback_v5'").get())
       .toBeUndefined();
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }]);
     expect(database.prepare('SELECT id FROM execution_plans').get()).toEqual({ id: plan().id });
     database.close();
   });

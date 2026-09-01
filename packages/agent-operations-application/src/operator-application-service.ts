@@ -186,6 +186,13 @@ export class OperatorApplicationService implements OperatorApplication {
     if (runtimeAgentIds.length === 0) {
       throw new Error(`Project ${projectId} has no configured Worker/Reviewer runtime`);
     }
+    for (const inputId of input.inputIds ?? []) {
+      const durableInput = await this.store.getInput(inputId);
+      if (!durableInput) throw new Error(`Input not found: ${inputId}`);
+      if (durableInput.projectId && durableInput.projectId !== projectId) {
+        throw new Error(`Input ${inputId} belongs to another Project`);
+      }
+    }
     return {
       project,
       repository,
@@ -198,6 +205,7 @@ export class OperatorApplicationService implements OperatorApplication {
         : OPERATOR_READ_ONLY_DEFAULTS,
       executionMode,
       executionAuthorized: false,
+      ...(input.inputIds?.length ? { inputIds: [...input.inputIds] } : {}),
     };
   }
 
@@ -228,6 +236,7 @@ export class OperatorApplicationService implements OperatorApplication {
         automaticReadOnlyCompletion: preview.executionMode === 'repository-read-only',
       });
       const job = await this.lifecycle.markJobReady(created.id);
+      if (input.inputIds?.length) await this.store.attachInputsToJob(job.id, input.inputIds);
       const createdAt = this.now().toISOString();
       await this.store.createOperatorRun({
         id: this.operatorRunIdFactory(),
@@ -408,6 +417,16 @@ export class OperatorApplicationService implements OperatorApplication {
     const finalWorkerResult = [...workerAttempts].reverse().find(story => story.resultText)?.resultText;
     const finalReview = reviews.at(-1);
     const repositoryWorkspace = await this.store.getRepositoryWorkspaceForJob(job.id);
+    const inputs = (await Promise.all((await this.store.listJobInputIds(job.id)).map(id => this.store.getInput(id))))
+      .filter(value => value !== null)
+      .map(value => ({
+        id: value.id, displayName: value.displayName, mimeType: value.mimeType,
+        byteSize: value.byteSize, sha256: value.sha256, sourceType: value.sourceType,
+        ...(value.originalUrl ? { originalUrl: value.originalUrl } : {}),
+        ...(value.finalUrl ? { finalUrl: value.finalUrl } : {}),
+        ...(value.projectId ? { projectId: value.projectId } : {}),
+        createdAt: value.createdAt,
+      }));
     return {
       summary,
       acceptanceCriteria: job.acceptanceCriteria ?? '',
@@ -417,6 +436,7 @@ export class OperatorApplicationService implements OperatorApplication {
       escalations,
       guidance,
       notificationDeliveries,
+      inputs,
       escalationActions: Object.fromEntries(await Promise.all(escalations.map(async escalation => [
         escalation.id,
         await this.actionsForEscalation(escalation, attempts),

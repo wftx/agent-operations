@@ -80,6 +80,7 @@ export class CortextOSOrchestratorConversationAdapter implements OrchestratorCon
       id: turnId,
       operatorMessage: input.message,
       ...(input.projectId ? { projectId: input.projectId } : {}),
+      ...(input.inputIds?.length ? { inputIds: [...input.inputIds] } : {}),
       relatedJobIds: [],
       clarificationRequired: false,
       status: 'pending',
@@ -300,6 +301,9 @@ function buildTurnPrompt(turn: StoredTurn): string {
     'BEGIN AGENT OPERATIONS WEB TURN',
     `Turn ID: ${turn.id}`,
     projectHint,
+    turn.inputIds?.length
+      ? `Attached AO Input IDs: ${turn.inputIds.join(', ')}. Inspect only these Inputs through ao.inputs.get and attach their IDs to any Job that needs them.`
+      : 'No AO Inputs are attached to this turn.',
     '',
     'Operator message:',
     turn.operatorMessage,

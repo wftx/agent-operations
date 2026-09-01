@@ -22,6 +22,11 @@ import type {
   DurableOperatorRun,
 } from './operator.js';
 import type { DurableRepositoryWorkspace } from './workspace.js';
+import type {
+  DurableLocalFolderResource,
+  DurableProjectProfile,
+} from './project.js';
+import type { DurableInput } from './input.js';
 
 export interface AgentOperationsInstallation {
   readonly id: string;
@@ -33,6 +38,7 @@ export interface AgentOperationsInstallation {
 export interface DurableProject {
   readonly id: string;
   readonly name: string;
+  readonly description?: string;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -103,6 +109,17 @@ export interface AgentOperationsStateStore {
   listCheckoutBindings(repositoryId?: string): Promise<readonly RepositoryCheckoutBinding[]>;
   listProjectRepositoryIds(projectId: string): Promise<readonly string[]>;
   listProjectRuntimeAgentIds(projectId: string): Promise<readonly string[]>;
+  createLocalFolderResource(resource: DurableLocalFolderResource): Promise<void>;
+  listLocalFolderResources(projectId?: string): Promise<readonly DurableLocalFolderResource[]>;
+  saveProjectProfile(profile: DurableProjectProfile): Promise<void>;
+  getProjectProfile(projectId: string): Promise<DurableProjectProfile | null>;
+  createInput(input: DurableInput): Promise<void>;
+  getInput(id: string): Promise<DurableInput | null>;
+  listInputs(projectId?: string): Promise<readonly DurableInput[]>;
+  associateInputsWithConversation(conversationId: string, inputIds: readonly string[]): Promise<void>;
+  listConversationInputIds(conversationId: string): Promise<readonly string[]>;
+  attachInputsToJob(jobId: string, inputIds: readonly string[]): Promise<void>;
+  listJobInputIds(jobId: string): Promise<readonly string[]>;
   recordRepositoryObservation(observation: DurableRepositoryObservation): Promise<void>;
   getLatestRepositoryObservation(checkoutBindingId: string): Promise<DurableRepositoryObservation | null>;
   recordRuntimeObservation(observation: DurableRuntimeObservation): Promise<void>;

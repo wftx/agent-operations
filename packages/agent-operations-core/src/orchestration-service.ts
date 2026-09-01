@@ -192,6 +192,7 @@ export class OrchestrationService {
     const reviewerRuntimeAgentId = this.reviewerRuntimeAgentId ?? job.preferredRuntimeAgentId ?? null;
     const findings = await this.eligibilityFindings(job, workerRuntimeAgentId, reviewerRuntimeAgentId);
     const writeMode = executionModeForJob(job) === 'repository-write-isolated';
+    const hasInputs = (await this.store.listJobInputIds(job.id)).length > 0;
     return {
       job,
       repositoryId: job.repositoryId ?? null,
@@ -201,8 +202,8 @@ export class OrchestrationService {
         ? { version: 1, filesystem: 'workspace-write', network: 'deny', environment: 'empty' }
         : { ...RESTRICTED_TEXT_EXECUTION_POLICY },
       capabilities: writeMode
-        ? { ...REPOSITORY_WRITE_EXECUTION_CAPABILITIES }
-        : { ...REPOSITORY_READ_EXECUTION_CAPABILITIES },
+        ? { ...REPOSITORY_WRITE_EXECUTION_CAPABILITIES, ...(hasInputs ? { inputRead: true } : {}) }
+        : { ...REPOSITORY_READ_EXECUTION_CAPABILITIES, ...(hasInputs ? { inputRead: true } : {}) },
       executionMode: executionModeForJob(job),
       repositoryRead: true,
       maxWorkerAttempts: MVP_MAX_WORKER_ATTEMPTS,
@@ -740,7 +741,8 @@ export class OrchestrationService {
     const workspace = writeMode
       ? await this.store.getRepositoryWorkspaceForJob(job.id)
       : null;
-    const instruction = attempt.executionRole === 'worker'
+    const attachedInputIds = await this.store.listJobInputIds(job.id);
+    const baseInstruction = attempt.executionRole === 'worker'
       ? buildWorkerInstruction(
         job,
         attempt.roleSequence,
@@ -757,8 +759,12 @@ export class OrchestrationService {
         writeMode,
         workspace,
       );
+    const instruction = attachedInputIds.length
+      ? `${baseInstruction}\n\nAttached immutable AO Inputs: ${attachedInputIds.join(', ')}. Inspect only these through inputs.list and inputs.read. For a write Job, copy an Input into the repository only through inputs.copy_to_repository and only when the task requires that explicit output.`
+      : baseInstruction;
     let plan = await this.store.getExecutionPlanForAttempt(attempt.id);
     if (!plan) {
+      const hasInputs = attachedInputIds.length > 0;
       plan = await this.planning.prepareExecutionPlan({
         projectId: job.projectId,
         attemptId: attempt.id,
@@ -768,9 +774,9 @@ export class OrchestrationService {
           : RESTRICTED_TEXT_EXECUTION_POLICY,
         requestedCapabilities: writeMode
           ? attempt.executionRole === 'worker'
-            ? REPOSITORY_WRITE_EXECUTION_CAPABILITIES
-            : REPOSITORY_WRITE_REVIEW_EXECUTION_CAPABILITIES
-          : REPOSITORY_READ_EXECUTION_CAPABILITIES,
+            ? { ...REPOSITORY_WRITE_EXECUTION_CAPABILITIES, ...(hasInputs ? { inputRead: true } : {}) }
+            : { ...REPOSITORY_WRITE_REVIEW_EXECUTION_CAPABILITIES, ...(hasInputs ? { inputRead: true } : {}) }
+          : { ...REPOSITORY_READ_EXECUTION_CAPABILITIES, ...(hasInputs ? { inputRead: true } : {}) },
         ...(workspace ? { repositoryWorkspaceId: workspace.id } : {}),
       });
     }
@@ -1384,7 +1390,8 @@ function sameCapabilities(
     && left.repositoryRead === right.repositoryRead
     && left.repositoryPatch === right.repositoryPatch
     && left.testRun === right.testRun
-    && left.gitInspect === right.gitInspect;
+    && left.gitInspect === right.gitInspect
+    && left.inputRead === right.inputRead;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

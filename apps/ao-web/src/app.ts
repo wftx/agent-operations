@@ -3,6 +3,8 @@ import type {
   OperatorJobList,
   OperatorTaskInput,
   OrchestratorConversationService,
+  ProjectApplication,
+  InputApplication,
 } from '../../../packages/agent-operations-application/src/index.js';
 import {
   renderDashboard,
@@ -12,6 +14,8 @@ import {
   renderJobList,
   renderNeedsMe,
   renderOrchestrator,
+  renderProjects,
+  renderNewProject,
 } from './render.js';
 
 export class OperatorWebApplication {
@@ -22,6 +26,8 @@ export class OperatorWebApplication {
     private readonly application: OperatorApplication,
     conversationOrOptions: OrchestratorConversationService | { readonly telegramConfigured?: boolean } = {},
     options: { readonly telegramConfigured?: boolean } = {},
+    private readonly projects?: ProjectApplication,
+    private readonly inputs?: InputApplication,
   ) {
     if ('sendTurn' in conversationOrOptions) {
       this.conversation = conversationOrOptions;
@@ -50,14 +56,52 @@ export class OperatorWebApplication {
         const form = await request.formData();
         const projectId = textValue(form, 'projectId');
         try {
+          const inputIds: string[] = [];
+          const upload = form.get('attachment');
+          if (upload instanceof File && upload.size > 0) {
+            if (!this.inputs) throw new Error('Input uploads are not configured.');
+            inputIds.push((await this.inputs.createUploadedInput({
+              displayName: upload.name,
+              mimeType: upload.type,
+              bytes: new Uint8Array(await upload.arrayBuffer()),
+              ...(projectId ? { projectId } : {}),
+            })).id);
+          }
+          const inputUrl = textValue(form, 'inputUrl');
+          if (inputUrl) {
+            if (!this.inputs) throw new Error('URL Inputs are not configured.');
+            inputIds.push((await this.inputs.createUrlInput({ url: inputUrl, ...(projectId ? { projectId } : {}) })).id);
+          }
           await this.conversation.sendTurn({
             message: textValue(form, 'message'),
             ...(projectId ? { projectId } : {}),
+            ...(inputIds.length ? { inputIds } : {}),
           });
           return redirect('/orchestrator');
         } catch (error) {
           return this.orchestratorPage(message(error), 400);
         }
+      }
+      if (request.method === 'GET' && url.pathname === '/projects') {
+        if (!this.projects) throw new Error('Project onboarding is not configured.');
+        return html(renderProjects(await this.projects.listProjects()));
+      }
+      if (request.method === 'GET' && url.pathname === '/projects/new') {
+        return html(renderNewProject());
+      }
+      if (request.method === 'POST' && url.pathname === '/projects') {
+        if (!this.projects) throw new Error('Project onboarding is not configured.');
+        const form = await request.formData();
+        const resourceType = textValue(form, 'resourceType');
+        if (!['git-repository', 'local-folder', 'none'].includes(resourceType)) throw new Error('Invalid Project Resource type');
+        const result = await this.projects.createProject({
+          name: textValue(form, 'name'),
+          description: textValue(form, 'description'),
+          resource: resourceType === 'none'
+            ? { type: 'none' }
+            : { type: resourceType as 'git-repository' | 'local-folder', path: textValue(form, 'path') },
+        });
+        return redirect(`/projects#${encodeURIComponent(result.project.id)}`);
       }
       if (request.method === 'POST' && url.pathname === '/runtime/start') {
         const runtimeStart = await this.application.startRuntime();

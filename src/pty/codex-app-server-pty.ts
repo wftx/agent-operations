@@ -98,7 +98,17 @@ interface CorrelatedTurnRecord {
   repositoryReadRoot?: string;
   repositoryReadOperations?: readonly RepositoryReadAuditEvent[];
   repositoryWriteRoot?: string;
-  toolOperations?: readonly WorkspaceToolAuditEvent[];
+  inputIds?: readonly string[];
+  toolOperations?: readonly (WorkspaceToolAuditEvent | InputToolAuditEvent)[];
+}
+
+interface InputToolAuditEvent {
+  readonly namespace: 'inputs';
+  readonly operation: string;
+  readonly success: boolean;
+  readonly occurredAt: string;
+  readonly path?: string;
+  readonly errorCode?: string;
 }
 
 export interface CorrelationSafeTurnReference {
@@ -285,6 +295,17 @@ const AO_ORCHESTRATOR_DYNAMIC_TOOLS = [{
       },
     },
     {
+      type: 'function', name: 'inputs_list', description: 'List provider safe metadata for AO Inputs.',
+      inputSchema: { type: 'object', properties: { projectId: { type: 'string' } }, additionalProperties: false },
+    },
+    {
+      type: 'function', name: 'inputs_get', description: 'Get provider safe metadata for one AO Input.',
+      inputSchema: {
+        type: 'object', properties: { inputId: { type: 'string' } },
+        required: ['inputId'], additionalProperties: false,
+      },
+    },
+    {
       type: 'function', name: 'jobs_create', description: 'Create one durable Agent Operations Job.',
       inputSchema: {
         type: 'object',
@@ -294,6 +315,7 @@ const AO_ORCHESTRATOR_DYNAMIC_TOOLS = [{
           executionMode: { type: 'string', enum: ['repository-read-only', 'repository-write-isolated'] },
           reviewerRequired: { type: 'boolean', const: true },
           maxWorkerAttempts: { type: 'integer', const: 2 },
+          inputIds: { type: 'array', items: { type: 'string' }, maxItems: 20, uniqueItems: true },
         },
         required: ['projectId', 'title', 'task', 'acceptanceCriteria'],
         additionalProperties: false,
@@ -333,6 +355,8 @@ const AO_ORCHESTRATOR_DYNAMIC_TOOLS = [{
 const AO_TOOL_NAMES = {
   projects_list: 'ao.projects.list',
   projects_get: 'ao.projects.get',
+  inputs_list: 'ao.inputs.list',
+  inputs_get: 'ao.inputs.get',
   jobs_create: 'ao.jobs.create',
   jobs_get: 'ao.jobs.get',
   jobs_list: 'ao.jobs.list',
@@ -340,8 +364,19 @@ const AO_TOOL_NAMES = {
   conversation_respond: 'ao.conversation.respond',
 } as const;
 
+const INPUT_DYNAMIC_TOOLS = [{
+  type: 'namespace', name: 'inputs',
+  description: 'Read only access to the exact immutable AO Inputs attached to this Job.',
+  tools: [
+    { type: 'function', name: 'list', description: 'List metadata for attached Inputs.', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
+    { type: 'function', name: 'read', description: 'Read a bounded binary safe Input chunk encoded as base64.', inputSchema: { type: 'object', properties: { inputId: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, length: { type: 'integer', minimum: 1, maximum: 65536 } }, required: ['inputId'], additionalProperties: false } },
+    { type: 'function', name: 'copy_to_repository', description: 'Copy one attached Input to a new repository file. Available only to an isolated write Worker.', inputSchema: { type: 'object', properties: { inputId: { type: 'string' }, path: { type: 'string' } }, required: ['inputId', 'path'], additionalProperties: false } },
+  ],
+}] as const;
+
 type AoToolName = keyof typeof AO_TOOL_NAMES;
 type AoToolExecutor = (tool: string, turnId: string, input: Record<string, unknown>) => Promise<unknown>;
+type InputToolExecutor = (tool: string, input: Record<string, unknown>, allowedInputIds: readonly string[], repositoryWriteRoot?: string) => Promise<unknown>;
 
 function buildDynamicTools(capabilities?: RuntimeExecutionCapabilitiesEnvelope): unknown[] {
   const tools: unknown[] = [];
@@ -357,6 +392,7 @@ function buildDynamicTools(capabilities?: RuntimeExecutionCapabilitiesEnvelope):
   }
   if (capabilities?.testRun) tools.push(...TEST_DYNAMIC_TOOLS);
   if (capabilities?.gitInspect) tools.push(...GIT_INSPECTION_DYNAMIC_TOOLS);
+  if (capabilities?.inputRead) tools.push(...INPUT_DYNAMIC_TOOLS);
   if (capabilities?.agentOperationsControl) tools.push(...AO_ORCHESTRATOR_DYNAMIC_TOOLS);
   return tools;
 }
@@ -479,7 +515,7 @@ export class CodexAppServerPTY {
   private _repositoryReader: RootScopedRepositoryReader | null = null;
   private _repositoryReadOperations: RepositoryReadAuditEvent[] = [];
   private _workspaceTools: RootScopedRepositoryWorkspaceTools | null = null;
-  private _workspaceToolOperations: WorkspaceToolAuditEvent[] = [];
+  private _workspaceToolOperations: Array<WorkspaceToolAuditEvent | InputToolAuditEvent> = [];
   private _workspaceToolCapabilities: RuntimeExecutionCapabilitiesEnvelope | null = null;
   private _protectedTurnResultText: string | null = null;
   private _protectedCorrelationId: string | null = null;
@@ -510,8 +546,11 @@ export class CodexAppServerPTY {
   private _chatId: string | null = null;
   private _typingLastSent = 0;
   private readonly _aoToolExecutor: AoToolExecutor;
+  private readonly _inputToolExecutor: InputToolExecutor;
+  private _protectedInputIds: readonly string[] = [];
+  private _protectedRepositoryWriteRoot: string | undefined;
 
-  constructor(env: CtxEnv, config: AgentConfig, logPath?: string, aoToolExecutor?: AoToolExecutor) {
+  constructor(env: CtxEnv, config: AgentConfig, logPath?: string, aoToolExecutor?: AoToolExecutor, inputToolExecutor?: InputToolExecutor) {
     this._env = env;
     this._config = config;
     this._cwd = config.working_directory || env.agentDir || process.cwd();
@@ -525,6 +564,8 @@ export class CodexAppServerPTY {
     this._outputBuffer = new OutputBuffer(1000, logPath, BOOTSTRAP_PATTERN);
     this._aoToolExecutor = aoToolExecutor ?? ((tool, turnId, input) =>
       executeAoTool(env.frameworkRoot, env.instanceId, tool, turnId, input));
+    this._inputToolExecutor = inputToolExecutor ?? ((tool, input, allowedInputIds, repositoryWriteRoot) =>
+      executeInputTool(env.frameworkRoot, env.instanceId, tool, input, allowedInputIds, repositoryWriteRoot));
   }
 
   async spawn(mode: 'fresh' | 'continue', prompt: string): Promise<void> {
@@ -692,6 +733,13 @@ export class CodexAppServerPTY {
     if (workspaceToolsEnabled && !executionContext?.repositoryReadRoot) {
       throw new Error('POLICY_UNSUPPORTED: workspace tools require the exact repository root');
     }
+    const inputReadEnabled = executionCapabilities?.inputRead === true;
+    if (inputReadEnabled && !executionContext?.inputIds?.length) {
+      throw new Error('POLICY_UNSUPPORTED: input-read capability requires an immutable Input allowlist');
+    }
+    if (!inputReadEnabled && executionContext?.inputIds?.length) {
+      throw new Error('POLICY_UNSUPPORTED: Input allowlist supplied without input-read capability');
+    }
     this._executing = true;
     this._correlationStartPending = true;
     let threadId: string;
@@ -707,6 +755,8 @@ export class CodexAppServerPTY {
       this._workspaceToolCapabilities = executionCapabilities
         ? { ...executionCapabilities }
         : null;
+      this._protectedInputIds = executionContext?.inputIds ? [...executionContext.inputIds] : [];
+      this._protectedRepositoryWriteRoot = executionContext?.repositoryWriteRoot;
       this._protectedTurnResultText = null;
       this._protectedCorrelationId = cleanCorrelationId;
       threadId = policyMapping
@@ -724,6 +774,8 @@ export class CodexAppServerPTY {
       this._workspaceTools = null;
       this._workspaceToolOperations = [];
       this._workspaceToolCapabilities = null;
+      this._protectedInputIds = [];
+      this._protectedRepositoryWriteRoot = undefined;
       this._protectedTurnResultText = null;
       this._protectedCorrelationId = null;
       if (this._alive && this._turnQueue.length > 0) void this.drainQueue();
@@ -775,6 +827,7 @@ export class CodexAppServerPTY {
         executionCapabilities,
         executionContext?.repositoryReadRoot,
         executionContext?.repositoryWriteRoot,
+        executionContext?.inputIds,
       )) {
         throw new Error('Codex turn started but correlated state could not be persisted');
       }
@@ -793,6 +846,7 @@ export class CodexAppServerPTY {
                 ...(executionContext.repositoryWriteRoot
                   ? { repositoryWriteRoot: executionContext.repositoryWriteRoot }
                   : {}),
+                ...(executionContext.inputIds?.length ? { inputIds: [...executionContext.inputIds] } : {}),
               },
             }
           : {}),
@@ -832,7 +886,8 @@ export class CodexAppServerPTY {
       && capabilities.repositoryRead === false
       && capabilities.repositoryPatch !== true
       && capabilities.testRun !== true
-      && capabilities.gitInspect !== true;
+      && capabilities.gitInspect !== true
+      && capabilities.inputRead !== true;
   }
 
   private turnPermissionOverrides(): Record<string, unknown> {
@@ -1681,6 +1736,10 @@ export class CodexAppServerPTY {
       await this.handleAoOrchestratorToolCall(id, params);
       return;
     }
+    if (params?.namespace === 'inputs') {
+      await this.handleInputToolCall(id, params);
+      return;
+    }
     if (params?.namespace === 'repository'
       && (params.tool === 'list' || params.tool === 'read' || params.tool === 'search')) {
       this.handleRepositoryToolCall(id, rawParams);
@@ -1754,6 +1813,44 @@ export class CodexAppServerPTY {
       };
       this.recordWorkspaceToolOperation(event);
       reply(false, { code, message: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  private async handleInputToolCall(id: number | string, params: DynamicToolCallParams): Promise<void> {
+    const reply = (success: boolean, value: unknown): void => {
+      this._rpc?.respond(id, { success, contentItems: [{ type: 'inputText', text: JSON.stringify(value) }] });
+    };
+    const exactTurn = params.threadId === this._protectedThreadId && params.turnId === this._protectedTurnId;
+    const validTool = params.tool === 'list' || params.tool === 'read' || params.tool === 'copy_to_repository';
+    const canCopy = params.tool !== 'copy_to_repository' || this._workspaceToolCapabilities?.repositoryPatch === true;
+    if (!exactTurn || !validTool || !canCopy || this._workspaceToolCapabilities?.inputRead !== true
+      || !this._protectedInputIds.length) {
+      reply(false, { code: 'CAPABILITY_DENIED', message: 'Input capability is unavailable for this exact turn' });
+      return;
+    }
+    try {
+      const result = await this._inputToolExecutor(
+        params.tool,
+        isRecord(params.arguments) ? params.arguments : {},
+        this._protectedInputIds,
+        this._protectedRepositoryWriteRoot,
+      );
+      const event: InputToolAuditEvent = {
+        namespace: 'inputs', operation: params.tool, success: true,
+        occurredAt: new Date().toISOString(),
+        ...(isRecord(params.arguments) && typeof params.arguments.path === 'string'
+          ? { path: params.arguments.path }
+          : {}),
+      };
+      this._workspaceToolOperations = [...this._workspaceToolOperations, event].slice(-100);
+      reply(true, result);
+    } catch (error) {
+      const event: InputToolAuditEvent = {
+        namespace: 'inputs', operation: params.tool, success: false,
+        occurredAt: new Date().toISOString(), errorCode: 'INPUT_TOOL_FAILED',
+      };
+      this._workspaceToolOperations = [...this._workspaceToolOperations, event].slice(-100);
+      reply(false, { code: 'INPUT_TOOL_FAILED', message: error instanceof Error ? error.message : String(error) });
     }
   }
 
@@ -1854,6 +1951,8 @@ export class CodexAppServerPTY {
     this._workspaceTools = null;
     this._workspaceToolOperations = [];
     this._workspaceToolCapabilities = null;
+    this._protectedInputIds = [];
+    this._protectedRepositoryWriteRoot = undefined;
     this._protectedTurnResultText = null;
     this._protectedCorrelationId = null;
     this._executing = false;
@@ -1883,6 +1982,7 @@ export class CodexAppServerPTY {
     effectiveCapabilities?: RuntimeExecutionCapabilitiesEnvelope,
     repositoryReadRoot?: string,
     repositoryWriteRoot?: string,
+    inputIds?: readonly string[],
   ): boolean {
     const path = this.correlatedTurnRecordPath(threadId, turn.id);
     if (!path) return false;
@@ -1905,6 +2005,7 @@ export class CodexAppServerPTY {
     const recordedCapabilities = effectiveCapabilities ?? previous?.effectiveCapabilities;
     const recordedReaderRoot = repositoryReadRoot ?? previous?.repositoryReadRoot;
     const recordedWriterRoot = repositoryWriteRoot ?? previous?.repositoryWriteRoot;
+    const recordedInputIds = inputIds ?? previous?.inputIds;
     const recordedOperations = this._repositoryReadOperations.length
       ? this._repositoryReadOperations
       : previous?.repositoryReadOperations;
@@ -1938,6 +2039,7 @@ export class CodexAppServerPTY {
         : {}),
       ...(recordedReaderRoot ? { repositoryReadRoot: recordedReaderRoot } : {}),
       ...(recordedWriterRoot ? { repositoryWriteRoot: recordedWriterRoot } : {}),
+      ...(recordedInputIds?.length ? { inputIds: [...recordedInputIds] } : {}),
       ...(recordedOperations?.length
         ? { repositoryReadOperations: recordedOperations.map(operation => ({ ...operation })) }
         : {}),
@@ -2295,6 +2397,37 @@ function executeAoTool(
         reject(new Error(error ? `Agent Operations tool failed: ${error.message}` : 'Agent Operations tool returned invalid JSON'));
       },
     );
+  });
+}
+
+function executeInputTool(
+  frameworkRoot: string,
+  instanceId: string,
+  tool: string,
+  input: Record<string, unknown>,
+  allowedInputIds: readonly string[],
+  repositoryWriteRoot?: string,
+): Promise<unknown> {
+  return new Promise((resolveValue, reject) => {
+    execFile(process.execPath, [
+      join(frameworkRoot, 'dist', 'ao-input-tool.js'),
+      tool,
+      '--input-json', JSON.stringify(input),
+      '--allowed-inputs-json', JSON.stringify(allowedInputIds),
+      '--instance', instanceId,
+      ...(repositoryWriteRoot ? ['--repository-write-root', repositoryWriteRoot] : []),
+    ], {
+      cwd: frameworkRoot,
+      env: { ...process.env, CTX_INSTANCE_ID: instanceId, CTX_FRAMEWORK_ROOT: frameworkRoot },
+      timeout: 30_000,
+      maxBuffer: 512 * 1024,
+    }, (error, stdout) => {
+      const lastLine = stdout.trim().split('\n').filter(Boolean).at(-1);
+      if (lastLine) {
+        try { resolveValue(JSON.parse(lastLine)); return; } catch { /* report failure below */ }
+      }
+      reject(new Error(error ? `Input tool failed: ${error.message}` : 'Input tool returned invalid JSON'));
+    });
   });
 }
 

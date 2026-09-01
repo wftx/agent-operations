@@ -29,6 +29,8 @@ import type {
   DurableOperatorRun,
 } from '../operator.js';
 import type { DurableRepositoryWorkspace } from '../workspace.js';
+import type { DurableLocalFolderResource, DurableProjectProfile } from '../project.js';
+import type { DurableInput } from '../input.js';
 
 export type InMemoryStateStoreOperation =
   | 'get-installation'
@@ -70,6 +72,29 @@ function copyRepository(value: DurableRepository): DurableRepository {
 }
 
 function copyBinding(value: RepositoryCheckoutBinding): RepositoryCheckoutBinding {
+  return { ...value };
+}
+
+function copyLocalFolderResource(value: DurableLocalFolderResource): DurableLocalFolderResource {
+  return { ...value };
+}
+
+function copyProjectProfile(value: DurableProjectProfile): DurableProjectProfile {
+  return {
+    ...value,
+    detectedStack: [...value.detectedStack],
+    buildCommandCandidates: [...value.buildCommandCandidates],
+    testCommandCandidates: [...value.testCommandCandidates],
+    previewCommandCandidates: [...value.previewCommandCandidates],
+    deploymentClues: [...value.deploymentClues],
+    documentation: value.documentation.map(entry => ({ ...entry })),
+    capabilities: { ...value.capabilities },
+    warnings: [...value.warnings],
+    knownConstraints: [...value.knownConstraints],
+  };
+}
+
+function copyInput(value: DurableInput): DurableInput {
   return { ...value };
 }
 
@@ -116,6 +141,7 @@ function copyExecutionPlan(value: DurableExecutionPlan): DurableExecutionPlan {
   return {
     ...value,
     input: { ...value.input },
+    ...(value.inputIds ? { inputIds: [...value.inputIds] } : {}),
     ...(value.requestedPolicy ? { requestedPolicy: { ...value.requestedPolicy } } : {}),
     ...(value.requestedCapabilities
       ? { requestedCapabilities: { ...value.requestedCapabilities } }
@@ -210,6 +236,11 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   private readonly bindings = new Map<string, RepositoryCheckoutBinding>();
   private readonly projectRepositories = new Map<string, Set<string>>();
   private readonly projectRuntimeAgents = new Map<string, Set<string>>();
+  private readonly localFolderResources = new Map<string, DurableLocalFolderResource>();
+  private readonly projectProfiles = new Map<string, DurableProjectProfile>();
+  private readonly inputs = new Map<string, DurableInput>();
+  private readonly conversationInputs = new Map<string, Set<string>>();
+  private readonly jobInputs = new Map<string, Set<string>>();
   private readonly repositoryObservations = new Map<string, DurableRepositoryObservation[]>();
   private readonly runtimeObservations = new Map<string, DurableRuntimeObservation[]>();
   private readonly repositoryWorkspaces = new Map<string, DurableRepositoryWorkspace>();
@@ -348,6 +379,97 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   async listProjectRuntimeAgentIds(projectId: string): Promise<readonly string[]> {
     this.assertAvailable('read');
     return [...(this.projectRuntimeAgents.get(projectId) ?? [])].sort();
+  }
+
+  async createLocalFolderResource(resource: DurableLocalFolderResource): Promise<void> {
+    this.assertAvailable('apply-configuration');
+    if (!this.projects.has(resource.projectId)) throw new Error(`Project not found: ${resource.projectId}`);
+    if (resource.installationId !== this.installation.id) throw new Error('Project Resource belongs to another installation');
+    if (this.localFolderResources.has(resource.id)) throw new Error(`Project Resource already exists: ${resource.id}`);
+    this.localFolderResources.set(resource.id, copyLocalFolderResource(resource));
+  }
+
+  async listLocalFolderResources(projectId?: string): Promise<readonly DurableLocalFolderResource[]> {
+    this.assertAvailable('read');
+    return [...this.localFolderResources.values()]
+      .filter(resource => !projectId || resource.projectId === projectId)
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .map(copyLocalFolderResource);
+  }
+
+  async saveProjectProfile(profile: DurableProjectProfile): Promise<void> {
+    this.assertAvailable('apply-configuration');
+    if (!this.projects.has(profile.projectId)) throw new Error(`Project not found: ${profile.projectId}`);
+    const existing = this.projectProfiles.get(profile.projectId);
+    if (profile.revision !== (existing ? existing.revision + 1 : 0)) {
+      throw new Error(`Stale Project Profile revision for ${profile.projectId}`);
+    }
+    this.projectProfiles.set(profile.projectId, copyProjectProfile(profile));
+  }
+
+  async getProjectProfile(projectId: string): Promise<DurableProjectProfile | null> {
+    this.assertAvailable('read');
+    const profile = this.projectProfiles.get(projectId);
+    return profile ? copyProjectProfile(profile) : null;
+  }
+
+  async createInput(input: DurableInput): Promise<void> {
+    this.assertAvailable('apply-configuration');
+    if (this.inputs.has(input.id)) throw new Error(`Input already exists: ${input.id}`);
+    if (input.projectId && !this.projects.has(input.projectId)) throw new Error(`Project not found: ${input.projectId}`);
+    this.inputs.set(input.id, copyInput(input));
+  }
+
+  async getInput(id: string): Promise<DurableInput | null> {
+    this.assertAvailable('read');
+    const input = this.inputs.get(id);
+    return input ? copyInput(input) : null;
+  }
+
+  async listInputs(projectId?: string): Promise<readonly DurableInput[]> {
+    this.assertAvailable('read');
+    return [...this.inputs.values()]
+      .filter(input => !projectId || input.projectId === projectId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map(copyInput);
+  }
+
+  async associateInputsWithConversation(conversationId: string, inputIds: readonly string[]): Promise<void> {
+    this.assertAvailable('apply-configuration');
+    rejectDuplicates(inputIds, 'Input ID');
+    const associated = this.conversationInputs.get(conversationId) ?? new Set<string>();
+    for (const inputId of inputIds) {
+      if (!this.inputs.has(inputId)) throw new Error(`Input not found: ${inputId}`);
+      if (associated.has(inputId)) throw new Error(`Input already associated with conversation: ${inputId}`);
+      associated.add(inputId);
+    }
+    this.conversationInputs.set(conversationId, associated);
+  }
+
+  async listConversationInputIds(conversationId: string): Promise<readonly string[]> {
+    this.assertAvailable('read');
+    return [...(this.conversationInputs.get(conversationId) ?? [])].sort();
+  }
+
+  async attachInputsToJob(jobId: string, inputIds: readonly string[]): Promise<void> {
+    this.assertAvailable('write-job');
+    rejectDuplicates(inputIds, 'Input ID');
+    const job = this.jobs.get(jobId);
+    if (!job) throw new Error(`Job not found: ${jobId}`);
+    const attached = this.jobInputs.get(jobId) ?? new Set<string>();
+    for (const inputId of inputIds) {
+      const input = this.inputs.get(inputId);
+      if (!input) throw new Error(`Input not found: ${inputId}`);
+      if (input.projectId && input.projectId !== job.projectId) throw new Error(`Input ${inputId} belongs to another Project`);
+      if (attached.has(inputId)) throw new Error(`Input already attached to Job: ${inputId}`);
+      attached.add(inputId);
+    }
+    this.jobInputs.set(jobId, attached);
+  }
+
+  async listJobInputIds(jobId: string): Promise<readonly string[]> {
+    this.assertAvailable('read');
+    return [...(this.jobInputs.get(jobId) ?? [])].sort();
   }
 
   async recordRepositoryObservation(observation: DurableRepositoryObservation): Promise<void> {
@@ -594,6 +716,9 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     if (plan.input.version !== 1) throw new Error(`Unsupported execution input version: ${plan.input.version}`);
     if (!plan.requestedPolicy) throw new Error('New Execution Plans require an explicit runtime execution policy');
     if (!plan.requestedCapabilities) throw new Error('New Execution Plans require explicit runtime tool capabilities');
+    for (const inputId of plan.inputIds ?? []) {
+      if (!this.jobInputs.get(plan.jobId)?.has(inputId)) throw new Error(`Execution Plan Input is not attached to Job: ${inputId}`);
+    }
     if (plan.jobRevisionAtPreparation < 0 || plan.attemptRevisionAtPreparation < 0) {
       throw new Error('Execution Plan revisions must be non-negative');
     }

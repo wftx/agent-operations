@@ -18,7 +18,8 @@ export const ORCHESTRATION_SCHEMA_VERSION = 9;
 export const DAILY_OPERATOR_SCHEMA_VERSION = 10;
 export const LATE_EXECUTION_RECONCILIATION_SCHEMA_VERSION = 11;
 export const ISOLATED_WRITE_WORKSPACE_SCHEMA_VERSION = 12;
-export const CURRENT_SCHEMA_VERSION = ISOLATED_WRITE_WORKSPACE_SCHEMA_VERSION;
+export const PROJECT_ONBOARDING_INPUTS_SCHEMA_VERSION = 13;
+export const CURRENT_SCHEMA_VERSION = PROJECT_ONBOARDING_INPUTS_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -597,6 +598,109 @@ const ISOLATED_WRITE_WORKSPACE_SCHEMA_SQL = `
   ALTER TABLE execution_observations ADD COLUMN tool_operations_json TEXT;
 `;
 
+const PROJECT_ONBOARDING_INPUTS_SCHEMA_SQL = `
+  ALTER TABLE projects ADD COLUMN description TEXT;
+
+  CREATE TABLE project_local_folders (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    installation_id TEXT NOT NULL REFERENCES installations(id),
+    canonical_path TEXT NOT NULL,
+    fingerprint TEXT NOT NULL CHECK (length(trim(fingerprint)) > 0),
+    availability TEXT NOT NULL CHECK (availability IN ('available', 'unavailable')),
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    UNIQUE (installation_id, canonical_path),
+    UNIQUE (project_id, canonical_path)
+  );
+
+  CREATE INDEX project_local_folders_by_project
+    ON project_local_folders(project_id, id);
+
+  CREATE TABLE project_profiles (
+    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+    resource_summary TEXT NOT NULL,
+    detected_stack_json TEXT NOT NULL,
+    package_manager TEXT,
+    build_commands_json TEXT NOT NULL,
+    test_commands_json TEXT NOT NULL,
+    preview_commands_json TEXT NOT NULL,
+    deployment_clues_json TEXT NOT NULL,
+    documentation_json TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL,
+    warnings_json TEXT NOT NULL,
+    known_constraints_json TEXT NOT NULL,
+    agents_file_suggestion INTEGER NOT NULL CHECK (agents_file_suggestion IN (0, 1)),
+    inspected_at TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 0)
+  );
+
+  CREATE TABLE inputs (
+    id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL CHECK (length(trim(display_name)) > 0),
+    mime_type TEXT NOT NULL CHECK (length(trim(mime_type)) > 0),
+    byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    source_type TEXT NOT NULL CHECK (source_type IN ('uploaded-file', 'authorized-url')),
+    original_url TEXT,
+    final_url TEXT,
+    project_id TEXT REFERENCES projects(id),
+    storage_reference TEXT NOT NULL UNIQUE CHECK (length(trim(storage_reference)) > 0),
+    ingestion_state TEXT NOT NULL CHECK (ingestion_state = 'complete'),
+    validation_state TEXT NOT NULL CHECK (validation_state = 'valid'),
+    created_at TEXT NOT NULL,
+    CHECK (
+      (source_type = 'uploaded-file' AND original_url IS NULL AND final_url IS NULL)
+      OR (source_type = 'authorized-url' AND original_url IS NOT NULL AND final_url IS NOT NULL)
+    )
+  );
+
+  CREATE INDEX inputs_by_project ON inputs(project_id, created_at, id);
+
+  CREATE TABLE conversation_inputs (
+    conversation_id TEXT NOT NULL CHECK (length(trim(conversation_id)) > 0),
+    input_id TEXT NOT NULL REFERENCES inputs(id),
+    PRIMARY KEY (conversation_id, input_id)
+  );
+
+  CREATE TABLE job_inputs (
+    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    input_id TEXT NOT NULL REFERENCES inputs(id),
+    PRIMARY KEY (job_id, input_id)
+  );
+
+  CREATE TABLE execution_plan_inputs (
+    execution_plan_id TEXT NOT NULL REFERENCES execution_plans(id) ON DELETE CASCADE,
+    input_id TEXT NOT NULL REFERENCES inputs(id),
+    PRIMARY KEY (execution_plan_id, input_id)
+  );
+
+  ALTER TABLE execution_plans ADD COLUMN requested_input_read INTEGER
+    CHECK (requested_input_read IS NULL OR requested_input_read IN (0, 1));
+  ALTER TABLE execution_dispatches ADD COLUMN effective_input_read INTEGER
+    CHECK (effective_input_read IS NULL OR effective_input_read IN (0, 1));
+  ALTER TABLE execution_observations ADD COLUMN effective_input_read INTEGER
+    CHECK (effective_input_read IS NULL OR effective_input_read IN (0, 1));
+
+  INSERT INTO project_profiles (
+    project_id, resource_summary, detected_stack_json, package_manager,
+    build_commands_json, test_commands_json, preview_commands_json,
+    deployment_clues_json, documentation_json, capabilities_json,
+    warnings_json, known_constraints_json, agents_file_suggestion, inspected_at, revision
+  )
+  SELECT
+    p.id,
+    CASE WHEN EXISTS (SELECT 1 FROM project_repositories pr WHERE pr.project_id = p.id)
+      THEN 'Existing Git repository' ELSE 'No resource attached' END,
+    '[]', NULL, '[]', '[]', '[]', '[]', '[]',
+    CASE WHEN EXISTS (SELECT 1 FROM project_repositories pr WHERE pr.project_id = p.id)
+      THEN '{"repositoryReadOnlyJobs":"available","isolatedCodeChangeJobs":"available","boundedFileInspection":"available","inputs":"available","orchestratorConversation":"available","build":"unknown","preview":"unknown","publish":"unknown"}'
+      ELSE '{"repositoryReadOnlyJobs":"unavailable","isolatedCodeChangeJobs":"unavailable","boundedFileInspection":"unavailable","inputs":"available","orchestratorConversation":"available","build":"unknown","preview":"unknown","publish":"unknown"}' END,
+    '["Run bounded Project inspection to enrich detected stack and command candidates."]',
+    '[]', 0, p.updated_at, 0
+  FROM projects p;
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -657,6 +761,11 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: ISOLATED_WRITE_WORKSPACE_SCHEMA_VERSION,
     name: 'isolated-write-job-workspaces',
     up: database => database.exec(ISOLATED_WRITE_WORKSPACE_SCHEMA_SQL),
+  },
+  {
+    version: PROJECT_ONBOARDING_INPUTS_SCHEMA_VERSION,
+    name: 'project-onboarding-and-job-inputs',
+    up: database => database.exec(PROJECT_ONBOARDING_INPUTS_SCHEMA_SQL),
   },
 ];
 

@@ -950,7 +950,7 @@ function isRuntimeExecutionCapabilitiesEnvelope(
   const capabilities = value as Record<string, unknown>;
   return capabilities.version === 1
     && typeof capabilities.repositoryRead === 'boolean'
-    && ['repositoryPatch', 'testRun', 'gitInspect', 'agentOperationsControl'].every(field =>
+    && ['repositoryPatch', 'testRun', 'gitInspect', 'agentOperationsControl', 'inputRead'].every(field =>
       capabilities[field] === undefined || typeof capabilities[field] === 'boolean');
 }
 
@@ -973,7 +973,11 @@ function isRuntimeExecutionContextEnvelope(value: unknown): value is RuntimeExec
         && context.repositoryWriteRoot.startsWith('/')
         && context.repositoryWriteRoot.length <= 4_096
         && !context.repositoryWriteRoot.includes('\0')
-        && pathResolve(context.repositoryWriteRoot) === context.repositoryWriteRoot));
+        && pathResolve(context.repositoryWriteRoot) === context.repositoryWriteRoot))
+    && (context.inputIds === undefined || (Array.isArray(context.inputIds)
+      && context.inputIds.length <= 20
+      && context.inputIds.every(value => typeof value === 'string' && /^input:[A-Za-z0-9-]+$/.test(value))
+      && new Set(context.inputIds).size === context.inputIds.length));
 }
 
 /**

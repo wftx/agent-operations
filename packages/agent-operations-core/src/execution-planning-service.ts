@@ -101,6 +101,12 @@ export class ExecutionPlanningService {
     if (requestedCapabilities.repositoryRead && !job.repositoryId) {
       throw new Error('Repository-read capability requires a repository-bound Job');
     }
+    const inputIds = requestedCapabilities.inputRead
+      ? await this.store.listJobInputIds(job.id)
+      : [];
+    if (!requestedCapabilities.inputRead && (await this.store.listJobInputIds(job.id)).length) {
+      throw new Error('Job Inputs require the explicit input-read capability');
+    }
     const workspace = input.repositoryWorkspaceId
       ? await this.store.getRepositoryWorkspace(input.repositoryWorkspaceId)
       : null;
@@ -127,6 +133,7 @@ export class ExecutionPlanningService {
       ...(job.repositoryId ? { repositoryId: job.repositoryId } : {}),
       ...(checkout ? { checkoutBindingId: checkout.id } : {}),
       ...(workspace ? { repositoryWorkspaceId: workspace.id } : {}),
+      ...(inputIds.length ? { inputIds } : {}),
       input: createExecutionInputEnvelope(input.instruction),
       requestedPolicy,
       requestedCapabilities,

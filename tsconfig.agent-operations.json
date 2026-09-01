@@ -23,6 +23,7 @@
     "scripts/telegram-notification-test.ts",
     "scripts/ao-web.ts",
     "scripts/ao-orchestrator-tool.ts",
+    "scripts/ao-job-input-tool.ts",
     "apps/ao-web/**/*.ts",
     "packages/telegram-notification-adapter/**/*.ts",
     "tests/architecture/agent-operations-boundary.test.ts"

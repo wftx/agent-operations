@@ -1251,6 +1251,48 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
     await flush();
   });
 
+  it('exposes exact Input tools and denies access outside the protected turn allowlist', async () => {
+    requestMock.mockImplementation(async (method: string) => {
+      if (method === 'config/read') return { result: { config: { mcp_servers: {} } } };
+      return method === 'thread/start'
+        ? { result: { thread: { id: 'thread-input' } } }
+        : { result: { turn: { id: 'turn-input', status: 'inProgress' } } };
+    });
+    const executeInput = vi.fn().mockResolvedValue([{ id: 'input:allowed' }]);
+    const pty = new CodexAppServerPTY(mockEnv, {}, undefined, undefined, executeInput);
+    Object.assign(pty as unknown as Record<string, unknown>, {
+      _alive: true, _threadId: 'thread-1',
+      _rpc: { request: requestMock, respondError: respondErrorMock, respond: respondMock },
+    });
+    const root = process.cwd();
+    await pty.startCorrelationSafeTurn(
+      'inspect attached input', 'dispatch-plan:input', restrictedPolicy,
+      { workingDirectory: root, repositoryReadRoot: root, inputIds: ['input:allowed'] },
+      { version: 1, repositoryRead: true, inputRead: true },
+    );
+    const threadStart = requestMock.mock.calls.find(([method]) => method === 'thread/start')?.[1] as {
+      dynamicTools: Array<{ name: string }>;
+    };
+    expect(threadStart.dynamicTools.map(value => value.name)).toEqual(['repository', 'inputs']);
+    await (pty as unknown as { handleDynamicToolCall(id: number, params: unknown): Promise<void> })
+      .handleDynamicToolCall(81, {
+        threadId: 'thread-input', turnId: 'turn-input', namespace: 'inputs', tool: 'read',
+        arguments: { inputId: 'input:allowed' },
+      });
+    expect(executeInput).toHaveBeenCalledWith('read', { inputId: 'input:allowed' }, ['input:allowed'], undefined);
+    await (pty as unknown as { handleDynamicToolCall(id: number, params: unknown): Promise<void> })
+      .handleDynamicToolCall(82, {
+        threadId: 'thread-other', turnId: 'turn-input', namespace: 'inputs', tool: 'read',
+        arguments: { inputId: 'input:other' },
+      });
+    expect(executeInput).toHaveBeenCalledTimes(1);
+    expect(respondMock).toHaveBeenLastCalledWith(82, expect.objectContaining({ success: false }));
+    rpc(pty).handleRpcMessage({
+      method: 'turn/completed', params: { threadId: 'thread-input', turn: { id: 'turn-input', status: 'completed' } },
+    });
+    await flush();
+  });
+
   it('serves repository dynamic calls only for the exact protected turn and audits metadata without contents', () => {
     const pty = makeReadyPty();
     const list = vi.fn().mockReturnValue({ path: '.', entries: [], truncated: false, omittedRestricted: 0 });
