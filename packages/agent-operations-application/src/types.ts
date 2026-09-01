@@ -3,6 +3,7 @@ import type {
   DurableAttemptReview,
   DurableEscalation,
   DurableHumanGuidance,
+  DurableWorkerBudgetExtension,
   DurableJob,
   DurableJobAttempt,
   DurableOperatorNotificationDelivery,
@@ -140,6 +141,9 @@ export interface OperatorJobSummary {
   readonly workerAttemptCount: number;
   /** Worker Attempts that crossed, or may have crossed, provider submission. */
   readonly workerExecutionCount: number;
+  readonly automaticWorkerExecutionLimit: 2;
+  readonly humanWorkerBudgetExtensionCount: number;
+  readonly authorizedWorkerExecutionLimit: number;
   readonly latestReviewDecision: AttemptReviewDecision | null;
   readonly needsHuman: boolean;
   readonly operatorRun: DurableOperatorRun | null;
@@ -170,7 +174,18 @@ export interface OperatorRuntimeStatus {
   readonly reason?: string;
 }
 
-export type OperatorEscalationAction = 'provide-guidance' | 'reconcile-execution' | 'cancel-job';
+export type OperatorEscalationAction =
+  | 'provide-guidance'
+  | 'authorize-worker-budget-extension'
+  | 'reconcile-execution'
+  | 'cancel-job';
+
+export type OperatorEscalationKind =
+  | 'actionable-continuation'
+  | 'human-approval'
+  | 'guidance-required'
+  | 'budget-extension-required'
+  | 'terminal';
 
 export interface OperatorAttemptStory {
   readonly attempt: DurableJobAttempt;
@@ -189,8 +204,10 @@ export interface OperatorJobDetail {
   readonly reviews: readonly DurableAttemptReview[];
   readonly escalations: readonly DurableEscalation[];
   readonly guidance: readonly DurableHumanGuidance[];
+  readonly workerBudgetExtensions: readonly DurableWorkerBudgetExtension[];
   readonly notificationDeliveries: readonly DurableOperatorNotificationDelivery[];
   readonly escalationActions: Readonly<Record<string, readonly OperatorEscalationAction[]>>;
+  readonly escalationKinds: Readonly<Record<string, OperatorEscalationKind>>;
   readonly finalWorkerResult?: string;
   readonly finalReview?: DurableAttemptReview;
   readonly completedAt?: string;
@@ -209,6 +226,7 @@ export interface OperatorApplication {
   runOperatorJob(input: OperatorTaskInput): Promise<OperatorRunSession>;
   waitForRun(jobId: string): Promise<OperatorRunSession>;
   provideGuidanceAndContinue(escalationId: string, instruction: string): Promise<OperatorRunSession>;
+  authorizeOneMoreWorkerAttempt(escalationId: string, instruction?: string): Promise<OperatorRunSession>;
   reconcileTimedOutExecution(escalationId: string): Promise<OperatorRunSession>;
   cancelEscalatedJob(escalationId: string): Promise<OperatorRunSession>;
   listJobs(filter?: OperatorJobList): Promise<readonly OperatorJobSummary[]>;

@@ -19,7 +19,8 @@ export const DAILY_OPERATOR_SCHEMA_VERSION = 10;
 export const LATE_EXECUTION_RECONCILIATION_SCHEMA_VERSION = 11;
 export const ISOLATED_WRITE_WORKSPACE_SCHEMA_VERSION = 12;
 export const PROJECT_ONBOARDING_INPUTS_SCHEMA_VERSION = 13;
-export const CURRENT_SCHEMA_VERSION = PROJECT_ONBOARDING_INPUTS_SCHEMA_VERSION;
+export const WORKER_BUDGET_EXTENSIONS_SCHEMA_VERSION = 14;
+export const CURRENT_SCHEMA_VERSION = WORKER_BUDGET_EXTENSIONS_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -701,6 +702,19 @@ const PROJECT_ONBOARDING_INPUTS_SCHEMA_SQL = `
   FROM projects p;
 `;
 
+const WORKER_BUDGET_EXTENSIONS_SCHEMA_SQL = `
+  CREATE TABLE worker_budget_extensions (
+    id TEXT PRIMARY KEY CHECK (id LIKE 'worker-budget-extension:%'),
+    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    escalation_id TEXT NOT NULL UNIQUE REFERENCES escalations(id),
+    additional_worker_executions INTEGER NOT NULL CHECK (additional_worker_executions = 1),
+    created_at TEXT NOT NULL
+  );
+
+  CREATE INDEX worker_budget_extensions_by_job
+    ON worker_budget_extensions(job_id, created_at, id);
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -766,6 +780,11 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: PROJECT_ONBOARDING_INPUTS_SCHEMA_VERSION,
     name: 'project-onboarding-and-job-inputs',
     up: database => database.exec(PROJECT_ONBOARDING_INPUTS_SCHEMA_SQL),
+  },
+  {
+    version: WORKER_BUDGET_EXTENSIONS_SCHEMA_VERSION,
+    name: 'human-worker-budget-extensions',
+    up: database => database.exec(WORKER_BUDGET_EXTENSIONS_SCHEMA_SQL),
   },
 ];
 

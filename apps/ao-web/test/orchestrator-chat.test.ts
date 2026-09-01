@@ -134,6 +134,7 @@ function fakeOperator(): OperatorApplication {
     runOperatorJob: vi.fn(),
     waitForRun: vi.fn(),
     provideGuidanceAndContinue: vi.fn(),
+    authorizeOneMoreWorkerAttempt: vi.fn(),
     reconcileTimedOutExecution: vi.fn(),
     cancelEscalatedJob: vi.fn(),
     listJobs: vi.fn(async () => []),

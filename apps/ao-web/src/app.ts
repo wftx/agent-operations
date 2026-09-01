@@ -142,6 +142,16 @@ export class OperatorWebApplication {
         );
         return redirect(`/jobs/${encodeURIComponent(session.jobId)}`);
       }
+      const extendWorkerBudget = url.pathname.match(/^\/escalations\/([^/]+)\/extend-worker-budget$/);
+      if (request.method === 'POST' && extendWorkerBudget) {
+        const form = await request.formData();
+        const instruction = textValue(form, 'instruction');
+        const session = await this.application.authorizeOneMoreWorkerAttempt(
+          decodeURIComponent(extendWorkerBudget[1]),
+          instruction || undefined,
+        );
+        return redirect(`/jobs/${encodeURIComponent(session.jobId)}`);
+      }
       const cancel = url.pathname.match(/^\/escalations\/([^/]+)\/cancel$/);
       if (request.method === 'POST' && cancel) {
         const session = await this.application.cancelEscalatedJob(decodeURIComponent(cancel[1]));

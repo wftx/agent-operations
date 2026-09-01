@@ -61,8 +61,21 @@ Needs Me offers only actions that are valid for that escalation:
   original escalation without deleting it, and includes the guidance only in a
   new Worker Attempt and Plan. It is limited to human-judgment and Reviewer-
   uncertainty boundaries while the two-Worker budget remains.
+- **Authorize 1 More Attempt + Continue** appears when a Reviewer requests a
+  revision after the automatic two Worker execution budget is exhausted. It
+  records one durable human budget extension for that exact escalation, accepts
+  optional guidance, and permits one fresh Worker Attempt and Plan. The original
+  automatic budget remains exhausted in history. Refresh never creates an
+  extension, and another revision requires another explicit human decision.
+- **Check Execution Again** is limited to a recoverable observation timeout and
+  observes the existing accepted Dispatch without resending it.
 - **Cancel Job** is available only when no Attempt or uncertain Dispatch may
   still be executing. It preserves the complete history.
+
+The UI classifies each unresolved escalation as actionable continuation, human
+approval, guidance required, budget extension required, or terminal. It offers
+only actions supported by the underlying durable state. Ready for Approval and
+uncertain Dispatch states never present a generic Continue action.
 
 ## CLI
 
@@ -164,7 +177,8 @@ authoritative whether Telegram is configured, unavailable, or rejected.
 - network: `deny`
 - environment: `empty`
 - tools: bounded repository list/read/search only
-- Worker Attempts: at most 2
+- automatic Worker executions: at most 2
+- additional Worker executions: one per explicit durable human authorization
 - Reviewer passes: 1 per Worker Attempt
 - automatic completion: only after Reviewer `PASS`
 

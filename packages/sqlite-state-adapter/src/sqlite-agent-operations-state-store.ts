@@ -39,6 +39,7 @@ import type {
   DurableEscalation,
   EscalationReason,
   DurableHumanGuidance,
+  DurableWorkerBudgetExtension,
   DurableOperatorNotificationDelivery,
   DurableOperatorRun,
   OperatorNotificationDeliveryStatus,
@@ -366,6 +367,14 @@ interface HumanGuidanceRow {
   job_id: string;
   escalation_id: string;
   instruction: string;
+  created_at: string;
+}
+
+interface WorkerBudgetExtensionRow {
+  id: string;
+  job_id: string;
+  escalation_id: string;
+  additional_worker_executions: 1;
   created_at: string;
 }
 
@@ -795,6 +804,16 @@ function toHumanGuidance(row: HumanGuidanceRow): DurableHumanGuidance {
   };
 }
 
+function toWorkerBudgetExtension(row: WorkerBudgetExtensionRow): DurableWorkerBudgetExtension {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    escalationId: row.escalation_id,
+    additionalWorkerExecutions: row.additional_worker_executions,
+    createdAt: row.created_at,
+  };
+}
+
 function toOperatorNotificationDelivery(
   row: OperatorNotificationDeliveryRow,
 ): DurableOperatorNotificationDelivery {
@@ -849,6 +868,7 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
   private readonly supportsLateExecutionReconciliation: boolean;
   private readonly supportsIsolatedWriteWorkspaces: boolean;
   private readonly supportsProjectInputs: boolean;
+  private readonly supportsWorkerBudgetExtensions: boolean;
 
   private constructor(databasePath: string, database: Database.Database) {
     this.databasePath = databasePath;
@@ -876,6 +896,9 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     ).get() as unknown) !== undefined;
     this.supportsProjectInputs = (database.prepare(
       "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'inputs'",
+    ).get() as unknown) !== undefined;
+    this.supportsWorkerBudgetExtensions = (database.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'worker_budget_extensions'",
     ).get() as unknown) !== undefined;
   }
 
@@ -2688,6 +2711,97 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     return (this.database.prepare(
       'SELECT * FROM human_guidance WHERE job_id = ? ORDER BY created_at, id',
     ).all(jobId) as HumanGuidanceRow[]).map(toHumanGuidance);
+  }
+
+  async authorizeWorkerBudgetExtensionAndResumeOperatorRun(
+    extension: DurableWorkerBudgetExtension,
+    guidance: DurableHumanGuidance | null,
+    resolvedAt: string,
+    resolutionSummary: string,
+    run: DurableOperatorRun,
+    expectedRunRevision: number,
+  ): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsWorkerBudgetExtensions) {
+      throw new Error('Worker Budget Extensions require Agent Operations schema v14');
+    }
+    requireNonEmpty(resolutionSummary, 'Escalation resolution summary');
+    if (!extension.id.startsWith('worker-budget-extension:')
+      || extension.additionalWorkerExecutions !== 1) {
+      throw new Error(`Invalid Worker Budget Extension: ${extension.id}`);
+    }
+    if (guidance && (!guidance.id.startsWith('guidance:')
+      || guidance.jobId !== extension.jobId
+      || guidance.escalationId !== extension.escalationId
+      || !guidance.instruction.trim()
+      || guidance.instruction.length > 4_096)) {
+      throw new Error(`Invalid Human Guidance association: ${guidance.id}`);
+    }
+    const persist = this.database.transaction(() => {
+      const escalation = this.database.prepare('SELECT job_id, resolved_at FROM escalations WHERE id = ?')
+        .get(extension.escalationId) as { job_id: string; resolved_at: string | null } | undefined;
+      const runRow = this.database.prepare('SELECT * FROM operator_runs WHERE id = ?')
+        .get(run.id) as OperatorRunRow | undefined;
+      const existingRun = runRow ? toOperatorRun(runRow) : null;
+      if (!escalation || escalation.job_id !== extension.jobId || escalation.resolved_at) {
+        throw new Error(`Invalid Worker Budget Extension association: ${extension.id}`);
+      }
+      if (!existingRun || existingRun.jobId !== extension.jobId
+        || existingRun.revision !== expectedRunRevision || run.revision !== expectedRunRevision + 1
+        || !isValidOperatorRunTransition(existingRun.status, run.status)) {
+        throw new Error(`Operator Run transition conflict: ${run.id}`);
+      }
+      this.database.prepare(`
+        INSERT INTO worker_budget_extensions
+          (id, job_id, escalation_id, additional_worker_executions, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        extension.id,
+        extension.jobId,
+        extension.escalationId,
+        extension.additionalWorkerExecutions,
+        extension.createdAt,
+      );
+      if (guidance) {
+        this.database.prepare(`
+          INSERT INTO human_guidance (id, job_id, escalation_id, instruction, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(guidance.id, guidance.jobId, guidance.escalationId, guidance.instruction, guidance.createdAt);
+      }
+      const escalationUpdate = this.database.prepare(`
+        UPDATE escalations
+        SET resolved_at = ?, resolution_summary = ?
+        WHERE id = ? AND resolved_at IS NULL
+      `).run(resolvedAt, resolutionSummary, extension.escalationId);
+      if (escalationUpdate.changes !== 1) {
+        throw new Error(`Escalation resolution conflict: ${extension.escalationId}`);
+      }
+      const runUpdate = this.database.prepare(`
+        UPDATE operator_runs
+        SET status = ?, failure_message = ?, revision = ?, updated_at = ?, started_at = ?, finished_at = ?
+        WHERE id = ? AND revision = ?
+      `).run(
+        run.status, run.failureMessage ?? null, run.revision, run.updatedAt,
+        run.startedAt ?? null, run.finishedAt ?? null, run.id, expectedRunRevision,
+      );
+      if (runUpdate.changes !== 1) throw new Error(`Operator Run transition conflict: ${run.id}`);
+    });
+    try {
+      persist();
+    } catch (error) {
+      throw new Error(`Could not persist Worker Budget Extension ${extension.id}: ${(error as Error).message}`);
+    }
+  }
+
+  async listWorkerBudgetExtensions(jobId: string): Promise<readonly DurableWorkerBudgetExtension[]> {
+    this.assertOpen();
+    if (!this.supportsWorkerBudgetExtensions) return [];
+    return (this.database.prepare(`
+      SELECT id, job_id, escalation_id, additional_worker_executions, created_at
+      FROM worker_budget_extensions
+      WHERE job_id = ?
+      ORDER BY created_at, id
+    `).all(jobId) as WorkerBudgetExtensionRow[]).map(toWorkerBudgetExtension);
   }
 
   async createOperatorNotificationDelivery(

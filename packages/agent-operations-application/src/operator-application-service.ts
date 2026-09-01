@@ -12,6 +12,7 @@ import {
   RESTRICTED_TEXT_EXECUTION_POLICY,
   REPOSITORY_WRITE_EXECUTION_CAPABILITIES,
   createHumanGuidanceId,
+  createWorkerBudgetExtensionId,
   createEscalationId,
   createOperatorRunId,
   isActiveAttemptStatus,
@@ -31,6 +32,7 @@ import type {
   OperatorApplication,
   OperatorAttemptStory,
   OperatorEscalationAction,
+  OperatorEscalationKind,
   OperatorExecutionStage,
   OperatorJobDetail,
   OperatorJobList,
@@ -56,6 +58,7 @@ export interface OperatorApplicationServiceOptions {
   readonly notifier?: OperatorNotifier;
   readonly operatorRunIdFactory?: () => string;
   readonly humanGuidanceIdFactory?: () => string;
+  readonly workerBudgetExtensionIdFactory?: () => string;
   readonly escalationIdFactory?: () => string;
   /** Persist mutations without waking this process's runner. Used by bounded external tool adapters. */
   readonly deferRunnerWake?: boolean;
@@ -90,6 +93,7 @@ export class OperatorApplicationService implements OperatorApplication {
   private readonly runtimeLifecycle?: RuntimeLifecycleAdapter;
   private readonly operatorRunIdFactory: () => string;
   private readonly humanGuidanceIdFactory: () => string;
+  private readonly workerBudgetExtensionIdFactory: () => string;
   private readonly escalationIdFactory: () => string;
   private readonly deferRunnerWake: boolean;
 
@@ -104,6 +108,8 @@ export class OperatorApplicationService implements OperatorApplication {
     this.runtimeLifecycle = options.runtimeLifecycle;
     this.operatorRunIdFactory = options.operatorRunIdFactory ?? (() => createOperatorRunId());
     this.humanGuidanceIdFactory = options.humanGuidanceIdFactory ?? (() => createHumanGuidanceId());
+    this.workerBudgetExtensionIdFactory = options.workerBudgetExtensionIdFactory
+      ?? (() => createWorkerBudgetExtensionId());
     this.escalationIdFactory = options.escalationIdFactory ?? (() => createEscalationId());
     this.deferRunnerWake = options.deferRunnerWake ?? false;
     this.runner = new OperatorRunner(store, orchestration, {
@@ -304,6 +310,58 @@ export class OperatorApplicationService implements OperatorApplication {
     return toRunSession(pending);
   }
 
+  async authorizeOneMoreWorkerAttempt(
+    escalationId: string,
+    instruction?: string,
+  ): Promise<OperatorRunSession> {
+    const escalation = await this.requireUnresolvedEscalation(escalationId);
+    const attempts = await this.store.listAttemptsForJob(escalation.jobId);
+    if (attempts.some(attempt => isActiveAttemptStatus(attempt.status))) {
+      throw new Error('Worker budget extension requires no active Attempt');
+    }
+    if (await this.hasUncertainDispatch(attempts)) {
+      throw new Error('Worker budget extension is forbidden while a Dispatch is uncertain');
+    }
+    const workerBudget = await readWorkerExecutionBudget(
+      this.store,
+      attempts,
+      MVP_MAX_WORKER_ATTEMPTS,
+    );
+    if (!workerBudget.exhausted
+      || !await this.allowsWorkerBudgetExtension(escalation, attempts)) {
+      throw new Error(`Escalation ${escalation.id} does not permit a Worker budget extension`);
+    }
+    const bounded = instruction?.trim();
+    if (bounded && bounded.length > 4_096) throw new Error('Guidance exceeds 4096 characters');
+    const timestamp = this.now().toISOString();
+    const run = await this.requireOperatorRun(escalation.jobId);
+    if (run.status !== 'needs_human') throw new Error(`Operator Run ${run.id} is ${run.status}`);
+    const pending: DurableOperatorRun = {
+      ...run,
+      status: 'pending',
+      failureMessage: undefined,
+      revision: run.revision + 1,
+      updatedAt: timestamp,
+      startedAt: undefined,
+      finishedAt: undefined,
+    };
+    await this.store.authorizeWorkerBudgetExtensionAndResumeOperatorRun({
+      id: this.workerBudgetExtensionIdFactory(),
+      jobId: escalation.jobId,
+      escalationId: escalation.id,
+      additionalWorkerExecutions: 1,
+      createdAt: timestamp,
+    }, bounded ? {
+      id: this.humanGuidanceIdFactory(),
+      jobId: escalation.jobId,
+      escalationId: escalation.id,
+      instruction: bounded,
+      createdAt: timestamp,
+    } : null, timestamp, 'Operator authorized exactly one additional Worker execution.', pending, run.revision);
+    if (!this.deferRunnerWake) void this.runner.wake();
+    return toRunSession(pending);
+  }
+
   async cancelEscalatedJob(escalationId: string): Promise<OperatorRunSession> {
     const escalation = await this.requireUnresolvedEscalation(escalationId);
     const attempts = await this.store.listAttemptsForJob(escalation.jobId);
@@ -403,6 +461,7 @@ export class OperatorApplicationService implements OperatorApplication {
     const reviews = await this.store.listAttemptReviewsForJob(job.id);
     const escalations = await this.store.listEscalations(job.id);
     const guidance = await this.store.listHumanGuidance(job.id);
+    const workerBudgetExtensions = await this.store.listWorkerBudgetExtensions(job.id);
     const notificationDeliveries = await this.store.listOperatorNotificationDeliveries(job.id);
     const stories = await Promise.all(attempts.map(attempt => this.buildAttemptStory(attempt)));
     const workerAttempts = stories
@@ -427,6 +486,14 @@ export class OperatorApplicationService implements OperatorApplication {
         ...(value.projectId ? { projectId: value.projectId } : {}),
         createdAt: value.createdAt,
       }));
+    const escalationActions = Object.fromEntries(await Promise.all(escalations.map(async escalation => [
+      escalation.id,
+      await this.actionsForEscalation(escalation, attempts),
+    ])));
+    const escalationKinds = Object.fromEntries(escalations.map(escalation => [
+      escalation.id,
+      classifyEscalation(escalation, escalationActions[escalation.id] ?? []),
+    ]));
     return {
       summary,
       acceptanceCriteria: job.acceptanceCriteria ?? '',
@@ -435,12 +502,11 @@ export class OperatorApplicationService implements OperatorApplication {
       reviews,
       escalations,
       guidance,
+      workerBudgetExtensions,
       notificationDeliveries,
       inputs,
-      escalationActions: Object.fromEntries(await Promise.all(escalations.map(async escalation => [
-        escalation.id,
-        await this.actionsForEscalation(escalation, attempts),
-      ]))),
+      escalationActions,
+      escalationKinds,
       ...(finalWorkerResult ? { finalWorkerResult } : {}),
       ...(finalReview ? { finalReview } : {}),
       ...(job.status === 'completed' ? { completedAt: job.updatedAt } : {}),
@@ -475,6 +541,9 @@ export class OperatorApplicationService implements OperatorApplication {
       orchestrationState: currentStage,
       workerAttemptCount: attempts.filter(attempt => attempt.executionRole === 'worker').length,
       workerExecutionCount: workerBudget.consumed,
+      automaticWorkerExecutionLimit: MVP_MAX_WORKER_ATTEMPTS,
+      humanWorkerBudgetExtensionCount: workerBudget.humanExtensions.length,
+      authorizedWorkerExecutionLimit: workerBudget.authorizedMaximum,
       latestReviewDecision: reviews.at(-1)?.decision ?? null,
       needsHuman: unresolved.length > 0,
       operatorRun,
@@ -583,7 +652,10 @@ export class OperatorApplicationService implements OperatorApplication {
       attempts,
       MVP_MAX_WORKER_ATTEMPTS,
     );
-    if (await this.allowsGuidedContinuation(escalation, attempts)
+    if (workerBudget.exhausted
+      && await this.allowsWorkerBudgetExtension(escalation, attempts)) {
+      actions.push('authorize-worker-budget-extension');
+    } else if (await this.allowsGuidedContinuation(escalation, attempts)
       && !workerBudget.exhausted) {
       actions.push('provide-guidance');
     }
@@ -596,13 +668,27 @@ export class OperatorApplicationService implements OperatorApplication {
     escalation: Awaited<ReturnType<AgentOperationsStateStore['getEscalation']>> & {},
     attempts: readonly DurableJobAttempt[],
   ): Promise<boolean> {
-    if (['human_judgment_required', 'reviewer_uncertain'].includes(escalation.reason)) return true;
+    if (escalation.reason === 'human_judgment_required') {
+      return !escalation.summary.startsWith('Ready for Approval.');
+    }
+    if (escalation.reason === 'reviewer_uncertain') return true;
     if (escalation.reason !== 'policy_blocked' || !escalation.attemptId) return false;
     const attempt = attempts.find(candidate => candidate.id === escalation.attemptId);
     if (!attempt || attempt.executionRole !== 'worker' || attempt.status !== 'cancelled') return false;
     const plan = await this.store.getExecutionPlanForAttempt(attempt.id);
     if (!plan) return false;
     return await this.store.getExecutionDispatchForPlan(plan.id) === null;
+  }
+
+  private async allowsWorkerBudgetExtension(
+    escalation: Awaited<ReturnType<AgentOperationsStateStore['getEscalation']>> & {},
+    attempts: readonly DurableJobAttempt[],
+  ): Promise<boolean> {
+    if (!escalation.attemptId || !escalation.reviewId) return false;
+    const attempt = attempts.find(candidate => candidate.id === escalation.attemptId);
+    if (!attempt || attempt.executionRole !== 'worker' || attempt.status !== 'completed') return false;
+    const review = await this.store.getAttemptReviewForWorkerAttempt(attempt.id);
+    return review?.id === escalation.reviewId && review.decision === 'REVISION_REQUIRED';
   }
 
   private async hasUncertainDispatch(attempts: readonly DurableJobAttempt[]): Promise<boolean> {
@@ -647,6 +733,18 @@ function isRecoverableObservationEscalation(
   return escalation.reason === 'observation_timeout'
     || (escalation.reason === 'runtime_failure'
       && escalation.summary.startsWith('Runtime observation failed: Observation text exceeds'));
+}
+
+function classifyEscalation(
+  escalation: DurableEscalation,
+  actions: readonly OperatorEscalationAction[],
+): OperatorEscalationKind {
+  if (escalation.reason === 'human_judgment_required'
+    && escalation.summary.startsWith('Ready for Approval.')) return 'human-approval';
+  if (actions.includes('authorize-worker-budget-extension')) return 'budget-extension-required';
+  if (actions.includes('provide-guidance')) return 'guidance-required';
+  if (actions.includes('reconcile-execution')) return 'actionable-continuation';
+  return 'terminal';
 }
 
 function taskTitle(task: string): string {

@@ -25,6 +25,7 @@ import { isBoundedExecutionResult } from '../observation.js';
 import type { DurableAttemptReview, DurableEscalation } from '../orchestration.js';
 import type {
   DurableHumanGuidance,
+  DurableWorkerBudgetExtension,
   DurableOperatorNotificationDelivery,
   DurableOperatorRun,
 } from '../operator.js';
@@ -49,6 +50,7 @@ export type InMemoryStateStoreOperation =
   | 'write-escalation'
   | 'write-operator-run'
   | 'write-human-guidance'
+  | 'write-worker-budget-extension'
   | 'write-operator-notification'
   | 'close';
 
@@ -183,6 +185,10 @@ function copyHumanGuidance(value: DurableHumanGuidance): DurableHumanGuidance {
   return { ...value };
 }
 
+function copyWorkerBudgetExtension(value: DurableWorkerBudgetExtension): DurableWorkerBudgetExtension {
+  return { ...value };
+}
+
 function copyOperatorNotificationDelivery(
   value: DurableOperatorNotificationDelivery,
 ): DurableOperatorNotificationDelivery {
@@ -254,6 +260,7 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   private readonly escalations = new Map<string, DurableEscalation>();
   private readonly operatorRuns = new Map<string, DurableOperatorRun>();
   private readonly humanGuidance = new Map<string, DurableHumanGuidance>();
+  private readonly workerBudgetExtensions = new Map<string, DurableWorkerBudgetExtension>();
   private readonly operatorNotificationDeliveries = new Map<string, DurableOperatorNotificationDelivery>();
   private closed = false;
 
@@ -1175,6 +1182,51 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
       .filter(value => value.jobId === jobId)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
       .map(copyHumanGuidance);
+  }
+
+  async authorizeWorkerBudgetExtensionAndResumeOperatorRun(
+    extension: DurableWorkerBudgetExtension,
+    guidance: DurableHumanGuidance | null,
+    resolvedAt: string,
+    resolutionSummary: string,
+    run: DurableOperatorRun,
+    expectedRunRevision: number,
+  ): Promise<void> {
+    this.assertAvailable('write-worker-budget-extension');
+    const escalation = this.escalations.get(extension.escalationId);
+    const existingRun = this.operatorRuns.get(run.id);
+    requireNonEmpty(resolutionSummary, 'Escalation resolution summary');
+    if (!extension.id.startsWith('worker-budget-extension:')
+      || extension.additionalWorkerExecutions !== 1
+      || !escalation || escalation.jobId !== extension.jobId || escalation.resolvedAt
+      || this.workerBudgetExtensions.has(extension.id)
+      || [...this.workerBudgetExtensions.values()].some(value => value.escalationId === extension.escalationId)) {
+      throw new Error(`Invalid Worker Budget Extension: ${extension.id}`);
+    }
+    if (guidance && (!guidance.id.startsWith('guidance:')
+      || guidance.jobId !== extension.jobId
+      || guidance.escalationId !== extension.escalationId
+      || !guidance.instruction.trim()
+      || [...this.humanGuidance.values()].some(value => value.escalationId === guidance.escalationId))) {
+      throw new Error(`Invalid Human Guidance association: ${guidance.id}`);
+    }
+    if (!existingRun || existingRun.jobId !== extension.jobId
+      || existingRun.revision !== expectedRunRevision || run.revision !== expectedRunRevision + 1
+      || !isValidOperatorRunTransition(existingRun.status, run.status)) {
+      throw new Error(`Operator Run transition conflict: ${run.id}`);
+    }
+    this.workerBudgetExtensions.set(extension.id, copyWorkerBudgetExtension(extension));
+    if (guidance) this.humanGuidance.set(guidance.id, copyHumanGuidance(guidance));
+    this.escalations.set(escalation.id, { ...escalation, resolvedAt, resolutionSummary });
+    this.operatorRuns.set(run.id, copyOperatorRun(run));
+  }
+
+  async listWorkerBudgetExtensions(jobId: string): Promise<readonly DurableWorkerBudgetExtension[]> {
+    this.assertAvailable('read');
+    return [...this.workerBudgetExtensions.values()]
+      .filter(value => value.jobId === jobId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+      .map(copyWorkerBudgetExtension);
   }
 
   async createOperatorNotificationDelivery(

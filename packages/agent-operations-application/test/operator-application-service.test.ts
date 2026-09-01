@@ -9,6 +9,7 @@ import {
 import {
   ExecutionPlanningService,
   JobLifecycleService,
+  readWorkerExecutionBudget,
   type OrchestrationPreview,
   type OrchestrationReadModel,
   type TimedOutExecutionReconciliation,
@@ -503,6 +504,7 @@ describe('OperatorApplicationService', () => {
       .toEqual([firstBlockedAttempt.id, secondBlockedAttempt.id]);
     expect(blockedDetail.escalationActions['escalation:policy-blocked'])
       .toEqual(['provide-guidance', 'cancel-job']);
+    expect(blockedDetail.escalationKinds['escalation:policy-blocked']).toBe('guidance-required');
     const continued = await application.provideGuidanceAndContinue(
       'escalation:policy-blocked',
       'The runtime is now available. Continue under the original read-only policy.',
@@ -525,6 +527,75 @@ describe('OperatorApplicationService', () => {
     expect(await store.getExecutionDispatchForPlan(firstPlan.id)).toBeNull();
     expect(await store.getExecutionDispatchForPlan(secondPlan.id)).toBeNull();
     expect(await store.getEscalation('escalation:policy-blocked')).toMatchObject({ resolvedAt: TIME });
+  });
+
+  it('durably authorizes exactly one additional Worker execution after automatic budget exhaustion', async () => {
+    const store = await configuredStore();
+    const seeded = await seedExhaustedRevision(store);
+    const application = new OperatorApplicationService(store, new FakeOrchestration(store), {
+      now: () => new Date(TIME),
+      deferRunnerWake: true,
+      workerBudgetExtensionIdFactory: () => 'worker-budget-extension:authorized',
+      humanGuidanceIdFactory: () => 'guidance:authorized',
+    });
+
+    const firstRead = await application.getJobDetail(seeded.jobId);
+    const secondRead = await application.getJobDetail(seeded.jobId);
+    expect(firstRead.summary).toMatchObject({
+      workerExecutionCount: 2,
+      automaticWorkerExecutionLimit: 2,
+      humanWorkerBudgetExtensionCount: 0,
+      authorizedWorkerExecutionLimit: 2,
+    });
+    expect(firstRead.escalationActions[seeded.escalationId]).toEqual([
+      'authorize-worker-budget-extension',
+      'cancel-job',
+    ]);
+    expect(firstRead.escalationKinds[seeded.escalationId]).toBe('budget-extension-required');
+    expect(secondRead.workerBudgetExtensions).toEqual([]);
+
+    const session = await application.authorizeOneMoreWorkerAttempt(
+      seeded.escalationId,
+      'Preserve the current approach and address the latest Reviewer feedback.',
+    );
+
+    expect(session.status).toBe('pending');
+    expect(await store.listWorkerBudgetExtensions(seeded.jobId)).toEqual([
+      expect.objectContaining({
+        id: 'worker-budget-extension:authorized',
+        escalationId: seeded.escalationId,
+        additionalWorkerExecutions: 1,
+      }),
+    ]);
+    expect(await store.listHumanGuidance(seeded.jobId)).toEqual([
+      expect.objectContaining({
+        escalationId: seeded.escalationId,
+        instruction: 'Preserve the current approach and address the latest Reviewer feedback.',
+      }),
+    ]);
+    expect(await store.getEscalation(seeded.escalationId)).toMatchObject({
+      resolvedAt: TIME,
+      resolutionSummary: 'Operator authorized exactly one additional Worker execution.',
+    });
+    expect(await store.getOperatorRunForJob(seeded.jobId)).toMatchObject({ status: 'pending', revision: 3 });
+    const budget = await readWorkerExecutionBudget(
+      store,
+      await store.listAttemptsForJob(seeded.jobId),
+      2,
+    );
+    expect(budget).toMatchObject({
+      consumed: 2,
+      automaticMaximum: 2,
+      automaticBudgetExhausted: true,
+      authorizedMaximum: 3,
+      remaining: 1,
+      exhausted: false,
+    });
+    expect(await Promise.all(seeded.planIds.map(id => store.getExecutionDispatchForPlan(id))))
+      .toEqual(seeded.dispatches);
+    await expect(application.authorizeOneMoreWorkerAttempt(seeded.escalationId))
+      .rejects.toThrow('already resolved');
+    expect(await store.listWorkerBudgetExtensions(seeded.jobId)).toHaveLength(1);
   });
 
   it('cancels an eligible Needs Me Job while preserving resolved escalation history', async () => {
@@ -748,4 +819,115 @@ async function configuredStore(): Promise<InMemoryAgentOperationsStateStore> {
     runtimeAgentIds: [RUNTIME_ID],
   });
   return store;
+}
+
+async function seedExhaustedRevision(store: InMemoryAgentOperationsStateStore) {
+  const lifecycle = new JobLifecycleService(store, {
+    now: () => new Date(TIME),
+    jobIdFactory: () => 'job:exhausted-revision',
+  });
+  const job = await lifecycle.markJobReady((await lifecycle.createJob({
+    projectId: PROJECT_ID,
+    repositoryId: REPOSITORY_ID,
+    preferredRuntimeAgentId: RUNTIME_ID,
+    title: 'Revise after automatic budget exhaustion',
+    description: INPUT.task,
+    acceptanceCriteria: INPUT.acceptanceCriteria,
+    automaticReadOnlyCompletion: true,
+  })).id);
+  const planning = new ExecutionPlanningService(store, {
+    now: () => new Date(TIME),
+    planIdFactory: (() => { let sequence = 0; return () => `plan:exhausted:${++sequence}`; })(),
+  });
+  const planIds: string[] = [];
+  const dispatches = [];
+  let latestWorkerId = '';
+  let latestReviewId = '';
+  for (let index = 1; index <= 2; index += 1) {
+    const worker = await lifecycle.createAttempt(job.id, {
+      runtimeAgentId: RUNTIME_ID,
+      executionRole: 'worker',
+    });
+    latestWorkerId = worker.id;
+    const plan = await planning.prepareExecutionPlan({
+      projectId: PROJECT_ID,
+      attemptId: worker.id,
+      instruction: 'Read the repository without mutation.',
+      requestedPolicy: RESTRICTED_TEXT_EXECUTION_POLICY,
+      requestedCapabilities: REPOSITORY_READ_EXECUTION_CAPABILITIES,
+    });
+    planIds.push(plan.id);
+    await lifecycle.startAttempt(worker.id);
+    const prepared = {
+      id: `dispatch:exhausted:${index}`,
+      executionPlanId: plan.id,
+      attemptId: worker.id,
+      jobId: job.id,
+      runtimeAgentId: RUNTIME_ID,
+      idempotencyKey: createExecutionDispatchIdempotencyKey(plan.id),
+      status: 'prepared' as const,
+      revision: 0,
+      createdAt: TIME,
+      updatedAt: TIME,
+    };
+    await store.createExecutionDispatch(prepared);
+    const submitting = {
+      ...prepared,
+      status: 'submitting' as const,
+      revision: 1,
+      submittedAt: TIME,
+    };
+    await store.saveExecutionDispatchTransition(submitting, 0);
+    const accepted = {
+      ...submitting,
+      status: 'accepted' as const,
+      revision: 2,
+      effectivePolicy: RESTRICTED_TEXT_EXECUTION_POLICY,
+      effectiveCapabilities: REPOSITORY_READ_EXECUTION_CAPABILITIES,
+      externalReference: `cortextos:codex-turn:v1:thread:${index}`,
+      acceptedAt: TIME,
+      resolvedAt: TIME,
+    };
+    await store.saveExecutionDispatchTransition(accepted, 1);
+    dispatches.push(accepted);
+    await lifecycle.completeAttempt(worker.id, `Worker ${index} produced a bounded result.`);
+    const reviewer = await lifecycle.createAttempt(job.id, {
+      runtimeAgentId: RUNTIME_ID,
+      executionRole: 'reviewer',
+    });
+    await lifecycle.startAttempt(reviewer.id);
+    await lifecycle.completeAttempt(reviewer.id, 'Reviewer requested revision.');
+    latestReviewId = `review:exhausted:${index}`;
+    await store.createAttemptReview({
+      id: latestReviewId,
+      jobId: job.id,
+      workerAttemptId: worker.id,
+      reviewerAttemptId: reviewer.id,
+      reviewerRuntimeAgentId: RUNTIME_ID,
+      decision: 'REVISION_REQUIRED',
+      summary: 'A source backed correction is still required.',
+      feedback: `Reviewer feedback ${index}.`,
+      createdAt: TIME,
+    });
+  }
+  const escalationId = 'escalation:exhausted';
+  await store.createEscalation({
+    id: escalationId,
+    jobId: job.id,
+    attemptId: latestWorkerId,
+    reviewId: latestReviewId,
+    reason: 'review_failed_after_budget',
+    summary: 'Worker execution budget of 2 is exhausted.',
+    createdAt: TIME,
+  });
+  const run = {
+    id: 'operator-run:exhausted', jobId: job.id, status: 'pending' as const, revision: 0,
+    createdAt: TIME, updatedAt: TIME,
+  };
+  await store.createOperatorRun(run);
+  await store.saveOperatorRunTransition({ ...run, status: 'running', revision: 1, startedAt: TIME }, 0);
+  await store.saveOperatorRunTransition({
+    ...run, status: 'needs_human', revision: 2, startedAt: TIME, finishedAt: TIME,
+  }, 1);
+  return { jobId: job.id, escalationId, planIds, dispatches };
 }

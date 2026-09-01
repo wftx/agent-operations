@@ -165,6 +165,7 @@ function fakeOperator(): OperatorApplication {
   return {
     startRunner() {}, listProjects: vi.fn(async () => []), getRuntimeStatus: vi.fn(), startRuntime: vi.fn(),
     previewTask: vi.fn(), runOperatorJob: vi.fn(), waitForRun: vi.fn(), provideGuidanceAndContinue: vi.fn(),
+    authorizeOneMoreWorkerAttempt: vi.fn(),
     reconcileTimedOutExecution: vi.fn(), cancelEscalatedJob: vi.fn(), listJobs: vi.fn(async () => []), getJobDetail: vi.fn(),
   };
 }

@@ -18,6 +18,7 @@ import type {
 } from './orchestration.js';
 import type {
   DurableHumanGuidance,
+  DurableWorkerBudgetExtension,
   DurableOperatorNotificationDelivery,
   DurableOperatorRun,
 } from './operator.js';
@@ -196,6 +197,15 @@ export interface AgentOperationsStateStore {
     expectedRunRevision: number,
   ): Promise<void>;
   listHumanGuidance(jobId: string): Promise<readonly DurableHumanGuidance[]>;
+  authorizeWorkerBudgetExtensionAndResumeOperatorRun(
+    extension: DurableWorkerBudgetExtension,
+    guidance: DurableHumanGuidance | null,
+    resolvedAt: string,
+    resolutionSummary: string,
+    run: DurableOperatorRun,
+    expectedRunRevision: number,
+  ): Promise<void>;
+  listWorkerBudgetExtensions(jobId: string): Promise<readonly DurableWorkerBudgetExtension[]>;
   createOperatorNotificationDelivery(
     delivery: DurableOperatorNotificationDelivery,
   ): Promise<boolean>;

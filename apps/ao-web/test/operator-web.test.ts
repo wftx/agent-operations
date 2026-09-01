@@ -26,6 +26,8 @@ class StubOperatorApplication implements OperatorApplication {
   previewCalls = 0;
   runCalls = 0;
   guidanceCalls = 0;
+  extensionCalls = 0;
+  extensionGuidance: string | undefined;
   cancelCalls = 0;
   reconcileCalls = 0;
   startRuntimeCalls = 0;
@@ -88,6 +90,12 @@ class StubOperatorApplication implements OperatorApplication {
     return { jobId: SUMMARY_ESCALATED.job.id, status: 'pending', startedAt: TIME };
   }
 
+  async authorizeOneMoreWorkerAttempt(_escalationId: string, instruction?: string): Promise<OperatorRunSession> {
+    this.extensionCalls += 1;
+    this.extensionGuidance = instruction;
+    return { jobId: SUMMARY_ESCALATED.job.id, status: 'pending', startedAt: TIME };
+  }
+
   async cancelEscalatedJob(): Promise<OperatorRunSession> {
     this.cancelCalls += 1;
     return { jobId: SUMMARY_ESCALATED.job.id, status: 'cancelled', startedAt: TIME, finishedAt: TIME };
@@ -140,7 +148,7 @@ describe('OperatorWebApplication', () => {
     expect(bodies[3]).toContain('All acceptance criteria are satisfied.');
     expect(bodies[3]).toContain('2 Worker executions');
     expect(bodies[3]).toContain('2 historical Attempts');
-    expect(bodies[4]).toContain('2 of 2 consumed');
+    expect(bodies[4]).toContain('2 of 2 automatic slots consumed');
     expect(bodies[4]).toContain('Historical Worker Attempt 1');
     expect(bodies[4]).toContain('REVISION_REQUIRED');
     expect(bodies[4]).toContain('Historical Worker Attempt 2');
@@ -174,7 +182,7 @@ describe('OperatorWebApplication', () => {
       .handle(new Request(`http://127.0.0.1/jobs/${encodeURIComponent(SUMMARY_ESCALATED.job.id)}`));
     const body = await response.text();
 
-    expect(body).toContain('0 of 2 consumed');
+    expect(body).toContain('0 of 2 automatic slots consumed');
     expect(body).toContain('2 historical Worker Attempts retained for audit');
     expect(body).toContain('Historical Worker Attempt 1');
     expect(body).toContain('Historical Worker Attempt 2');
@@ -191,6 +199,7 @@ describe('OperatorWebApplication', () => {
         summary: 'The accepted Worker turn exceeded the observation window.',
       }],
       escalationActions: { 'escalation:1': ['reconcile-execution'] },
+      escalationKinds: { 'escalation:1': 'actionable-continuation' },
     };
     service.getJobDetail = async () => detail;
     const response = await new OperatorWebApplication(service)
@@ -198,6 +207,7 @@ describe('OperatorWebApplication', () => {
     const body = await response.text();
     expect(body).toContain('Check Execution Again');
     expect(body).toContain('does not resend the task');
+    expect(body).toContain('Actionable Continuation');
     expect(body).toContain('/escalations/escalation%3A1/reconcile');
   });
 
@@ -232,6 +242,109 @@ describe('OperatorWebApplication', () => {
     ));
     expect(reconcile.status).toBe(303);
     expect(service.reconcileCalls).toBe(1);
+  });
+
+  it('offers one explicit budget extension with Reviewer feedback and optional guidance', async () => {
+    const service = new StubOperatorApplication();
+    const exhausted: OperatorJobDetail = {
+      ...ESCALATED_DETAIL,
+      summary: {
+        ...SUMMARY_ESCALATED,
+        workerAttemptCount: 2,
+        workerExecutionCount: 2,
+        latestReviewDecision: 'REVISION_REQUIRED',
+      },
+      workerAttempts: [
+        { attempt: { ...WORKER_ONE, jobId: SUMMARY_ESCALATED.job.id } },
+        { attempt: { ...WORKER_TWO, jobId: SUMMARY_ESCALATED.job.id }, review: {
+          ...REVIEW_ONE,
+          jobId: SUMMARY_ESCALATED.job.id,
+          workerAttemptId: WORKER_TWO.id,
+          feedback: 'Correct the source boundary before the next review.',
+        } },
+      ],
+      finalReview: {
+        ...REVIEW_ONE,
+        jobId: SUMMARY_ESCALATED.job.id,
+        workerAttemptId: WORKER_TWO.id,
+        feedback: 'Correct the source boundary before the next review.',
+      },
+      escalations: [{
+        id: 'escalation:budget', jobId: SUMMARY_ESCALATED.job.id,
+        attemptId: WORKER_TWO.id, reviewId: REVIEW_ONE.id,
+        reason: 'review_failed_after_budget',
+        summary: 'Worker execution budget of 2 is exhausted.', createdAt: TIME,
+      }],
+      escalationActions: {
+        'escalation:budget': ['authorize-worker-budget-extension', 'cancel-job'],
+      },
+      escalationKinds: { 'escalation:budget': 'budget-extension-required' },
+    };
+    service.getJobDetail = async () => exhausted;
+    const app = new OperatorWebApplication(service);
+
+    const first = await (await app.handle(new Request(
+      `http://127.0.0.1/jobs/${encodeURIComponent(SUMMARY_ESCALATED.job.id)}`,
+    ))).text();
+    await app.handle(new Request(`http://127.0.0.1/jobs/${encodeURIComponent(SUMMARY_ESCALATED.job.id)}`));
+    expect(first).toContain('Reviewer feedback');
+    expect(first).toContain('Correct the source boundary before the next review.');
+    expect(first).toContain('Optional guidance for the next Worker');
+    expect(first).toContain('Authorize 1 More Attempt + Continue');
+    expect(first).toContain('Cancel Job');
+    expect(service.extensionCalls).toBe(0);
+
+    const response = await app.handle(new Request(
+      `http://127.0.0.1/escalations/${encodeURIComponent('escalation:budget')}/extend-worker-budget`,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ instruction: 'Keep the layout and address the review.' }),
+      },
+    ));
+    expect(response.status).toBe(303);
+    expect(service.extensionCalls).toBe(1);
+    expect(service.extensionGuidance).toBe('Keep the layout and address the review.');
+  });
+
+  it('does not offer continuation for a genuinely terminal Needs Me state', async () => {
+    const service = new StubOperatorApplication();
+    service.getJobDetail = async () => ({
+      ...ESCALATED_DETAIL,
+      escalations: [{
+        id: 'escalation:terminal', jobId: SUMMARY_ESCALATED.job.id,
+        reason: 'dispatch_uncertain', summary: 'Provider acceptance cannot be determined.', createdAt: TIME,
+      }],
+      escalationActions: { 'escalation:terminal': ['cancel-job'] },
+      escalationKinds: { 'escalation:terminal': 'terminal' },
+    });
+    const body = await (await new OperatorWebApplication(service).handle(new Request(
+      `http://127.0.0.1/jobs/${encodeURIComponent(SUMMARY_ESCALATED.job.id)}`,
+    ))).text();
+    expect(body).toContain('Cancel Job');
+    expect(body).not.toContain('Authorize 1 More Attempt + Continue');
+    expect(body).not.toContain('Provide Guidance + Continue');
+  });
+
+  it('labels human approval without offering a continuation action', async () => {
+    const service = new StubOperatorApplication();
+    service.getJobDetail = async () => ({
+      ...ESCALATED_DETAIL,
+      escalations: [{
+        id: 'escalation:approval', jobId: SUMMARY_ESCALATED.job.id,
+        reason: 'human_judgment_required',
+        summary: 'Ready for Approval. Review the bounded evidence.', createdAt: TIME,
+      }],
+      escalationActions: { 'escalation:approval': ['cancel-job'] },
+      escalationKinds: { 'escalation:approval': 'human-approval' },
+    });
+    const body = await (await new OperatorWebApplication(service).handle(new Request(
+      'http://127.0.0.1/needs-me',
+    ))).text();
+    expect(body).toContain('Human Approval');
+    expect(body).toContain('AO will not continue or publish automatically.');
+    expect(body).not.toContain('Authorize 1 More Attempt + Continue');
+    expect(body).not.toContain('Provide Guidance + Continue');
   });
 
   it('shows an offline runtime without starting it and rejects invalid action requests', async () => {
@@ -388,6 +501,9 @@ function summary(
     orchestrationState: state,
     workerAttemptCount: status === 'completed' ? 2 : 0,
     workerExecutionCount: status === 'completed' ? 2 : 0,
+    automaticWorkerExecutionLimit: 2,
+    humanWorkerBudgetExtensionCount: 0,
+    authorizedWorkerExecutionLimit: 2,
     latestReviewDecision: status === 'completed' ? 'PASS' : null,
     needsHuman,
     operatorRun: {
@@ -440,7 +556,9 @@ const DETAIL: OperatorJobDetail = {
   reviews: [REVIEW_ONE, REVIEW_TWO],
   escalations: [],
   guidance: [],
+  workerBudgetExtensions: [],
   notificationDeliveries: [],
+  escalationKinds: {},
   escalationActions: {},
   finalWorkerResult: 'Final answer: PASS / REVISION_REQUIRED / ESCALATE',
   finalReview: REVIEW_TWO,
@@ -466,6 +584,8 @@ const ESCALATED_DETAIL: OperatorJobDetail = {
     summary: 'Choose whether to revise the task.', createdAt: TIME,
   }],
   guidance: [],
+  workerBudgetExtensions: [],
   notificationDeliveries: [],
   escalationActions: { 'escalation:1': ['provide-guidance', 'cancel-job'] },
+  escalationKinds: { 'escalation:1': 'guidance-required' },
 };

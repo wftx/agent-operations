@@ -2,6 +2,7 @@ import type {
   AgentOperationsStateStore,
   DurableExecutionDispatch,
   DurableJobAttempt,
+  DurableWorkerBudgetExtension,
 } from '../../agent-operations-contracts/src/index.js';
 
 export interface WorkerExecutionBudget {
@@ -9,7 +10,11 @@ export interface WorkerExecutionBudget {
   readonly historicalAttempts: readonly DurableJobAttempt[];
   /** Worker Attempts whose Dispatch crossed, or may have crossed, submission. */
   readonly consumingAttempts: readonly DurableJobAttempt[];
+  readonly automaticMaximum: number;
+  readonly humanExtensions: readonly DurableWorkerBudgetExtension[];
+  readonly authorizedMaximum: number;
   readonly consumed: number;
+  readonly automaticBudgetExhausted: boolean;
   readonly remaining: number;
   readonly exhausted: boolean;
 }
@@ -43,11 +48,21 @@ export async function readWorkerExecutionBudget(
     }
   }
   const consumed = consumingAttempts.length;
+  const jobId = historicalAttempts[0]?.jobId;
+  const humanExtensions = jobId ? await store.listWorkerBudgetExtensions(jobId) : [];
+  const authorizedMaximum = maximum + humanExtensions.reduce(
+    (total, extension) => total + extension.additionalWorkerExecutions,
+    0,
+  );
   return {
     historicalAttempts,
     consumingAttempts,
+    automaticMaximum: maximum,
+    humanExtensions,
+    authorizedMaximum,
     consumed,
-    remaining: Math.max(0, maximum - consumed),
-    exhausted: consumed >= maximum,
+    automaticBudgetExhausted: consumed >= maximum,
+    remaining: Math.max(0, authorizedMaximum - consumed),
+    exhausted: consumed >= authorizedMaximum,
   };
 }

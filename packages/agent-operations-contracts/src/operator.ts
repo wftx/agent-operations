@@ -32,6 +32,15 @@ export interface DurableHumanGuidance {
   readonly createdAt: string;
 }
 
+/** One explicit operator authorization for one additional Worker execution. */
+export interface DurableWorkerBudgetExtension {
+  readonly id: string;
+  readonly jobId: string;
+  readonly escalationId: string;
+  readonly additionalWorkerExecutions: 1;
+  readonly createdAt: string;
+}
+
 export const OPERATOR_NOTIFICATION_KINDS = ['job_completed', 'needs_human'] as const;
 export type OperatorNotificationKind = (typeof OPERATOR_NOTIFICATION_KINDS)[number];
 
@@ -65,6 +74,10 @@ export function createOperatorRunId(uuid: string = randomUUID()): string {
 
 export function createHumanGuidanceId(uuid: string = randomUUID()): string {
   return prefixedId('guidance', uuid, 'Human Guidance');
+}
+
+export function createWorkerBudgetExtensionId(uuid: string = randomUUID()): string {
+  return prefixedId('worker-budget-extension', uuid, 'Worker Budget Extension');
 }
 
 export function createOperatorNotificationDeliveryId(uuid: string = randomUUID()): string {

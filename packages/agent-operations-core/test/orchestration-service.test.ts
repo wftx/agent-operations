@@ -71,9 +71,14 @@ type ObservationFixture =
 
 class ScriptedExecutionAdapter implements RuntimeExecutionAdapter {
   readonly requests: RuntimeDispatchRequest[] = [];
-  private index = 0;
+  private index: number;
 
-  constructor(private readonly results: readonly ('accepted' | 'rejected' | 'uncertain')[] = []) {}
+  constructor(
+    private readonly results: readonly ('accepted' | 'rejected' | 'uncertain')[] = [],
+    startIndex = 0,
+  ) {
+    this.index = startIndex;
+  }
 
   async dispatch(request: RuntimeDispatchRequest): Promise<RuntimeDispatchResult> {
     this.requests.push(request);
@@ -635,6 +640,91 @@ describe('OrchestrationService', () => {
       remaining: 0,
       exhausted: true,
     });
+  });
+
+  it('uses one durable human extension for one fresh Worker and Reviewer only', async () => {
+    const setup = await harness([
+      { kind: 'completed', resultText: WRONG_RESULT },
+      { kind: 'completed', resultText: REVISION },
+      { kind: 'completed', resultText: WRONG_RESULT },
+      { kind: 'completed', resultText: REVISION },
+    ]);
+    const exhausted = await setup.service.runJob(JOB_ID);
+    const escalation = exhausted.escalations[0]!;
+    const oldPlanIds = new Set(setup.execution.requests.map(request => request.executionPlanId));
+    const oldDispatches = await Promise.all([...oldPlanIds].map(async planId =>
+      setup.store.getExecutionDispatchForPlan(planId)));
+    const run = {
+      id: 'operator-run:budget-extension', jobId: JOB_ID, status: 'pending' as const, revision: 0,
+      createdAt: TIME, updatedAt: TIME,
+    };
+    await setup.store.createOperatorRun(run);
+    await setup.store.saveOperatorRunTransition({
+      ...run, status: 'running', revision: 1, startedAt: TIME,
+    }, 0);
+    await setup.store.saveOperatorRunTransition({
+      ...run, status: 'needs_human', revision: 2, startedAt: TIME, finishedAt: TIME,
+    }, 1);
+    await setup.store.authorizeWorkerBudgetExtensionAndResumeOperatorRun({
+      id: 'worker-budget-extension:one', jobId: JOB_ID, escalationId: escalation.id,
+      additionalWorkerExecutions: 1, createdAt: TIME,
+    }, {
+      id: 'guidance:extension', jobId: JOB_ID, escalationId: escalation.id,
+      instruction: 'Preserve the verified parts and correct the exact source identification.', createdAt: TIME,
+    }, TIME, 'Operator authorized exactly one additional Worker execution.', {
+      ...run, status: 'pending', revision: 3,
+    }, 2);
+
+    const execution = new ScriptedExecutionAdapter([], 4);
+    const observer = new ScriptedObservationAdapter([
+      { kind: 'completed', resultText: WRONG_RESULT },
+      { kind: 'completed', resultText: REVISION },
+    ]);
+    let reviewSequence = 10;
+    let escalationSequence = 10;
+    const resumed = new OrchestrationService(
+      setup.store,
+      setup.runtimes,
+      setup.repositories,
+      execution,
+      observer,
+      {
+        now: () => new Date(TIME),
+        observationIntervalMs: 0,
+        observationTimeoutMs: 0,
+        sleep: async () => undefined,
+        attemptReviewIdFactory: () => `review:${++reviewSequence}`,
+        escalationIdFactory: () => `escalation:${++escalationSequence}`,
+      },
+    );
+    const result = await resumed.runJob(JOB_ID);
+
+    expect(result.finalDecision).toBe('ESCALATED');
+    expect(result.workerAttempts).toHaveLength(3);
+    expect(result.reviewerAttempts).toHaveLength(3);
+    expect(execution.requests).toHaveLength(2);
+    expect(new Set(execution.requests.map(request => request.executionPlanId)).size).toBe(2);
+    expect(execution.requests.every(request => !oldPlanIds.has(request.executionPlanId))).toBe(true);
+    expect(execution.requests[0]!.input.instruction).toContain('Search packages/agent-operations-contracts');
+    expect(execution.requests[0]!.input.instruction)
+      .toContain('Preserve the verified parts and correct the exact source identification.');
+    expect(await Promise.all([...oldPlanIds].map(async planId =>
+      setup.store.getExecutionDispatchForPlan(planId)))).toEqual(oldDispatches);
+    expect(setup.execution.requests).toHaveLength(4);
+    expect(await readWorkerExecutionBudget(setup.store, result.workerAttempts, 2)).toMatchObject({
+      consumed: 3,
+      automaticMaximum: 2,
+      automaticBudgetExhausted: true,
+      authorizedMaximum: 3,
+      remaining: 0,
+      exhausted: true,
+    });
+    expect(result.escalations.filter(candidate => !candidate.resolvedAt)).toEqual([
+      expect.objectContaining({
+        attemptId: result.workerAttempts[2]!.id,
+        reviewId: 'review:11',
+      }),
+    ]);
   });
 
   it('escalates malformed Reviewer output instead of guessing', async () => {

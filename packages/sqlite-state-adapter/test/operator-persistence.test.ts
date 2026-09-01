@@ -155,6 +155,64 @@ describe('daily Operator persistence', () => {
     await reopened.close();
   });
 
+  it('atomically persists one human Worker budget extension per escalation', async () => {
+    const databasePath = path();
+    const store = open(databasePath);
+    const job = await seed(store);
+    const run = {
+      id: 'operator-run:extension', jobId: job.id, status: 'pending' as const, revision: 0,
+      createdAt: TIME, updatedAt: TIME,
+    };
+    await store.createOperatorRun(run);
+    await store.saveOperatorRunTransition({
+      ...run, status: 'running', revision: 1, startedAt: TIME,
+    }, 0);
+    await store.saveOperatorRunTransition({
+      ...run, status: 'needs_human', revision: 2, startedAt: TIME, finishedAt: TIME,
+    }, 1);
+    await store.createEscalation({
+      id: 'escalation:extension', jobId: job.id, reason: 'review_failed_after_budget',
+      summary: 'Worker execution budget of 2 is exhausted.', createdAt: TIME,
+    });
+    const extension = {
+      id: 'worker-budget-extension:1', jobId: job.id, escalationId: 'escalation:extension',
+      additionalWorkerExecutions: 1 as const, createdAt: TIME,
+    };
+    const pending = { ...run, status: 'pending' as const, revision: 3 };
+
+    await store.authorizeWorkerBudgetExtensionAndResumeOperatorRun(
+      extension,
+      {
+        id: 'guidance:extension', jobId: job.id, escalationId: 'escalation:extension',
+        instruction: 'Keep the Reviewer feedback and check the exact file.', createdAt: TIME,
+      },
+      TIME,
+      'Operator authorized exactly one additional Worker execution.',
+      pending,
+      2,
+    );
+
+    expect(await store.listWorkerBudgetExtensions(job.id)).toEqual([extension]);
+    expect(await store.listHumanGuidance(job.id)).toEqual([
+      expect.objectContaining({ instruction: 'Keep the Reviewer feedback and check the exact file.' }),
+    ]);
+    expect(await store.getEscalation('escalation:extension')).toMatchObject({
+      resolvedAt: TIME,
+      resolutionSummary: 'Operator authorized exactly one additional Worker execution.',
+    });
+    expect(await store.getOperatorRunForJob(job.id)).toMatchObject({ status: 'pending', revision: 3 });
+    await expect(store.authorizeWorkerBudgetExtensionAndResumeOperatorRun(
+      { ...extension, id: 'worker-budget-extension:duplicate' }, null, TIME,
+      'Duplicate.', { ...pending, revision: 4 }, 3,
+    )).rejects.toThrow();
+    expect(await store.listWorkerBudgetExtensions(job.id)).toHaveLength(1);
+    await store.close();
+
+    const reopened = open(databasePath);
+    expect(await reopened.listWorkerBudgetExtensions(job.id)).toEqual([extension]);
+    await reopened.close();
+  });
+
   it('upgrades populated v9 state without rewriting existing orchestration truth', async () => {
     const databasePath = path();
     const legacy = open(databasePath, 9);
@@ -173,6 +231,7 @@ describe('daily Operator persistence', () => {
     });
     expect(await upgraded.listOperatorRuns()).toEqual([]);
     expect(await upgraded.listHumanGuidance(job.id)).toEqual([]);
+    expect(await upgraded.listWorkerBudgetExtensions(job.id)).toEqual([]);
     expect(await upgraded.listOperatorNotificationDeliveries()).toEqual([]);
     await upgraded.close();
   });
