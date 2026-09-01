@@ -163,14 +163,13 @@ export class CortextOSOrchestratorConversationAdapter implements OrchestratorCon
         new Date(observedAt.getTime() - this.timeoutMs).toISOString(),
         observedAt.toISOString(),
       );
-      const response = await this.sender({ type: 'list-agents', source: 'agent-operations web conversation readiness' });
+      const response = await this.sender({ type: 'status', source: 'agent-operations web conversation readiness' });
       if (!isRecord(response) || response.success !== true || !Array.isArray(response.data)) {
         return { state: 'offline', reason: 'CortextOS runtime inventory is unavailable.' };
       }
       const agent = response.data.find(candidate => isRecord(candidate) && candidate.name === this.agentName);
       if (!isRecord(agent)) return { state: 'offline', reason: `CortextOS agent ${this.agentName} is not registered.` };
-      if (agent.enabled === false) return { state: 'offline', reason: `CortextOS agent ${this.agentName} is disabled.` };
-      if (agent.running !== true) return { state: 'offline', reason: `CortextOS agent ${this.agentName} is not running.` };
+      if (agent.status !== 'running') return { state: 'offline', reason: `CortextOS agent ${this.agentName} is not running.` };
       return this.state.list().some(turn => turn.status === 'pending')
         ? { state: 'busy', reason: 'The AO Orchestrator is already handling a turn.' }
         : { state: 'ready' };

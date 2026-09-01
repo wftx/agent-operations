@@ -22,7 +22,7 @@ describe('CortextOSOrchestratorConversationAdapter', () => {
       pollIntervalMs: 5,
       turnIdFactory: () => `conversation:${++sequence}`,
       requestSender: async request => {
-        if (request.type === 'list-agents') return readyInventory();
+        if (request.type === 'status') return readyInventory();
         const text = String((request.data as Record<string, unknown>).text);
         const turnId = text.match(/Turn ID: (conversation:[A-Za-z0-9-]+)/)![1]!;
         queueMicrotask(() => {
@@ -63,6 +63,21 @@ describe('CortextOSOrchestratorConversationAdapter', () => {
     await expect(adapter.sendTurn({ message: 'Create a Job.' })).rejects.toThrow('not registered');
     expect(injections).toBe(0);
     expect((await adapter.getConversationState()).runtimeState).toBe('offline');
+  });
+
+  it('uses the daemon structured status inventory for readiness', async () => {
+    const root = temporaryRoot();
+    const requests: string[] = [];
+    const adapter = new CortextOSOrchestratorConversationAdapter({
+      ctxRoot: root,
+      requestSender: async request => {
+        requests.push(String(request.type));
+        return readyInventory();
+      },
+    });
+
+    await expect(adapter.getConversationState()).resolves.toMatchObject({ runtimeState: 'ready' });
+    expect(requests).toEqual(['status']);
   });
 
   it('reconciles an expired pending turn after web process restart', async () => {
@@ -118,7 +133,7 @@ describe('CortextOSOrchestratorConversationAdapter', () => {
 });
 
 function readyInventory() {
-  return { success: true, data: [{ name: 'ao-orchestrator', enabled: true, running: true }] };
+  return { success: true, data: [{ name: 'ao-orchestrator', status: 'running', pid: 24680 }] };
 }
 
 function temporaryRoot(): string {
