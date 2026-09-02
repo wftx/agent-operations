@@ -651,6 +651,24 @@ describe('OrchestrationService', () => {
     ]);
     const exhausted = await setup.service.runJob(JOB_ID);
     const escalation = exhausted.escalations[0]!;
+    const priorReview = exhausted.reviews[0]!;
+    const priorWorker = exhausted.workerAttempts[0]!;
+    await setup.store.createEscalation({
+      id: 'escalation:prior-human-guidance',
+      jobId: JOB_ID,
+      attemptId: priorWorker.id,
+      reviewId: priorReview.id,
+      reason: 'human_judgment_required',
+      summary: priorReview.feedback!,
+      createdAt: '2024-12-31T23:59:59.000Z',
+    });
+    await setup.store.createHumanGuidanceAndResolveEscalation({
+      id: 'guidance:prior-worker',
+      jobId: JOB_ID,
+      escalationId: 'escalation:prior-human-guidance',
+      instruction: 'Use the Reviewer feedback in exactly one fresh Worker execution.',
+      createdAt: '2024-12-31T23:59:59.000Z',
+    }, '2024-12-31T23:59:59.000Z');
     const oldPlanIds = new Set(setup.execution.requests.map(request => request.executionPlanId));
     const oldDispatches = await Promise.all([...oldPlanIds].map(async planId =>
       setup.store.getExecutionDispatchForPlan(planId)));
@@ -674,6 +692,16 @@ describe('OrchestrationService', () => {
     }, TIME, 'Operator authorized exactly one additional Worker execution.', {
       ...run, status: 'pending', revision: 3,
     }, 2);
+    expect(await readWorkerExecutionBudget(
+      setup.store,
+      await setup.store.listAttemptsForJob(JOB_ID),
+      2,
+    )).toMatchObject({
+      consumed: 2,
+      authorizedMaximum: 3,
+      remaining: 1,
+      exhausted: false,
+    });
 
     const execution = new ScriptedExecutionAdapter([], 4);
     const observer = new ScriptedObservationAdapter([
@@ -706,6 +734,7 @@ describe('OrchestrationService', () => {
     expect(new Set(execution.requests.map(request => request.executionPlanId)).size).toBe(2);
     expect(execution.requests.every(request => !oldPlanIds.has(request.executionPlanId))).toBe(true);
     expect(execution.requests[0]!.input.instruction).toContain('Search packages/agent-operations-contracts');
+    expect(execution.requests[0]!.input.instruction).toContain(exhausted.reviews.at(-1)!.feedback!);
     expect(execution.requests[0]!.input.instruction)
       .toContain('Preserve the verified parts and correct the exact source identification.');
     expect(await Promise.all([...oldPlanIds].map(async planId =>
@@ -725,6 +754,30 @@ describe('OrchestrationService', () => {
         reviewId: 'review:11',
       }),
     ]);
+
+    const attemptsAfterContinuation = await setup.store.listAttemptsForJob(JOB_ID);
+    const escalationsAfterContinuation = await setup.store.listEscalations(JOB_ID);
+    const repeat = await resumed.runJob(JOB_ID);
+    const restarted = new OrchestrationService(
+      setup.store,
+      setup.runtimes,
+      setup.repositories,
+      execution,
+      observer,
+      {
+        now: () => new Date(TIME),
+        observationIntervalMs: 0,
+        observationTimeoutMs: 0,
+        sleep: async () => undefined,
+      },
+    );
+    const afterRestart = await restarted.runJob(JOB_ID);
+
+    expect(repeat.finalDecision).toBe('ESCALATED');
+    expect(afterRestart.finalDecision).toBe('ESCALATED');
+    expect(await setup.store.listAttemptsForJob(JOB_ID)).toEqual(attemptsAfterContinuation);
+    expect(await setup.store.listEscalations(JOB_ID)).toEqual(escalationsAfterContinuation);
+    expect(execution.requests).toHaveLength(2);
   });
 
   it('escalates malformed Reviewer output instead of guessing', async () => {

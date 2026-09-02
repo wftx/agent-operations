@@ -401,8 +401,12 @@ export class OrchestrationService {
           );
           return this.readModel(job.id, 'ESCALATED');
         }
+        const humanContinuationAuthorized = review.decision === 'REVISION_REQUIRED'
+          && !workerBudget.exhausted
+          && await this.hasHumanWorkerExtensionForReview(job.id, latestWorker.id, review.id);
         if (review.decision === 'REVISION_REQUIRED'
-          && await this.isHumanGuidedWorkerAttempt(job.id, latestWorker)) {
+          && await this.isHumanGuidedWorkerAttempt(job.id, latestWorker)
+          && !humanContinuationAuthorized) {
           await this.escalate(
             job.id,
             'human_judgment_required',
@@ -1126,6 +1130,21 @@ export class OrchestrationService {
       if (nextWorker?.id === attempt.id) return true;
     }
     return false;
+  }
+
+  private async hasHumanWorkerExtensionForReview(
+    jobId: string,
+    attemptId: string,
+    reviewId: string,
+  ): Promise<boolean> {
+    const [escalations, extensions] = await Promise.all([
+      this.store.listEscalations(jobId),
+      this.store.listWorkerBudgetExtensions(jobId),
+    ]);
+    return extensions.some(extension => {
+      const escalation = escalations.find(candidate => candidate.id === extension.escalationId);
+      return escalation?.attemptId === attemptId && escalation.reviewId === reviewId;
+    });
   }
 
   private async policyBlockedGuidanceFor(
