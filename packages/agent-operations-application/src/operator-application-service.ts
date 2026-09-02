@@ -201,6 +201,7 @@ export class OperatorApplicationService implements OperatorApplication {
         throw new Error(`Input ${inputId} belongs to another Project`);
       }
     }
+    if (input.browserEvidenceRequirement) validateBrowserEvidenceRequirement(input.browserEvidenceRequirement);
     return {
       project,
       repository,
@@ -214,6 +215,9 @@ export class OperatorApplicationService implements OperatorApplication {
       executionMode,
       executionAuthorized: false,
       ...(input.inputIds?.length ? { inputIds: [...input.inputIds] } : {}),
+      ...(input.browserEvidenceRequirement
+        ? { browserEvidenceRequirement: { ...input.browserEvidenceRequirement, viewport: { ...input.browserEvidenceRequirement.viewport } } }
+        : {}),
     };
   }
 
@@ -245,6 +249,9 @@ export class OperatorApplicationService implements OperatorApplication {
       });
       const job = await this.lifecycle.markJobReady(created.id);
       if (input.inputIds?.length) await this.store.attachInputsToJob(job.id, input.inputIds);
+      if (preview.browserEvidenceRequirement) {
+        await this.store.setJobBrowserEvidenceRequirement(job.id, preview.browserEvidenceRequirement);
+      }
       const createdAt = this.now().toISOString();
       await this.store.createOperatorRun({
         id: this.operatorRunIdFactory(),
@@ -524,6 +531,10 @@ export class OperatorApplicationService implements OperatorApplication {
     const finalWorkerResult = [...workerAttempts].reverse().find(story => story.resultText)?.resultText;
     const finalReview = reviews.at(-1);
     const repositoryWorkspace = await this.store.getRepositoryWorkspaceForJob(job.id);
+    const browserEvidenceRequirement = await this.store.getJobBrowserEvidenceRequirement(job.id);
+    const previewSession = await this.store.getPreviewSessionForJob(job.id);
+    const previewProfile = previewSession ? await this.store.getPreviewProfile(previewSession.profileId) : null;
+    const browserEvidence = await this.store.listBrowserEvidenceForJob(job.id);
     const inputs = (await Promise.all((await this.store.listJobInputIds(job.id)).map(id => this.store.getInput(id))))
       .filter(value => value !== null)
       .map(value => ({
@@ -559,6 +570,10 @@ export class OperatorApplicationService implements OperatorApplication {
       ...(finalReview ? { finalReview } : {}),
       ...(job.status === 'completed' ? { completedAt: job.updatedAt } : {}),
       ...(repositoryWorkspace ? { repositoryWorkspace } : {}),
+      ...(browserEvidenceRequirement ? { browserEvidenceRequirement } : {}),
+      ...(previewSession ? { previewSession } : {}),
+      ...(previewProfile ? { previewProfile } : {}),
+      ...(browserEvidence.length ? { browserEvidence } : {}),
     };
   }
 
@@ -760,6 +775,16 @@ export class OperatorApplicationService implements OperatorApplication {
     const run = await this.store.getOperatorRunForJob(jobId);
     if (!run) throw new Error(`Operator Run not found for Job: ${jobId}`);
     return run;
+  }
+}
+
+function validateBrowserEvidenceRequirement(requirement: import('../../agent-operations-contracts/src/index.js').BrowserEvidenceRequirement): void {
+  if (requirement.kind !== 'browser-render' || !/^\/(?!\/)/.test(requirement.route)
+    || requirement.route.includes('://') || requirement.route.includes('\0')
+    || !Number.isInteger(requirement.viewport.width) || requirement.viewport.width < 320
+    || requirement.viewport.width > 2_560 || !Number.isInteger(requirement.viewport.height)
+    || requirement.viewport.height < 240 || requirement.viewport.height > 2_560) {
+    throw new Error('Browser render evidence requirement is invalid');
   }
 }
 

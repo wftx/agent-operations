@@ -23,6 +23,32 @@ polling only read AO durable state. Preview creates no Job, Plan, or Dispatch.
 **Run Job** durably accepts a Job and returns immediately; the one-process local
 runner continues Worker and Reviewer work after the HTTP request ends.
 
+## Exact local previews and browser evidence
+
+A Job may require a browser render at one repository relative route and bounded
+viewport. AO keeps detected preview script candidates separate from a durable
+Preview Profile. The command is validated only after an explicit preview start
+or as required by an authorized Job. It runs as tokenized process arguments,
+never through a shell, and binds only to a dynamic `127.0.0.1` port.
+
+Read only Jobs use a clean detached AO worktree at one verified commit. Write
+Jobs use their existing isolated Job worktree. The primary checkout is never a
+preview execution root. AO records both the commit and a source state hash so a
+render cannot be attributed to a changed worktree.
+
+The Job detail page offers explicit Start Preview and Capture Evidence actions.
+Loading or refreshing any page starts nothing. The bounded browser can access
+only the exact Preview Session origin. It blocks external URLs, other local
+ports, file URLs, downloads, and redirect escapes. Evidence includes the route,
+viewport, title, final URL, visible text, console failures, failed resources,
+screenshot dimensions, byte size, SHA 256, and a durable evidence hash.
+
+Screenshot bytes use the existing immutable Input storage boundary. Workers and
+Reviewers receive only the bounded Browser Evidence record and the attached
+screenshot Input ID. AO storage paths are never exposed. A Job with a required
+browser render stops before provider execution if preview or capture cannot be
+proven for the exact source state.
+
 If the runtime is offline, **Start Runtime** is the only web action that may
 start CortextOS. It is an explicit POST action. Page load, refresh, status
 inventory, previews, and Job detail reads never start a process. The lifecycle

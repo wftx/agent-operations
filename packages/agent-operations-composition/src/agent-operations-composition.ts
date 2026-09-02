@@ -3,12 +3,14 @@ import {
   OperatorApplicationService,
   ProjectApplicationService,
   InputApplicationService,
+  PreviewApplicationService,
   OrchestratorConversationApplicationService,
   OrchestratorToolApplicationService,
   type OperatorApplication,
   type OrchestratorConversationService,
   type ProjectApplication,
   type InputApplication,
+  type PreviewApplication,
 } from '../../agent-operations-application/src/index.js';
 import { OrchestrationService, RepositoryWorkspaceService } from '../../agent-operations-core/src/index.js';
 import {
@@ -18,7 +20,8 @@ import {
 import { CortextOSOrchestratorConversationAdapter } from '../../cortextos-conversation-adapter/src/index.js';
 import { CortextOSExecutionAdapter } from '../../cortextos-execution-adapter/src/index.js';
 import { CortextOSExecutionObserver } from '../../cortextos-execution-observer/src/index.js';
-import { GitRepositoryAdapter, GitRepositoryWorkspaceAdapter } from '../../git-adapter/src/index.js';
+import { GitPreviewWorkspaceAdapter, GitRepositoryAdapter, GitRepositoryWorkspaceAdapter } from '../../git-adapter/src/index.js';
+import { NodePreviewProcessAdapter, PlaywrightBoundedBrowserAdapter } from '../../preview-browser-adapter/src/index.js';
 import {
   FileInputObjectStorage,
   LocalProjectResourceInspector,
@@ -48,6 +51,7 @@ export interface AgentOperationsComposition {
   readonly tools: OrchestratorToolApplicationService;
   readonly projects: ProjectApplication;
   readonly inputs: InputApplication;
+  readonly preview: PreviewApplication;
   readonly telegramConfigured: boolean;
   close(): Promise<void>;
 }
@@ -70,11 +74,22 @@ export function createAgentOperationsComposition(
     new FileInputObjectStorage(`${stateLocation.stateDirectory}/inputs`),
     new SecureAuthorizedUrlInputFetcher(),
   );
+  const writeWorkspaceAdapter = new GitRepositoryWorkspaceAdapter({ workspaceRoot: `${stateLocation.stateDirectory}/workspaces` });
   const repositoryWorkspace = new RepositoryWorkspaceService(
     store,
     repositories,
-    new GitRepositoryWorkspaceAdapter({ workspaceRoot: `${stateLocation.stateDirectory}/workspaces` }),
+    writeWorkspaceAdapter,
     { stateDirectory: stateLocation.stateDirectory },
+  );
+  const preview = new PreviewApplicationService(
+    store,
+    repositories,
+    new GitPreviewWorkspaceAdapter({ workspaceRoot: `${stateLocation.stateDirectory}/preview-workspaces` }),
+    writeWorkspaceAdapter,
+    new NodePreviewProcessAdapter(),
+    new PlaywrightBoundedBrowserAdapter(),
+    inputs,
+    { previewWorkspaceRoot: `${stateLocation.stateDirectory}/preview-workspaces` },
   );
   const orchestration = new OrchestrationService(
     store,
@@ -82,7 +97,7 @@ export function createAgentOperationsComposition(
     repositories,
     new CortextOSExecutionAdapter(),
     new CortextOSExecutionObserver(),
-    { workspaceService: repositoryWorkspace },
+    { workspaceService: repositoryWorkspace, browserEvidence: preview },
   );
   const notification = loadNotifier();
   const operator = new OperatorApplicationService(store, orchestration, {
@@ -111,6 +126,7 @@ export function createAgentOperationsComposition(
     tools,
     projects,
     inputs,
+    preview,
     telegramConfigured: notification.configured,
     async close() {
       if (runnerTimer) clearInterval(runnerTimer);

@@ -156,6 +156,10 @@ export function renderDashboard(
         <label>Acceptance criteria
           <textarea name="acceptanceCriteria" rows="3" required placeholder="Identify the authoritative contract file and its three dimensions.">${escapeHtml(options.input?.acceptanceCriteria ?? '')}</textarea>
         </label>
+        <label>Visual evidence
+          <select name="browserEvidence"><option value="">Not required</option><option value="browser-render" ${options.input?.browserEvidenceRequirement ? 'selected' : ''}>Capture browser render</option></select>
+        </label>
+        <label>Preview route<input name="browserRoute" value="${escapeAttr(options.input?.browserEvidenceRequirement?.route ?? '/')}" placeholder="/dashboard"></label>
         <div class="defaults"><span>Repository <strong>${selectedMode === 'repository-write-isolated' ? 'isolated workspace' : 'read only'}</strong></span><span>Network <strong>deny</strong></span><span>Environment <strong>empty</strong></span><span>Worker executions <strong>max 2</strong></span><span>Reviewer <strong>on</strong></span><span>Result <strong>${selectedMode === 'repository-write-isolated' ? 'approval required after PASS' : 'complete after PASS'}</strong></span></div>
         <div class="actions"><button class="secondary" name="intent" value="preview">Preview</button><button name="intent" value="run" ${runnable.length ? '' : 'disabled'}>Run Job</button></div>
       </form>
@@ -227,6 +231,7 @@ export function renderJobDetail(detail: OperatorJobDetail): string {
     <section class="criteria"><p class="eyebrow">Execution mode</p><p><strong>${summary.job.executionMode === 'repository-write-isolated' ? 'Isolated repository write' : 'Repository read only'}</strong>${detail.repositoryWorkspace ? ` · branch ${escapeHtml(detail.repositoryWorkspace.branchName)} · base ${escapeHtml(detail.repositoryWorkspace.baseRevision.slice(0, 12))} · workspace ${escapeHtml(detail.repositoryWorkspace.canonicalPath)} · state ${escapeHtml(detail.repositoryWorkspace.state)}` : ''}</p>${detail.repositoryWorkspace?.evidence ? `<p>${detail.repositoryWorkspace.evidence.changedFiles.length} changed file(s), ${detail.repositoryWorkspace.evidence.binaryFiles?.length ?? 0} binary. Diff ${detail.repositoryWorkspace.evidence.diffTruncated ? 'was truncated to its audit bound' : 'captured in full'}. ${detail.repositoryWorkspace.evidence.testResults.length} test result(s) recorded.</p><details><summary>Bounded diff evidence</summary><pre>${escapeHtml(detail.repositoryWorkspace.evidence.diffStat)}\n\n${escapeHtml(detail.repositoryWorkspace.evidence.diffText)}</pre></details>` : ''}</section>
     <section class="criteria"><p class="eyebrow">Worker execution budget</p><p><strong>${Math.min(summary.workerExecutionCount, summary.automaticWorkerExecutionLimit)} of ${summary.automaticWorkerExecutionLimit} automatic slots consumed</strong> · ${summary.humanWorkerBudgetExtensionCount} human ${summary.humanWorkerBudgetExtensionCount === 1 ? 'extension' : 'extensions'} authorized · ${summary.workerExecutionCount} of ${summary.authorizedWorkerExecutionLimit} total authorized executions consumed · ${summary.workerAttemptCount} historical Worker ${summary.workerAttemptCount === 1 ? 'Attempt' : 'Attempts'} retained for audit.</p></section>
     <section class="criteria"><p class="eyebrow">Acceptance criteria</p><p>${escapeHtml(detail.acceptanceCriteria)}</p></section>
+    ${renderBrowserEvidence(detail)}
     ${detail.inputs?.length ? `<section class="criteria"><p class="eyebrow">Attached Inputs</p>${detail.inputs.map(input => `<p><strong>${escapeHtml(input.displayName)}</strong> · ${escapeHtml(input.mimeType)} · ${input.byteSize} bytes · SHA256 ${escapeHtml(input.sha256)}</p>`).join('')}</section>` : ''}
     ${extensionReview ? `<section class="criteria review revision_required"><p class="eyebrow">Reviewer feedback requiring another attempt</p><h2>${escapeHtml(extensionReview.decision)}</h2><p>${escapeHtml(extensionReview.feedback ?? extensionReview.summary)}</p></section>` : ''}
     ${escalations}<section class="story">${story || '<div class="empty"><h2>Accepted</h2><p>Agent Operations will prepare the first Worker Attempt.</p></div>'}${guidance}${budgetExtensions}</section>
@@ -235,6 +240,33 @@ export function renderJobDetail(detail: OperatorJobDetail): string {
       ${detail.finalReview ? `<h3>Reviewer ${escapeHtml(detail.finalReview.decision)}</h3><p>${escapeHtml(detail.finalReview.summary)}</p>` : ''}
     </section>`;
   return layout(summary.job.title, content, summary.needsHuman ? 'needs-me' : summary.job.status === 'completed' ? 'done' : 'running', summary.operatorRun?.status === 'pending' || summary.operatorRun?.status === 'running' ? 10 : undefined);
+}
+
+function renderBrowserEvidence(detail: OperatorJobDetail): string {
+  const requirement = detail.browserEvidenceRequirement;
+  const jobId = encodeURIComponent(detail.summary.job.id);
+  if (!requirement) return `<section class="criteria"><p class="eyebrow">Local preview</p>
+    <p>Capture an exact local render only when this Job needs visual evidence. This action does not create a Worker or Reviewer.</p>
+    <form method="post" action="/jobs/${jobId}/preview/requirement"><label>Application route<input name="route" value="/" placeholder="/dashboard" required></label><div class="actions"><button>Require Browser Evidence</button></div></form>
+  </section>`;
+  const session = detail.previewSession;
+  const evidence = detail.browserEvidence?.at(-1);
+  return `<section class="criteria"><p class="eyebrow">Browser evidence</p>
+    <p><strong>${evidence ? 'Captured' : session?.state === 'running' ? 'Preview ready' : 'Required'}</strong> · route ${escapeHtml(requirement.route)} · viewport ${requirement.viewport.width} × ${requirement.viewport.height}</p>
+    ${session ? `<p>Preview ${escapeHtml(session.state)} · exact revision ${escapeHtml(session.revisionCommit.slice(0, 12))} · source state ${escapeHtml(session.sourceStateHash.slice(0, 12))}${session.state === 'running' ? ` · <a href="${escapeAttr(`${session.origin}${requirement.route}`)}" target="_blank" rel="noopener">View Preview</a>` : ''}</p>` : ''}
+    ${evidence ? `<p>Screenshot SHA256 ${escapeHtml(evidence.screenshotSha256)} · ${evidence.screenshotByteSize} bytes · ${evidence.screenshotWidth} × ${evidence.screenshotHeight} · evidence ${escapeHtml(evidence.evidenceHash)}</p><details><summary>Bounded page evidence</summary><pre>${escapeHtml(evidence.visibleText)}\n\nConsole failures: ${escapeHtml(evidence.consoleFailures.join('\n') || 'none')}\nFailed resources: ${escapeHtml(evidence.failedResources.join('\n') || 'none')}</pre></details>` : ''}
+    ${detail.previewProfile?.status === 'invalid' ? `<div class="alert error"><strong>Preview command needs attention.</strong><br>${escapeHtml(detail.previewProfile.validation?.message ?? 'The selected command did not produce a healthy local preview.')}</div>` : ''}
+    <form method="post" action="/jobs/${jobId}/preview/profile"><label>Selected preview command<input name="command" value="${escapeAttr(detail.previewProfile ? displayPreviewCommand(detail.previewProfile.command) : '')}" placeholder="npm run dev" required></label><div class="actions"><button class="secondary">Save Preview Profile</button></div></form>
+    <div class="actions"><form method="post" action="/jobs/${jobId}/preview/start"><button>${session?.state === 'running' ? 'Check Preview' : 'Start Preview'}</button></form>${session?.state === 'running' ? `<form method="post" action="/jobs/${jobId}/preview/evidence"><button class="secondary">${evidence ? 'Refresh Evidence' : 'Capture Evidence'}</button></form>` : ''}</div>
+  </section>`;
+}
+
+function displayPreviewCommand(command: { readonly executable: string; readonly arguments: readonly string[] }): string {
+  const args = [...command.arguments];
+  const suffix = args.slice(-5).join(' ');
+  if (suffix === '-- --hostname {host} --port {port}' || suffix === '-- --host {host} --port {port}') args.splice(-5);
+  else if (args.slice(-4).join(' ') === '--hostname {host} --port {port}' || args.slice(-4).join(' ') === '--host {host} --port {port}') args.splice(-4);
+  return [command.executable, ...args].join(' ');
 }
 
 export function renderError(message: string, status = 500): string {

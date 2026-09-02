@@ -91,6 +91,7 @@ describe('SQLite Agent Operations state store', () => {
       { version: 12, name: 'isolated-write-job-workspaces' },
       { version: 13, name: 'project-onboarding-and-job-inputs' },
       { version: 14, name: 'human-worker-budget-extensions' },
+      { version: 15, name: 'preview-profiles-and-browser-evidence' },
     ]);
     database.close();
 
@@ -149,6 +150,51 @@ describe('SQLite Agent Operations state store', () => {
     expect(await reopened.listCheckoutBindings(REPOSITORY_ID)).toEqual(configured.checkoutBindings);
     expect(await reopened.listProjectRepositoryIds('ao')).toEqual([REPOSITORY_ID]);
     expect(await reopened.listProjectRuntimeAgentIds('ao')).toEqual(['operations/agent']);
+    await reopened.close();
+  });
+
+  it('persists Preview Profiles, exact sessions, requirements, and bounded Browser Evidence', async () => {
+    const databasePath = temporaryPath('preview.db');
+    const store = open(databasePath);
+    await store.applyProjectConfiguration(configuration());
+    await store.createJob({ id: 'job:preview', projectId: 'ao', repositoryId: REPOSITORY_ID,
+      title: 'Visual proof', status: 'draft', revision: 0, createdAt: TIME, updatedAt: TIME });
+    await store.savePreviewProfile({ id: `preview-profile:${'a'.repeat(64)}`, projectId: 'ao', name: 'default',
+      command: { executable: 'npm', arguments: ['run', 'dev', '--', '--port', '{port}'] },
+      status: 'candidate', revision: 0, createdAt: TIME, updatedAt: TIME });
+    await store.setJobBrowserEvidenceRequirement('job:preview', {
+      kind: 'browser-render', route: '/dashboard', viewport: { width: 1440, height: 900 },
+    });
+    await store.createInput({ id: 'input:screenshot', displayName: 'proof.png', mimeType: 'image/png',
+      byteSize: 100, sha256: 'b'.repeat(64), sourceType: 'uploaded-file', projectId: 'ao',
+      storageReference: 'opaque:proof', ingestionState: 'complete', validationState: 'valid', createdAt: TIME });
+    const session = { id: 'preview-session:one', jobId: 'job:preview', projectId: 'ao',
+      repositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID,
+      profileId: `preview-profile:${'a'.repeat(64)}`,
+      workspaceKind: 'read-only-detached-worktree' as const, workspacePath: '/ao/previews/job-preview',
+      revisionCommit: 'c'.repeat(40), sourceStateHash: 'd'.repeat(64),
+      origin: 'http://127.0.0.1:4311', route: '/dashboard', port: 4311,
+      state: 'starting' as const, logs: '', revision: 0, createdAt: TIME, updatedAt: TIME };
+    await store.createPreviewSession(session);
+    await store.savePreviewSessionTransition({ ...session, state: 'running', pid: 88,
+      logs: 'ready', revision: 1 }, 0);
+    await store.createBrowserEvidence({ id: 'browser-evidence:one', jobId: 'job:preview', projectId: 'ao',
+      repositoryId: REPOSITORY_ID, previewProfileId: session.profileId, previewSessionId: session.id,
+      revisionCommit: session.revisionCommit, sourceStateHash: session.sourceStateHash,
+      origin: session.origin, route: '/dashboard', viewport: { width: 1440, height: 900 },
+      capturedAt: TIME, title: 'Dashboard', finalUrl: `${session.origin}/dashboard`,
+      screenshotInputId: 'input:screenshot', screenshotSha256: 'b'.repeat(64), screenshotByteSize: 100,
+      screenshotWidth: 1440, screenshotHeight: 900, visibleText: 'Revenue 42', consoleFailures: [],
+      failedResources: [], audit: [{ operation: 'navigate', target: `${session.origin}/dashboard`, occurredAt: TIME }],
+      version: 1, evidenceHash: 'e'.repeat(64) });
+    await store.close();
+
+    const reopened = open(databasePath);
+    expect(await reopened.getJobBrowserEvidenceRequirement('job:preview')).toMatchObject({ route: '/dashboard' });
+    expect(await reopened.getPreviewSessionForJob('job:preview')).toMatchObject({ state: 'running', pid: 88 });
+    expect(await reopened.listBrowserEvidenceForJob('job:preview')).toEqual([
+      expect.objectContaining({ screenshotInputId: 'input:screenshot', sourceStateHash: 'd'.repeat(64), visibleText: 'Revenue 42' }),
+    ]);
     await reopened.close();
   });
 
@@ -308,7 +354,7 @@ describe('SQLite Agent Operations state store', () => {
       installationIdFactory: () => INSTALLATION_ID,
       now: () => new Date(TIME),
       additionalMigrations: [{
-        version: 15,
+        version: 16,
         name: 'deliberate-test-failure',
         up: database => {
           database.exec('CREATE TABLE should_rollback (id TEXT)');
@@ -322,7 +368,7 @@ describe('SQLite Agent Operations state store', () => {
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'should_rollback'",
     ).get()).toBeUndefined();
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }]);
     database.close();
 
     const corruptPath = temporaryPath('corrupt.db');

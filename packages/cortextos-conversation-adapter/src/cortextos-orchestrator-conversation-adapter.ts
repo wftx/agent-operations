@@ -30,9 +30,9 @@ interface StoredTurn extends OrchestratorConversationTurn {
 
 type RequestSender = (request: Record<string, unknown>) => Promise<unknown>;
 
-/** Catalog required by the Phase 27C AO Web conversation contract. */
+/** Catalog required by the current AO Web conversation contract. */
 export const EXPECTED_AO_ORCHESTRATOR_TOOL_CATALOG_REVISION =
-  'sha256:85bca3441a06e127d569ff70f85f1267e95ffcb9d9a7e429cbfee2f465e26b77';
+  'sha256:ab0fb12cd6fbe36e6539231237e69bf00aaeae46d0bd69ab31aa7612744c976e';
 
 export interface CortextOSOrchestratorConversationAdapterOptions {
   readonly instanceId?: string;

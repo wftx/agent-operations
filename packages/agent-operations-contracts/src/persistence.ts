@@ -28,6 +28,12 @@ import type {
   DurableProjectProfile,
 } from './project.js';
 import type { DurableInput } from './input.js';
+import type {
+  BrowserEvidenceRequirement,
+  DurableBrowserEvidence,
+  DurablePreviewProfile,
+  DurablePreviewSession,
+} from './preview.js';
 
 export interface AgentOperationsInstallation {
   readonly id: string;
@@ -114,6 +120,9 @@ export interface AgentOperationsStateStore {
   listLocalFolderResources(projectId?: string): Promise<readonly DurableLocalFolderResource[]>;
   saveProjectProfile(profile: DurableProjectProfile): Promise<void>;
   getProjectProfile(projectId: string): Promise<DurableProjectProfile | null>;
+  savePreviewProfile(profile: DurablePreviewProfile): Promise<void>;
+  getPreviewProfile(id: string): Promise<DurablePreviewProfile | null>;
+  listPreviewProfiles(projectId?: string): Promise<readonly DurablePreviewProfile[]>;
   createInput(input: DurableInput): Promise<void>;
   getInput(id: string): Promise<DurableInput | null>;
   listInputs(projectId?: string): Promise<readonly DurableInput[]>;
@@ -121,6 +130,15 @@ export interface AgentOperationsStateStore {
   listConversationInputIds(conversationId: string): Promise<readonly string[]>;
   attachInputsToJob(jobId: string, inputIds: readonly string[]): Promise<void>;
   listJobInputIds(jobId: string): Promise<readonly string[]>;
+  setJobBrowserEvidenceRequirement(jobId: string, requirement: BrowserEvidenceRequirement): Promise<void>;
+  getJobBrowserEvidenceRequirement(jobId: string): Promise<BrowserEvidenceRequirement | null>;
+  createPreviewSession(session: DurablePreviewSession): Promise<void>;
+  getPreviewSession(id: string): Promise<DurablePreviewSession | null>;
+  getPreviewSessionForJob(jobId: string): Promise<DurablePreviewSession | null>;
+  savePreviewSessionTransition(session: DurablePreviewSession, expectedRevision: number): Promise<void>;
+  createBrowserEvidence(evidence: DurableBrowserEvidence): Promise<void>;
+  getBrowserEvidence(id: string): Promise<DurableBrowserEvidence | null>;
+  listBrowserEvidenceForJob(jobId: string): Promise<readonly DurableBrowserEvidence[]>;
   recordRepositoryObservation(observation: DurableRepositoryObservation): Promise<void>;
   getLatestRepositoryObservation(checkoutBindingId: string): Promise<DurableRepositoryObservation | null>;
   recordRuntimeObservation(observation: DurableRuntimeObservation): Promise<void>;

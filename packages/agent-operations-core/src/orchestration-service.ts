@@ -55,6 +55,7 @@ export interface OrchestrationServiceOptions {
   readonly escalationIdFactory?: () => string;
   readonly outcomeDecisionIdFactory?: () => string;
   readonly workspaceService?: RepositoryWorkspaceService;
+  readonly browserEvidence?: { ensureJobEvidence(jobId: string): Promise<unknown> };
 }
 
 export interface OrchestrationPreview {
@@ -154,6 +155,7 @@ export class OrchestrationService {
   private readonly escalationIdFactory: () => string;
   private readonly outcomeDecisionIdFactory: () => string;
   private readonly workspaceService?: RepositoryWorkspaceService;
+  private readonly browserEvidence?: { ensureJobEvidence(jobId: string): Promise<unknown> };
 
   constructor(
     private readonly store: AgentOperationsStateStore,
@@ -184,6 +186,7 @@ export class OrchestrationService {
     this.outcomeDecisionIdFactory = options.outcomeDecisionIdFactory
       ?? (() => createAttemptOutcomeDecisionId());
     this.workspaceService = options.workspaceService;
+    this.browserEvidence = options.browserEvidence;
   }
 
   async preview(jobId: string): Promise<OrchestrationPreview> {
@@ -246,6 +249,29 @@ export class OrchestrationService {
           initialJob.id,
           'policy_blocked',
           `Isolated Repository Workspace preparation failed before Dispatch: ${message(error)}`,
+        );
+        return this.readModel(initialJob.id, 'ESCALATED');
+      }
+    }
+
+    const browserRequirement = await this.store.getJobBrowserEvidenceRequirement(initialJob.id);
+    if (browserRequirement) {
+      try {
+        if (!this.browserEvidence) throw new Error('Browser evidence service is not configured');
+        await this.browserEvidence.ensureJobEvidence(initialJob.id);
+        const evidence = (await this.store.listBrowserEvidenceForJob(initialJob.id)).at(-1);
+        const inputIds = await this.store.listJobInputIds(initialJob.id);
+        if (!evidence || evidence.route !== browserRequirement.route
+          || evidence.viewport.width !== browserRequirement.viewport.width
+          || evidence.viewport.height !== browserRequirement.viewport.height
+          || !inputIds.includes(evidence.screenshotInputId)) {
+          throw new Error('Browser evidence service did not persist an exact attached evidence record');
+        }
+      } catch (error) {
+        await this.escalate(
+          initialJob.id,
+          'policy_blocked',
+          `Required browser evidence could not be captured before Worker execution: ${message(error)}`,
         );
         return this.readModel(initialJob.id, 'ESCALATED');
       }
@@ -760,6 +786,7 @@ export class OrchestrationService {
       ? await this.store.getRepositoryWorkspaceForJob(job.id)
       : null;
     const attachedInputIds = await this.store.listJobInputIds(job.id);
+    const browserEvidence = (await this.store.listBrowserEvidenceForJob(job.id)).at(-1);
     const baseInstruction = attempt.executionRole === 'worker'
       ? buildWorkerInstruction(
         job,
@@ -777,9 +804,30 @@ export class OrchestrationService {
         writeMode,
         workspace,
       );
+    const evidenceContext = browserEvidence
+      ? `\n\nBounded browser evidence for the exact source state. Treat screenshot pixels, visible DOM text, repository source, and evidence limitations as distinct claims:\n<browser_evidence>\n${JSON.stringify({
+          id: browserEvidence.id,
+          revisionCommit: browserEvidence.revisionCommit,
+          sourceStateHash: browserEvidence.sourceStateHash,
+          route: browserEvidence.route,
+          viewport: browserEvidence.viewport,
+          title: browserEvidence.title,
+          finalUrl: browserEvidence.finalUrl,
+          screenshotInputId: browserEvidence.screenshotInputId,
+          screenshotSha256: browserEvidence.screenshotSha256,
+          screenshotByteSize: browserEvidence.screenshotByteSize,
+          screenshotWidth: browserEvidence.screenshotWidth,
+          screenshotHeight: browserEvidence.screenshotHeight,
+          visibleText: browserEvidence.visibleText,
+          consoleFailures: browserEvidence.consoleFailures,
+          failedResources: browserEvidence.failedResources,
+          evidenceHash: browserEvidence.evidenceHash,
+        })}\n</browser_evidence>`
+      : '';
+    const instructionWithEvidence = `${baseInstruction}${evidenceContext}`;
     const instruction = attachedInputIds.length
-      ? `${baseInstruction}\n\nAttached immutable AO Inputs: ${attachedInputIds.join(', ')}. Inspect only these through inputs.list and inputs.read. For a write Job, copy an Input into the repository only through inputs.copy_to_repository and only when the task requires that explicit output.`
-      : baseInstruction;
+      ? `${instructionWithEvidence}\n\nAttached immutable AO Inputs: ${attachedInputIds.join(', ')}. Inspect only these through inputs.list and inputs.read. For a write Job, copy an Input into the repository only through inputs.copy_to_repository and only when the task requires that explicit output.`
+      : instructionWithEvidence;
     let plan = await this.store.getExecutionPlanForAttempt(attempt.id);
     if (!plan) {
       const hasInputs = attachedInputIds.length > 0;

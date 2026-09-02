@@ -12,3 +12,7 @@ export {
   GitRepositoryWorkspaceAdapter,
   type GitRepositoryWorkspaceAdapterOptions,
 } from './git-repository-workspace-adapter.js';
+export {
+  GitPreviewWorkspaceAdapter,
+  type GitPreviewWorkspaceAdapterOptions,
+} from './git-preview-workspace-adapter.js';

@@ -3,6 +3,7 @@ import type {
   OrchestratorConversationService,
   ProjectApplication,
   InputApplication,
+  PreviewApplication,
 } from '../../../packages/agent-operations-application/src/index.js';
 import { OperatorWebApplication } from './app.js';
 import { createOperatorHttpServer } from './http-server.js';
@@ -13,6 +14,7 @@ export interface OperatorWebServerDependencies {
   readonly telegramConfigured: boolean;
   readonly projects?: ProjectApplication;
   readonly inputs?: InputApplication;
+  readonly preview?: PreviewApplication;
   close(): Promise<void>;
 }
 
@@ -25,6 +27,7 @@ export function startOperatorWebServer(dependencies: OperatorWebServerDependenci
     { telegramConfigured: dependencies.telegramConfigured },
     dependencies.projects,
     dependencies.inputs,
+    dependencies.preview,
   );
   const server = createOperatorHttpServer(app, { host, port });
   server.listen(port, host, () => {

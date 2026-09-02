@@ -401,6 +401,21 @@ describe('OperatorApplicationService', () => {
     expect(await store.listJobInputIds(started.jobId)).not.toContain('input:unattached');
   });
 
+  it('persists one bounded browser evidence requirement without starting a Preview', async () => {
+    const store = await configuredStore();
+    const application = new OperatorApplicationService(store, new FakeOrchestration(store), {
+      now: () => new Date(TIME), deferRunnerWake: true,
+    });
+    const started = await application.runOperatorJob({
+      ...INPUT,
+      browserEvidenceRequirement: { kind: 'browser-render', route: '/dashboard', viewport: { width: 1440, height: 900 } },
+    });
+    expect(await store.getJobBrowserEvidenceRequirement(started.jobId)).toEqual({
+      kind: 'browser-render', route: '/dashboard', viewport: { width: 1440, height: 900 },
+    });
+    expect(await store.getPreviewSessionForJob(started.jobId)).toBeNull();
+  });
+
   it('surfaces durable escalations in Needs Me and excludes them from Done', async () => {
     const store = await configuredStore();
     const application = new OperatorApplicationService(store, new FakeOrchestration(store, 'ESCALATED'), { now: () => new Date(TIME) });

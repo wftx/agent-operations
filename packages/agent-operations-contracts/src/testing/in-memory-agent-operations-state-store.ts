@@ -32,6 +32,12 @@ import type {
 import type { DurableRepositoryWorkspace } from '../workspace.js';
 import type { DurableLocalFolderResource, DurableProjectProfile } from '../project.js';
 import type { DurableInput } from '../input.js';
+import type {
+  BrowserEvidenceRequirement,
+  DurableBrowserEvidence,
+  DurablePreviewProfile,
+  DurablePreviewSession,
+} from '../preview.js';
 
 export type InMemoryStateStoreOperation =
   | 'get-installation'
@@ -98,6 +104,23 @@ function copyProjectProfile(value: DurableProjectProfile): DurableProjectProfile
 
 function copyInput(value: DurableInput): DurableInput {
   return { ...value };
+}
+
+function copyPreviewProfile(value: DurablePreviewProfile): DurablePreviewProfile {
+  return { ...value, command: { ...value.command, arguments: [...value.command.arguments] },
+    ...(value.validation ? { validation: { ...value.validation } } : {}) };
+}
+
+function copyPreviewSession(value: DurablePreviewSession): DurablePreviewSession { return { ...value }; }
+
+function copyBrowserEvidence(value: DurableBrowserEvidence): DurableBrowserEvidence {
+  return {
+    ...value,
+    viewport: { ...value.viewport },
+    consoleFailures: [...value.consoleFailures],
+    failedResources: [...value.failedResources],
+    audit: value.audit.map(operation => ({ ...operation })),
+  };
 }
 
 function copyRepositoryObservation(value: DurableRepositoryObservation): DurableRepositoryObservation {
@@ -247,6 +270,10 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   private readonly inputs = new Map<string, DurableInput>();
   private readonly conversationInputs = new Map<string, Set<string>>();
   private readonly jobInputs = new Map<string, Set<string>>();
+  private readonly previewProfiles = new Map<string, DurablePreviewProfile>();
+  private readonly browserRequirements = new Map<string, BrowserEvidenceRequirement>();
+  private readonly previewSessions = new Map<string, DurablePreviewSession>();
+  private readonly browserEvidence = new Map<string, DurableBrowserEvidence>();
   private readonly repositoryObservations = new Map<string, DurableRepositoryObservation[]>();
   private readonly runtimeObservations = new Map<string, DurableRuntimeObservation[]>();
   private readonly repositoryWorkspaces = new Map<string, DurableRepositoryWorkspace>();
@@ -420,6 +447,27 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     return profile ? copyProjectProfile(profile) : null;
   }
 
+  async savePreviewProfile(profile: DurablePreviewProfile): Promise<void> {
+    this.assertAvailable('apply-configuration');
+    const existing = this.previewProfiles.get(profile.id);
+    if (!this.projects.has(profile.projectId) || profile.revision !== (existing ? existing.revision + 1 : 0)) {
+      throw new Error(`Stale or invalid Preview Profile: ${profile.id}`);
+    }
+    this.previewProfiles.set(profile.id, copyPreviewProfile(profile));
+  }
+
+  async getPreviewProfile(id: string): Promise<DurablePreviewProfile | null> {
+    this.assertAvailable('read');
+    const profile = this.previewProfiles.get(id);
+    return profile ? copyPreviewProfile(profile) : null;
+  }
+
+  async listPreviewProfiles(projectId?: string): Promise<readonly DurablePreviewProfile[]> {
+    this.assertAvailable('read');
+    return [...this.previewProfiles.values()].filter(profile => !projectId || profile.projectId === projectId)
+      .sort((a, b) => a.name.localeCompare(b.name)).map(copyPreviewProfile);
+  }
+
   async createInput(input: DurableInput): Promise<void> {
     this.assertAvailable('apply-configuration');
     if (this.inputs.has(input.id)) throw new Error(`Input already exists: ${input.id}`);
@@ -477,6 +525,66 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   async listJobInputIds(jobId: string): Promise<readonly string[]> {
     this.assertAvailable('read');
     return [...(this.jobInputs.get(jobId) ?? [])].sort();
+  }
+
+  async setJobBrowserEvidenceRequirement(jobId: string, requirement: BrowserEvidenceRequirement): Promise<void> {
+    this.assertAvailable('write-job');
+    if (!this.jobs.has(jobId)) throw new Error(`Job not found: ${jobId}`);
+    this.browserRequirements.set(jobId, { ...requirement, viewport: { ...requirement.viewport } });
+  }
+
+  async getJobBrowserEvidenceRequirement(jobId: string): Promise<BrowserEvidenceRequirement | null> {
+    this.assertAvailable('read');
+    const requirement = this.browserRequirements.get(jobId);
+    return requirement ? { ...requirement, viewport: { ...requirement.viewport } } : null;
+  }
+
+  async createPreviewSession(session: DurablePreviewSession): Promise<void> {
+    this.assertAvailable('write-job');
+    if (this.previewSessions.has(session.id)) {
+      throw new Error(`Preview Session already exists: ${session.id}`);
+    }
+    this.previewSessions.set(session.id, copyPreviewSession(session));
+  }
+
+  async getPreviewSession(id: string): Promise<DurablePreviewSession | null> {
+    this.assertAvailable('read');
+    const session = this.previewSessions.get(id);
+    return session ? copyPreviewSession(session) : null;
+  }
+
+  async getPreviewSessionForJob(jobId: string): Promise<DurablePreviewSession | null> {
+    this.assertAvailable('read');
+    const session = [...this.previewSessions.values()].filter(value => value.jobId === jobId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))[0];
+    return session ? copyPreviewSession(session) : null;
+  }
+
+  async savePreviewSessionTransition(session: DurablePreviewSession, expectedRevision: number): Promise<void> {
+    this.assertAvailable('write-job');
+    const existing = this.previewSessions.get(session.id);
+    if (!existing || existing.revision !== expectedRevision || session.revision !== expectedRevision + 1) {
+      throw new Error(`Preview Session transition conflict: ${session.id}`);
+    }
+    this.previewSessions.set(session.id, copyPreviewSession(session));
+  }
+
+  async createBrowserEvidence(evidence: DurableBrowserEvidence): Promise<void> {
+    this.assertAvailable('write-job');
+    if (this.browserEvidence.has(evidence.id)) throw new Error(`Browser Evidence already exists: ${evidence.id}`);
+    this.browserEvidence.set(evidence.id, copyBrowserEvidence(evidence));
+  }
+
+  async getBrowserEvidence(id: string): Promise<DurableBrowserEvidence | null> {
+    this.assertAvailable('read');
+    const evidence = this.browserEvidence.get(id);
+    return evidence ? copyBrowserEvidence(evidence) : null;
+  }
+
+  async listBrowserEvidenceForJob(jobId: string): Promise<readonly DurableBrowserEvidence[]> {
+    this.assertAvailable('read');
+    return [...this.browserEvidence.values()].filter(value => value.jobId === jobId)
+      .sort((a, b) => a.capturedAt.localeCompare(b.capturedAt)).map(copyBrowserEvidence);
   }
 
   async recordRepositoryObservation(observation: DurableRepositoryObservation): Promise<void> {

@@ -109,6 +109,18 @@ describe('OrchestratorToolApplicationService', () => {
     expect(created.ok).toBe(true);
   });
 
+  it('passes one structured browser render requirement through normal Job creation', async () => {
+    const operator = fakeOperator();
+    const tools = new OrchestratorToolApplicationService(operator);
+    const result = await tools.execute({ name: 'ao.jobs.create', arguments: validCreate({
+      evidenceRequirements: [{ kind: 'browser-render', route: '/mirror-x', viewport: { width: 1440, height: 900 } }],
+    }) });
+    expect(result.ok).toBe(true);
+    expect(operator.runOperatorJob).toHaveBeenCalledWith(expect.objectContaining({
+      browserEvidenceRequirement: { kind: 'browser-render', route: '/mirror-x', viewport: { width: 1440, height: 900 } },
+    }));
+  });
+
   it('returns bounded Input metadata without exposing its physical storage reference', async () => {
     const tools = new OrchestratorToolApplicationService(fakeOperator(), fakeInputs());
     const result = await tools.execute({ name: 'ao.inputs.get', arguments: { inputId: 'input:brief' } });

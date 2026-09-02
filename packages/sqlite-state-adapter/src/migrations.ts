@@ -20,7 +20,8 @@ export const LATE_EXECUTION_RECONCILIATION_SCHEMA_VERSION = 11;
 export const ISOLATED_WRITE_WORKSPACE_SCHEMA_VERSION = 12;
 export const PROJECT_ONBOARDING_INPUTS_SCHEMA_VERSION = 13;
 export const WORKER_BUDGET_EXTENSIONS_SCHEMA_VERSION = 14;
-export const CURRENT_SCHEMA_VERSION = WORKER_BUDGET_EXTENSIONS_SCHEMA_VERSION;
+export const PREVIEW_BROWSER_EVIDENCE_SCHEMA_VERSION = 15;
+export const CURRENT_SCHEMA_VERSION = PREVIEW_BROWSER_EVIDENCE_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -715,6 +716,85 @@ const WORKER_BUDGET_EXTENSIONS_SCHEMA_SQL = `
     ON worker_budget_extensions(job_id, created_at, id);
 `;
 
+const PREVIEW_BROWSER_EVIDENCE_SCHEMA_SQL = `
+  CREATE TABLE preview_profiles (
+    id TEXT PRIMARY KEY CHECK (id LIKE 'preview-profile:%'),
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+    command_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('candidate', 'validated', 'invalid')),
+    validation_json TEXT,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (project_id, name)
+  );
+
+  CREATE TABLE job_browser_evidence_requirements (
+    job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind = 'browser-render'),
+    route TEXT NOT NULL CHECK (substr(route, 1, 1) = '/' AND instr(route, char(0)) = 0),
+    viewport_width INTEGER NOT NULL CHECK (viewport_width BETWEEN 320 AND 2560),
+    viewport_height INTEGER NOT NULL CHECK (viewport_height BETWEEN 240 AND 2560)
+  );
+
+  CREATE TABLE preview_sessions (
+    id TEXT PRIMARY KEY CHECK (id LIKE 'preview-session:%'),
+    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    repository_id TEXT NOT NULL REFERENCES repositories(id),
+    installation_id TEXT NOT NULL REFERENCES installations(id),
+    profile_id TEXT NOT NULL REFERENCES preview_profiles(id),
+    workspace_kind TEXT NOT NULL CHECK (workspace_kind IN ('read-only-detached-worktree', 'isolated-write-worktree')),
+    workspace_path TEXT NOT NULL,
+    revision_commit TEXT NOT NULL CHECK (length(trim(revision_commit)) > 0),
+    source_state_hash TEXT NOT NULL CHECK (length(source_state_hash) = 64),
+    origin TEXT NOT NULL CHECK (origin LIKE 'http://127.0.0.1:%'),
+    route TEXT NOT NULL CHECK (substr(route, 1, 1) = '/'),
+    port INTEGER NOT NULL CHECK (port BETWEEN 1024 AND 65535),
+    pid INTEGER,
+    state TEXT NOT NULL CHECK (state IN ('starting', 'running', 'stopped', 'failed', 'stale')),
+    logs TEXT NOT NULL,
+    failure_reason TEXT,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK ((state = 'failed') = (failure_reason IS NOT NULL))
+  );
+
+  CREATE INDEX preview_sessions_by_job ON preview_sessions(job_id, created_at, id);
+
+  CREATE TABLE browser_evidence (
+    id TEXT PRIMARY KEY CHECK (id LIKE 'browser-evidence:%'),
+    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    repository_id TEXT NOT NULL REFERENCES repositories(id),
+    preview_profile_id TEXT NOT NULL REFERENCES preview_profiles(id),
+    preview_session_id TEXT NOT NULL REFERENCES preview_sessions(id),
+    revision_commit TEXT NOT NULL,
+    source_state_hash TEXT NOT NULL CHECK (length(source_state_hash) = 64),
+    origin TEXT NOT NULL,
+    route TEXT NOT NULL,
+    viewport_json TEXT NOT NULL,
+    captured_at TEXT NOT NULL,
+    title TEXT NOT NULL,
+    final_url TEXT NOT NULL,
+    screenshot_input_id TEXT NOT NULL REFERENCES inputs(id),
+    screenshot_sha256 TEXT NOT NULL CHECK (length(screenshot_sha256) = 64),
+    screenshot_byte_size INTEGER NOT NULL CHECK (screenshot_byte_size > 0),
+    screenshot_width INTEGER NOT NULL CHECK (screenshot_width > 0),
+    screenshot_height INTEGER NOT NULL CHECK (screenshot_height > 0),
+    visible_text TEXT NOT NULL,
+    console_failures_json TEXT NOT NULL,
+    failed_resources_json TEXT NOT NULL,
+    audit_json TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version = 1),
+    evidence_hash TEXT NOT NULL UNIQUE CHECK (length(evidence_hash) = 64)
+  );
+
+  CREATE INDEX browser_evidence_by_job ON browser_evidence(job_id, captured_at, id);
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -785,6 +865,11 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: WORKER_BUDGET_EXTENSIONS_SCHEMA_VERSION,
     name: 'human-worker-budget-extensions',
     up: database => database.exec(WORKER_BUDGET_EXTENSIONS_SCHEMA_SQL),
+  },
+  {
+    version: PREVIEW_BROWSER_EVIDENCE_SCHEMA_VERSION,
+    name: 'preview-profiles-and-browser-evidence',
+    up: database => database.exec(PREVIEW_BROWSER_EVIDENCE_SCHEMA_SQL),
   },
 ];
 

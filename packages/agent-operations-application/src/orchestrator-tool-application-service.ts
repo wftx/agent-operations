@@ -96,6 +96,7 @@ export class OrchestratorToolApplicationService {
       acceptanceCriteria: text(argumentsValue, 'acceptanceCriteria'),
       executionMode,
       inputIds: stringArray(argumentsValue, 'inputIds'),
+      ...parseBrowserEvidenceRequirement(argumentsValue),
     });
     return success({
       jobId: session.jobId,
@@ -109,6 +110,27 @@ export class OrchestratorToolApplicationService {
     if (!project) throw new Error(`Project not found: ${projectId}`);
     return project;
   }
+}
+
+function parseBrowserEvidenceRequirement(value: Readonly<Record<string, unknown>>) {
+  const raw = value['evidenceRequirements'];
+  if (raw === undefined) return {};
+  if (!Array.isArray(raw) || raw.length !== 1 || !raw[0] || typeof raw[0] !== 'object') {
+    throw new Error('evidenceRequirements must contain exactly one browser-render requirement');
+  }
+  const item = raw[0] as Record<string, unknown>;
+  if (item['kind'] !== 'browser-render' || typeof item['route'] !== 'string') {
+    throw new Error('Only browser-render evidence is supported');
+  }
+  const viewport = item['viewport'];
+  const resolved = viewport && typeof viewport === 'object' && !Array.isArray(viewport)
+    ? viewport as Record<string, unknown>
+    : { width: 1440, height: 900 };
+  return { browserEvidenceRequirement: {
+    kind: 'browser-render' as const,
+    route: item['route'],
+    viewport: { width: Number(resolved['width']), height: Number(resolved['height']) },
+  } };
 }
 
 function projectView(option: OperatorProjectOption) {

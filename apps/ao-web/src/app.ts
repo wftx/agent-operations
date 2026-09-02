@@ -5,6 +5,7 @@ import type {
   OrchestratorConversationService,
   ProjectApplication,
   InputApplication,
+  PreviewApplication,
 } from '../../../packages/agent-operations-application/src/index.js';
 import {
   renderDashboard,
@@ -28,6 +29,7 @@ export class OperatorWebApplication {
     options: { readonly telegramConfigured?: boolean } = {},
     private readonly projects?: ProjectApplication,
     private readonly inputs?: InputApplication,
+    private readonly preview?: PreviewApplication,
   ) {
     if ('sendTurn' in conversationOrOptions) {
       this.conversation = conversationOrOptions;
@@ -133,6 +135,40 @@ export class OperatorWebApplication {
       if (request.method === 'POST' && url.pathname === '/jobs') {
         return this.submit(request);
       }
+      const evidenceRequirement = url.pathname.match(/^\/jobs\/([^/]+)\/preview\/requirement$/);
+      if (request.method === 'POST' && evidenceRequirement) {
+        if (!this.preview) throw new Error('Browser Evidence is not configured.');
+        const form = await request.formData();
+        const jobId = decodeURIComponent(evidenceRequirement[1]);
+        await this.preview.setJobEvidenceRequirement(jobId, {
+          kind: 'browser-render',
+          route: textValue(form, 'route') || '/',
+          viewport: { width: 1440, height: 900 },
+        });
+        return redirect(`/jobs/${encodeURIComponent(jobId)}`);
+      }
+      const previewProfile = url.pathname.match(/^\/jobs\/([^/]+)\/preview\/profile$/);
+      if (request.method === 'POST' && previewProfile) {
+        if (!this.preview) throw new Error('Job Preview is not configured.');
+        const form = await request.formData();
+        const jobId = decodeURIComponent(previewProfile[1]);
+        await this.preview.setJobPreviewProfile(jobId, textValue(form, 'command'));
+        return redirect(`/jobs/${encodeURIComponent(jobId)}`);
+      }
+      const previewStart = url.pathname.match(/^\/jobs\/([^/]+)\/preview\/start$/);
+      if (request.method === 'POST' && previewStart) {
+        if (!this.preview) throw new Error('Job Preview is not configured.');
+        const jobId = decodeURIComponent(previewStart[1]);
+        await this.preview.startJobPreview(jobId);
+        return redirect(`/jobs/${encodeURIComponent(jobId)}`);
+      }
+      const evidenceRefresh = url.pathname.match(/^\/jobs\/([^/]+)\/preview\/evidence$/);
+      if (request.method === 'POST' && evidenceRefresh) {
+        if (!this.preview) throw new Error('Browser Evidence is not configured.');
+        const jobId = decodeURIComponent(evidenceRefresh[1]);
+        await this.preview.refreshJobEvidence(jobId);
+        return redirect(`/jobs/${encodeURIComponent(jobId)}`);
+      }
       const guidance = url.pathname.match(/^\/escalations\/([^/]+)\/guidance$/);
       if (request.method === 'POST' && guidance) {
         const form = await request.formData();
@@ -182,6 +218,13 @@ export class OperatorWebApplication {
       executionMode: textValue(form, 'executionMode') === 'repository-write-isolated'
         ? 'repository-write-isolated'
         : 'repository-read-only',
+      ...(textValue(form, 'browserEvidence') === 'browser-render'
+        ? { browserEvidenceRequirement: {
+            kind: 'browser-render' as const,
+            route: textValue(form, 'browserRoute') || '/',
+            viewport: { width: 1440, height: 900 },
+          } }
+        : {}),
     };
     try {
       if (textValue(form, 'intent') === 'preview') {

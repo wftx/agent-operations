@@ -2,6 +2,7 @@ export * from './runtime.js';
 export * from './repository.js';
 export * from './project.js';
 export * from './input.js';
+export * from './preview.js';
 export * from './persistence.js';
 export * from './work.js';
 export * from './workspace.js';

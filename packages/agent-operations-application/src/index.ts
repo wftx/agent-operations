@@ -41,11 +41,13 @@ export type {
   OrchestratorToolResult,
   OrchestratorTurnInput,
   OrchestratorTurnResult,
+  PreviewApplication,
 } from './types.js';
 export { OrchestratorConversationApplicationService } from './orchestrator-conversation-service.js';
 export { OrchestratorToolApplicationService } from './orchestrator-tool-application-service.js';
 export { ProjectApplicationService, type ProjectApplicationServiceOptions } from './project-application-service.js';
 export { InputApplicationService, type InputApplicationServiceOptions } from './input-application-service.js';
+export { PreviewApplicationService, type PreviewApplicationServiceOptions } from './preview-application-service.js';
 export type {
   CreateProjectInput,
   CreateProjectResourceInput,

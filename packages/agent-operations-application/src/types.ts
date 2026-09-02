@@ -21,6 +21,10 @@ import type {
   InputMetadata,
   RepositoryAvailability,
   WorkingTreeState,
+  BrowserEvidenceRequirement,
+  DurableBrowserEvidence,
+  DurablePreviewProfile,
+  DurablePreviewSession,
 } from '../../agent-operations-contracts/src/index.js';
 
 export type { RuntimeStartResult } from '../../agent-operations-contracts/src/index.js';
@@ -33,6 +37,7 @@ export interface OperatorTaskInput {
   readonly acceptanceCriteria: string;
   readonly executionMode?: JobExecutionMode;
   readonly inputIds?: readonly string[];
+  readonly browserEvidenceRequirement?: BrowserEvidenceRequirement;
 }
 
 export type CreateProjectResourceInput =
@@ -119,6 +124,7 @@ export interface OperatorTaskPreview {
   readonly executionMode?: JobExecutionMode;
   readonly executionAuthorized: false;
   readonly inputIds?: readonly string[];
+  readonly browserEvidenceRequirement?: BrowserEvidenceRequirement;
 }
 
 export type OperatorRunStatus = 'pending' | 'running' | 'done' | 'needs-human' | 'failed' | 'cancelled';
@@ -213,6 +219,24 @@ export interface OperatorJobDetail {
   readonly completedAt?: string;
   readonly repositoryWorkspace?: DurableRepositoryWorkspace;
   readonly inputs?: readonly InputMetadata[];
+  readonly browserEvidenceRequirement?: BrowserEvidenceRequirement;
+  readonly previewProfile?: DurablePreviewProfile;
+  readonly previewSession?: DurablePreviewSession;
+  readonly browserEvidence?: readonly DurableBrowserEvidence[];
+}
+
+export interface PreviewApplication {
+  setJobEvidenceRequirement(jobId: string, requirement: BrowserEvidenceRequirement): Promise<void>;
+  setJobPreviewProfile(jobId: string, command: string): Promise<DurablePreviewProfile>;
+  startJobPreview(jobId: string): Promise<DurablePreviewSession>;
+  refreshJobEvidence(jobId: string): Promise<DurableBrowserEvidence>;
+  ensureJobEvidence(jobId: string): Promise<DurableBrowserEvidence>;
+  getJobPreview(jobId: string): Promise<{
+    readonly requirement: BrowserEvidenceRequirement | null;
+    readonly profile: DurablePreviewProfile | null;
+    readonly session: DurablePreviewSession | null;
+    readonly evidence: readonly DurableBrowserEvidence[];
+  }>;
 }
 
 export type OperatorJobList = 'all' | 'running' | 'needs-human' | 'done';

@@ -9,6 +9,7 @@ import type {
   OperatorTaskInput,
   OperatorTaskPreview,
   RuntimeStartResult,
+  PreviewApplication,
 } from '../../../packages/agent-operations-application/src/index.js';
 import {
   OPERATOR_ISOLATED_WRITE_DEFAULTS,
@@ -589,3 +590,72 @@ const ESCALATED_DETAIL: OperatorJobDetail = {
   escalationActions: { 'escalation:1': ['provide-guidance', 'cancel-job'] },
   escalationKinds: { 'escalation:1': 'guidance-required' },
 };
+
+describe('Job Preview HTTP actions', () => {
+  it('keeps GET read only and starts or captures only through explicit POST actions', async () => {
+    const operator = new StubOperatorApplication();
+    let starts = 0;
+    let captures = 0;
+    let requirements = 0;
+    let profiles = 0;
+    const preview: PreviewApplication = {
+      setJobEvidenceRequirement: async (_jobId, requirement) => {
+        requirements += 1;
+        expect(requirement).toEqual({
+          kind: 'browser-render', route: '/dashboard', viewport: { width: 1440, height: 900 },
+        });
+      },
+      setJobPreviewProfile: async (_jobId, command) => {
+        profiles += 1;
+        expect(command).toBe('npm exec --offline -- next dev');
+        throw new Error('profile fixture');
+      },
+      startJobPreview: async jobId => {
+        starts += 1;
+        return { id: 'preview-session:test', jobId, projectId: PROJECT_ID, repositoryId: REPOSITORY_ID,
+          installationId: 'installation:test', profileId: 'preview-profile:test',
+          workspaceKind: 'read-only-detached-worktree', workspacePath: '/ao/preview',
+          revisionCommit: '1'.repeat(40), sourceStateHash: '2'.repeat(64),
+          origin: 'http://127.0.0.1:4311', route: '/', port: 4311, pid: 10, state: 'running',
+          logs: '', revision: 1, createdAt: TIME, updatedAt: TIME };
+      },
+      refreshJobEvidence: async () => {
+        captures += 1;
+        throw new Error('capture fixture');
+      },
+      ensureJobEvidence: async () => { throw new Error('not used'); },
+      getJobPreview: async () => ({ requirement: null, profile: null, session: null, evidence: [] }),
+    };
+    const app = new OperatorWebApplication(operator, {}, {}, undefined, undefined, preview);
+
+    expect((await app.handle(new Request(`http://localhost/jobs/${encodeURIComponent(JOB_ID)}`))).status).toBe(200);
+    expect(requirements).toBe(0);
+    expect(starts).toBe(0);
+    const required = await app.handle(new Request(
+      `http://localhost/jobs/${encodeURIComponent(JOB_ID)}/preview/requirement`, {
+        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ route: '/dashboard' }),
+      },
+    ));
+    expect(required.status).toBe(303);
+    expect(requirements).toBe(1);
+    const profiled = await app.handle(new Request(
+      `http://localhost/jobs/${encodeURIComponent(JOB_ID)}/preview/profile`, {
+        method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ command: 'npm exec --offline -- next dev' }),
+      },
+    ));
+    expect(profiled.status).toBe(400);
+    expect(profiles).toBe(1);
+    const started = await app.handle(new Request(
+      `http://localhost/jobs/${encodeURIComponent(JOB_ID)}/preview/start`, { method: 'POST' },
+    ));
+    expect(started.status).toBe(303);
+    expect(starts).toBe(1);
+    const captured = await app.handle(new Request(
+      `http://localhost/jobs/${encodeURIComponent(JOB_ID)}/preview/evidence`, { method: 'POST' },
+    ));
+    expect(captured.status).toBe(400);
+    expect(captures).toBe(1);
+  });
+});

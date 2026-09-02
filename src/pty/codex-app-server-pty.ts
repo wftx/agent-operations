@@ -326,6 +326,22 @@ export const AO_ORCHESTRATOR_DYNAMIC_TOOLS = [{
           reviewerRequired: { type: 'boolean', const: true },
           maxWorkerAttempts: { type: 'integer', const: 2 },
           inputIds: { type: 'array', items: { type: 'string' }, maxItems: 20, uniqueItems: true },
+          evidenceRequirements: {
+            type: 'array', maxItems: 1, uniqueItems: true,
+            items: {
+              type: 'object',
+              properties: {
+                kind: { type: 'string', const: 'browser-render' },
+                route: { type: 'string' },
+                viewport: {
+                  type: 'object',
+                  properties: { width: { type: 'integer' }, height: { type: 'integer' } },
+                  required: ['width', 'height'], additionalProperties: false,
+                },
+              },
+              required: ['kind', 'route'], additionalProperties: false,
+            },
+          },
         },
         required: ['projectId', 'title', 'task', 'acceptanceCriteria'],
         additionalProperties: false,

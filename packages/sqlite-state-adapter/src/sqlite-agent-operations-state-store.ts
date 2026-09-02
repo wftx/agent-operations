@@ -55,6 +55,13 @@ import type {
   ProjectCapabilityReadiness,
   DurableInput,
   InputSourceType,
+  BrowserEvidenceRequirement,
+  DurableBrowserEvidence,
+  DurablePreviewProfile,
+  DurablePreviewSession,
+  PreviewProcessState,
+  PreviewProfileStatus,
+  PreviewWorkspaceKind,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   createRepositoryCheckoutBindingId,
@@ -127,6 +134,69 @@ interface InputRow {
   ingestion_state: 'complete';
   validation_state: 'valid';
   created_at: string;
+}
+
+interface PreviewProfileRow {
+  id: string;
+  project_id: string;
+  name: string;
+  command_json: string;
+  status: PreviewProfileStatus;
+  validation_json: string | null;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface PreviewSessionRow {
+  id: string;
+  job_id: string;
+  project_id: string;
+  repository_id: string;
+  installation_id: string;
+  profile_id: string;
+  workspace_kind: PreviewWorkspaceKind;
+  workspace_path: string;
+  revision_commit: string;
+  source_state_hash: string;
+  origin: string;
+  route: string;
+  port: number;
+  pid: number | null;
+  state: PreviewProcessState;
+  logs: string;
+  failure_reason: string | null;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface BrowserEvidenceRow {
+  id: string;
+  job_id: string;
+  project_id: string;
+  repository_id: string;
+  preview_profile_id: string;
+  preview_session_id: string;
+  revision_commit: string;
+  source_state_hash: string;
+  origin: string;
+  route: string;
+  viewport_json: string;
+  captured_at: string;
+  title: string;
+  final_url: string;
+  screenshot_input_id: string;
+  screenshot_sha256: string;
+  screenshot_byte_size: number;
+  screenshot_width: number;
+  screenshot_height: number;
+  visible_text: string;
+  console_failures_json: string;
+  failed_resources_json: string;
+  audit_json: string;
+  version: 1;
+  evidence_hash: string;
 }
 
 interface RepositoryRow {
@@ -470,6 +540,77 @@ function toInput(row: InputRow): DurableInput {
     ingestionState: row.ingestion_state,
     validationState: row.validation_state,
     createdAt: row.created_at,
+  };
+}
+
+function toPreviewProfile(row: PreviewProfileRow): DurablePreviewProfile {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    name: row.name,
+    command: JSON.parse(row.command_json) as DurablePreviewProfile['command'],
+    status: row.status,
+    ...(row.validation_json
+      ? { validation: JSON.parse(row.validation_json) as NonNullable<DurablePreviewProfile['validation']> }
+      : {}),
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toPreviewSession(row: PreviewSessionRow): DurablePreviewSession {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    projectId: row.project_id,
+    repositoryId: row.repository_id,
+    installationId: row.installation_id,
+    profileId: row.profile_id,
+    workspaceKind: row.workspace_kind,
+    workspacePath: row.workspace_path,
+    revisionCommit: row.revision_commit,
+    sourceStateHash: row.source_state_hash,
+    origin: row.origin,
+    route: row.route,
+    port: row.port,
+    ...(row.pid ? { pid: row.pid } : {}),
+    state: row.state,
+    logs: row.logs,
+    ...(row.failure_reason ? { failureReason: row.failure_reason } : {}),
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function toBrowserEvidence(row: BrowserEvidenceRow): DurableBrowserEvidence {
+  return {
+    id: row.id,
+    jobId: row.job_id,
+    projectId: row.project_id,
+    repositoryId: row.repository_id,
+    previewProfileId: row.preview_profile_id,
+    previewSessionId: row.preview_session_id,
+    revisionCommit: row.revision_commit,
+    sourceStateHash: row.source_state_hash,
+    origin: row.origin,
+    route: row.route,
+    viewport: JSON.parse(row.viewport_json) as DurableBrowserEvidence['viewport'],
+    capturedAt: row.captured_at,
+    title: row.title,
+    finalUrl: row.final_url,
+    screenshotInputId: row.screenshot_input_id,
+    screenshotSha256: row.screenshot_sha256,
+    screenshotByteSize: row.screenshot_byte_size,
+    screenshotWidth: row.screenshot_width,
+    screenshotHeight: row.screenshot_height,
+    visibleText: row.visible_text,
+    consoleFailures: jsonArray<string>(row.console_failures_json, 'browser console failures'),
+    failedResources: jsonArray<string>(row.failed_resources_json, 'browser failed resources'),
+    audit: jsonArray(row.audit_json, 'browser audit'),
+    version: row.version,
+    evidenceHash: row.evidence_hash,
   };
 }
 
@@ -856,6 +997,24 @@ function isValidRepositoryWorkspaceTransition(
     || from === 'cleanup_pending' && (to === 'cleaned' || to === 'failed');
 }
 
+function isValidPreviewSessionTransition(from: PreviewProcessState, to: PreviewProcessState): boolean {
+  return from === 'starting' && (to === 'running' || to === 'failed')
+    || from === 'running' && (to === 'stopped' || to === 'failed' || to === 'stale')
+    || from === 'stale' && (to === 'starting' || to === 'stopped')
+    || from === 'stopped' && to === 'starting'
+    || from === 'failed' && to === 'starting';
+}
+
+function validateBrowserRequirement(requirement: BrowserEvidenceRequirement): void {
+  if (requirement.kind !== 'browser-render' || !/^\/(?!\/)/.test(requirement.route)
+    || requirement.route.includes('\0') || requirement.route.includes('://')
+    || !Number.isInteger(requirement.viewport.width) || requirement.viewport.width < 320
+    || requirement.viewport.width > 2_560 || !Number.isInteger(requirement.viewport.height)
+    || requirement.viewport.height < 240 || requirement.viewport.height > 2_560) {
+    throw new Error('Invalid browser render evidence requirement');
+  }
+}
+
 export class SqliteAgentOperationsStateStore implements AgentOperationsStateStore {
   readonly databasePath: string;
   private readonly database: Database.Database;
@@ -869,6 +1028,7 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
   private readonly supportsIsolatedWriteWorkspaces: boolean;
   private readonly supportsProjectInputs: boolean;
   private readonly supportsWorkerBudgetExtensions: boolean;
+  private readonly supportsPreviewBrowserEvidence: boolean;
 
   private constructor(databasePath: string, database: Database.Database) {
     this.databasePath = databasePath;
@@ -899,6 +1059,9 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     ).get() as unknown) !== undefined;
     this.supportsWorkerBudgetExtensions = (database.prepare(
       "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'worker_budget_extensions'",
+    ).get() as unknown) !== undefined;
+    this.supportsPreviewBrowserEvidence = (database.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'browser_evidence'",
     ).get() as unknown) !== undefined;
   }
 
@@ -1159,6 +1322,49 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     return row ? toProjectProfile(row) : null;
   }
 
+  async savePreviewProfile(profile: DurablePreviewProfile): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsPreviewBrowserEvidence) throw new Error('Preview Profiles require Agent Operations schema v15');
+    if (!profile.id.startsWith('preview-profile:') || !profile.name.trim()) {
+      throw new Error(`Invalid Preview Profile: ${profile.id}`);
+    }
+    const existing = this.database.prepare('SELECT * FROM preview_profiles WHERE id = ?')
+      .get(profile.id) as PreviewProfileRow | undefined;
+    if (profile.revision !== (existing ? existing.revision + 1 : 0)
+      || (existing && (existing.project_id !== profile.projectId || existing.name !== profile.name
+        || existing.created_at !== profile.createdAt))) {
+      throw new Error(`Stale or rewritten Preview Profile: ${profile.id}`);
+    }
+    this.database.prepare(`
+      INSERT INTO preview_profiles
+        (id, project_id, name, command_json, status, validation_json, revision, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET command_json=excluded.command_json, status=excluded.status,
+        validation_json=excluded.validation_json, revision=excluded.revision, updated_at=excluded.updated_at
+    `).run(
+      profile.id, profile.projectId, profile.name, JSON.stringify(profile.command), profile.status,
+      profile.validation ? JSON.stringify(profile.validation) : null, profile.revision,
+      profile.createdAt, profile.updatedAt,
+    );
+  }
+
+  async getPreviewProfile(id: string): Promise<DurablePreviewProfile | null> {
+    this.assertOpen();
+    if (!this.supportsPreviewBrowserEvidence) return null;
+    const row = this.database.prepare('SELECT * FROM preview_profiles WHERE id = ?')
+      .get(id) as PreviewProfileRow | undefined;
+    return row ? toPreviewProfile(row) : null;
+  }
+
+  async listPreviewProfiles(projectId?: string): Promise<readonly DurablePreviewProfile[]> {
+    this.assertOpen();
+    if (!this.supportsPreviewBrowserEvidence) return [];
+    const rows = projectId
+      ? this.database.prepare('SELECT * FROM preview_profiles WHERE project_id = ? ORDER BY name, id').all(projectId)
+      : this.database.prepare('SELECT * FROM preview_profiles ORDER BY project_id, name, id').all();
+    return (rows as PreviewProfileRow[]).map(toPreviewProfile);
+  }
+
   async createInput(input: DurableInput): Promise<void> {
     this.assertOpen();
     if (!this.supportsProjectInputs) throw new Error('Inputs require Agent Operations schema v13');
@@ -1243,6 +1449,144 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     if (!this.supportsProjectInputs) return [];
     return (this.database.prepare('SELECT input_id FROM job_inputs WHERE job_id = ? ORDER BY input_id')
       .all(jobId) as Array<{ input_id: string }>).map(row => row.input_id);
+  }
+
+  async setJobBrowserEvidenceRequirement(
+    jobId: string,
+    requirement: BrowserEvidenceRequirement,
+  ): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsPreviewBrowserEvidence) throw new Error('Browser evidence requires Agent Operations schema v15');
+    if (!await this.getJob(jobId)) throw new Error(`Job not found: ${jobId}`);
+    validateBrowserRequirement(requirement);
+    this.database.prepare(`
+      INSERT INTO job_browser_evidence_requirements
+        (job_id, kind, route, viewport_width, viewport_height)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(job_id) DO UPDATE SET kind=excluded.kind, route=excluded.route,
+        viewport_width=excluded.viewport_width, viewport_height=excluded.viewport_height
+    `).run(jobId, requirement.kind, requirement.route, requirement.viewport.width, requirement.viewport.height);
+  }
+
+  async getJobBrowserEvidenceRequirement(jobId: string): Promise<BrowserEvidenceRequirement | null> {
+    this.assertOpen();
+    if (!this.supportsPreviewBrowserEvidence) return null;
+    const row = this.database.prepare(`
+      SELECT kind, route, viewport_width, viewport_height
+      FROM job_browser_evidence_requirements WHERE job_id = ?
+    `).get(jobId) as {
+      kind: 'browser-render'; route: string; viewport_width: number; viewport_height: number;
+    } | undefined;
+    return row ? {
+      kind: row.kind,
+      route: row.route,
+      viewport: { width: row.viewport_width, height: row.viewport_height },
+    } : null;
+  }
+
+  async createPreviewSession(session: DurablePreviewSession): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsPreviewBrowserEvidence) throw new Error('Preview Sessions require Agent Operations schema v15');
+    if (!session.id.startsWith('preview-session:') || session.revision !== 0 || session.state !== 'starting'
+      || session.pid !== undefined || session.failureReason !== undefined) {
+      throw new Error(`Invalid new Preview Session: ${session.id}`);
+    }
+    this.database.prepare(`
+      INSERT INTO preview_sessions
+        (id, job_id, project_id, repository_id, installation_id, profile_id, workspace_kind,
+        workspace_path, revision_commit, source_state_hash, origin, route, port, pid, state, logs, failure_reason,
+         revision, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      session.id, session.jobId, session.projectId, session.repositoryId, session.installationId,
+      session.profileId, session.workspaceKind, session.workspacePath, session.revisionCommit,
+      session.sourceStateHash, session.origin, session.route, session.port, null, session.state, session.logs, null,
+      session.revision, session.createdAt, session.updatedAt,
+    );
+  }
+
+  async getPreviewSession(id: string): Promise<DurablePreviewSession | null> {
+    this.assertOpen();
+    if (!this.supportsPreviewBrowserEvidence) return null;
+    const row = this.database.prepare('SELECT * FROM preview_sessions WHERE id = ?')
+      .get(id) as PreviewSessionRow | undefined;
+    return row ? toPreviewSession(row) : null;
+  }
+
+  async getPreviewSessionForJob(jobId: string): Promise<DurablePreviewSession | null> {
+    this.assertOpen();
+    if (!this.supportsPreviewBrowserEvidence) return null;
+    const row = this.database.prepare('SELECT * FROM preview_sessions WHERE job_id = ? ORDER BY created_at DESC, id DESC LIMIT 1')
+      .get(jobId) as PreviewSessionRow | undefined;
+    return row ? toPreviewSession(row) : null;
+  }
+
+  async savePreviewSessionTransition(session: DurablePreviewSession, expectedRevision: number): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsPreviewBrowserEvidence) throw new Error('Preview Sessions require Agent Operations schema v15');
+    const existing = await this.getPreviewSession(session.id);
+    if (!existing || existing.revision !== expectedRevision || session.revision !== expectedRevision + 1
+      || existing.jobId !== session.jobId || existing.projectId !== session.projectId
+      || existing.repositoryId !== session.repositoryId || existing.installationId !== session.installationId
+      || existing.profileId !== session.profileId || existing.workspaceKind !== session.workspaceKind
+      || existing.workspacePath !== session.workspacePath || existing.revisionCommit !== session.revisionCommit
+      || existing.sourceStateHash !== session.sourceStateHash
+      || existing.origin !== session.origin || existing.route !== session.route || existing.port !== session.port
+      || existing.createdAt !== session.createdAt || !isValidPreviewSessionTransition(existing.state, session.state)
+      || ((session.state === 'failed') !== Boolean(session.failureReason))) {
+      throw new Error(`Invalid Preview Session transition: ${session.id}`);
+    }
+    const updated = this.database.prepare(`
+      UPDATE preview_sessions SET pid=?, state=?, logs=?, failure_reason=?, revision=?, updated_at=?
+      WHERE id=? AND revision=?
+    `).run(
+      session.pid ?? null, session.state, session.logs, session.failureReason ?? null,
+      session.revision, session.updatedAt, session.id, expectedRevision,
+    );
+    if (updated.changes !== 1) throw new Error(`Preview Session transition conflict: ${session.id}`);
+  }
+
+  async createBrowserEvidence(evidence: DurableBrowserEvidence): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsPreviewBrowserEvidence) throw new Error('Browser Evidence requires Agent Operations schema v15');
+    if (!evidence.id.startsWith('browser-evidence:') || evidence.version !== 1
+      || !/^[a-f0-9]{64}$/.test(evidence.evidenceHash)
+      || !/^[a-f0-9]{64}$/.test(evidence.screenshotSha256)) {
+      throw new Error(`Invalid Browser Evidence: ${evidence.id}`);
+    }
+    this.database.prepare(`
+      INSERT INTO browser_evidence
+        (id, job_id, project_id, repository_id, preview_profile_id, preview_session_id,
+         revision_commit, source_state_hash, origin, route, viewport_json, captured_at, title, final_url,
+         screenshot_input_id, screenshot_sha256, screenshot_byte_size, screenshot_width,
+         screenshot_height, visible_text, console_failures_json, failed_resources_json,
+         audit_json, version, evidence_hash)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      evidence.id, evidence.jobId, evidence.projectId, evidence.repositoryId,
+      evidence.previewProfileId, evidence.previewSessionId, evidence.revisionCommit,
+      evidence.sourceStateHash, evidence.origin, evidence.route, JSON.stringify(evidence.viewport), evidence.capturedAt,
+      evidence.title, evidence.finalUrl, evidence.screenshotInputId, evidence.screenshotSha256,
+      evidence.screenshotByteSize, evidence.screenshotWidth, evidence.screenshotHeight,
+      evidence.visibleText, JSON.stringify(evidence.consoleFailures),
+      JSON.stringify(evidence.failedResources), JSON.stringify(evidence.audit),
+      evidence.version, evidence.evidenceHash,
+    );
+  }
+
+  async getBrowserEvidence(id: string): Promise<DurableBrowserEvidence | null> {
+    this.assertOpen();
+    if (!this.supportsPreviewBrowserEvidence) return null;
+    const row = this.database.prepare('SELECT * FROM browser_evidence WHERE id = ?')
+      .get(id) as BrowserEvidenceRow | undefined;
+    return row ? toBrowserEvidence(row) : null;
+  }
+
+  async listBrowserEvidenceForJob(jobId: string): Promise<readonly DurableBrowserEvidence[]> {
+    this.assertOpen();
+    if (!this.supportsPreviewBrowserEvidence) return [];
+    return (this.database.prepare('SELECT * FROM browser_evidence WHERE job_id = ? ORDER BY captured_at, id')
+      .all(jobId) as BrowserEvidenceRow[]).map(toBrowserEvidence);
   }
 
   async recordRepositoryObservation(observation: DurableRepositoryObservation): Promise<void> {

@@ -8,7 +8,7 @@ const operatorWebRoot = join(repositoryRoot, 'apps', 'ao-web', 'src');
 const failures = [];
 const importPattern = /(?:from\s+|import\s*\(|require\s*\()\s*['"]([^'"]+)['"]/g;
 const coreInternalPattern = /(?:^|\/)src\/(?:daemon|pty|hooks)(?:\/|$)/;
-const implementationPackagePattern = /(?:^|\/)(?:agent-operations-rehearsal|cortextos-adapter|cortextos-execution-adapter|cortextos-execution-observer|git-adapter|sqlite-state-adapter|telegram-notification-adapter)(?:\/|$)/;
+const implementationPackagePattern = /(?:^|\/)(?:agent-operations-rehearsal|cortextos-adapter|cortextos-execution-adapter|cortextos-execution-observer|git-adapter|preview-browser-adapter|sqlite-state-adapter|telegram-notification-adapter)(?:\/|$)/;
 const foreignPersistencePattern = /(?:^|\/)(?:dashboard\/src\/lib\/db|src\/(?:bus|utils\/(?:atomic|lock)))(?:\.[cm]?[jt]s|\/|$)/;
 
 function walk(directory) {
