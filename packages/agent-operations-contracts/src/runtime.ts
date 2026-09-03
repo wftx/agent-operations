@@ -59,6 +59,10 @@ export interface AgentRuntimeSummary extends AgentRuntimeIdentity {
   readonly configured: boolean;
   readonly capabilities: readonly RuntimeCapability[];
   readonly health: AgentRuntimeHealth;
+  /** Live loaded catalog identity, when the runtime can prove it. */
+  readonly toolCatalogRevision?: string;
+  /** Live loaded application revision, when the runtime can prove it. */
+  readonly loadedRevision?: string;
 }
 
 export interface AgentRuntimeDetail extends AgentRuntimeSummary {
@@ -105,6 +109,19 @@ export interface RuntimeStartResult {
 /** Explicit mutation port. Runtime inventory and page reads never call it. */
 export interface RuntimeLifecycleAdapter {
   start(): Promise<RuntimeStartResult>;
+  restart?(): Promise<RuntimeStartResult>;
+}
+
+export type RuntimeFreshnessState = 'current' | 'restart-pending' | 'restarting' | 'stale-blocked';
+
+export interface RuntimeFreshnessReport {
+  readonly state: RuntimeFreshnessState;
+  readonly expectedToolCatalogRevision: string;
+  readonly loadedToolCatalogRevision?: string;
+  readonly expectedRevision?: string;
+  readonly loadedRevision?: string;
+  readonly activeAcceptedWork: number;
+  readonly message: string;
 }
 
 export function isRuntimeProvider(value: unknown): value is RuntimeProvider {

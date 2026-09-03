@@ -25,9 +25,19 @@ import type {
   DurableBrowserEvidence,
   DurablePreviewProfile,
   DurablePreviewSession,
+  DurableTrustProfile,
+  DurableAuthenticatedPreviewSession,
+  TrustProfilePolicy,
+  TrustProfilePreset,
+  TrustProfileScope,
+  RuntimeFreshnessReport,
 } from '../../agent-operations-contracts/src/index.js';
 
-export type { RuntimeStartResult } from '../../agent-operations-contracts/src/index.js';
+export type {
+  DurableTrustProfile,
+  RuntimeFreshnessReport,
+  RuntimeStartResult,
+} from '../../agent-operations-contracts/src/index.js';
 
 export interface OperatorTaskInput {
   readonly projectId: string;
@@ -100,7 +110,7 @@ export interface InputApplication {
 export interface OperatorPolicyDefaults {
   readonly policy: RuntimeExecutionPolicy;
   readonly capabilities: RuntimeExecutionCapabilities;
-  readonly maxWorkerAttempts: 2;
+  readonly maxWorkerAttempts: number;
   readonly reviewerEnabled: true;
   readonly automaticReadOnlyCompletion: boolean;
 }
@@ -147,7 +157,7 @@ export interface OperatorJobSummary {
   readonly workerAttemptCount: number;
   /** Worker Attempts that crossed, or may have crossed, provider submission. */
   readonly workerExecutionCount: number;
-  readonly automaticWorkerExecutionLimit: 2;
+  readonly automaticWorkerExecutionLimit: number;
   readonly humanWorkerBudgetExtensionCount: number;
   readonly authorizedWorkerExecutionLimit: number;
   readonly latestReviewDecision: AttemptReviewDecision | null;
@@ -223,11 +233,69 @@ export interface OperatorJobDetail {
   readonly previewProfile?: DurablePreviewProfile;
   readonly previewSession?: DurablePreviewSession;
   readonly browserEvidence?: readonly DurableBrowserEvidence[];
+  readonly authenticatedPreviewSession?: DurableAuthenticatedPreviewSession;
+}
+
+export interface EffectiveTrustProfile {
+  readonly profile: DurableTrustProfile | null;
+  readonly policy: TrustProfilePolicy;
+  readonly source: 'global' | 'project' | 'job' | 'conservative-fallback';
+}
+
+export interface SaveTrustProfileInput {
+  readonly scope: TrustProfileScope;
+  readonly scopeId?: string;
+  readonly name?: string;
+  readonly preset: TrustProfilePreset;
+  readonly policy?: TrustProfilePolicy;
+}
+
+export interface TrustProfileApplication {
+  list(): Promise<readonly DurableTrustProfile[]>;
+  save(input: SaveTrustProfileInput): Promise<DurableTrustProfile>;
+  effectiveForProject(projectId: string): Promise<EffectiveTrustProfile>;
+  effectiveForJob(jobId: string): Promise<EffectiveTrustProfile>;
+}
+
+export interface DailyDriverMetrics {
+  readonly jobsCreated: number;
+  readonly jobsCompleted: number;
+  readonly jobsFailed: number;
+  readonly jobsCancelled: number;
+  readonly jobsActiveOrNeedsHuman: number;
+  readonly autonomousCompletions: number;
+  readonly autonomousCompletionRate: number | null;
+  readonly jobsRequiringHumanIntervention: number;
+  readonly humanInterventionCount: number;
+  readonly humanInterventionRate: number | null;
+  readonly needsMeCategories: {
+    readonly machineResolvable: number;
+    readonly operatorResolvable: number;
+    readonly terminal: number;
+  };
+  readonly workerExecutions: number;
+  readonly averageWorkerExecutions: number | null;
+  readonly reviewerRevisionCount: number;
+  readonly reviewerRevisionRate: number | null;
+  readonly recoveryCount: number;
+  readonly providerSubmissions: number;
+  readonly duplicateDispatchCount: number;
+  readonly averageTimeToResultMs: number | null;
+}
+
+export interface DailyDriverMetricsApplication { read(): Promise<DailyDriverMetrics>; }
+
+export interface RuntimeFreshnessApplication {
+  inspect(): Promise<RuntimeFreshnessReport>;
+  ensureCurrentForJob(jobId: string): Promise<RuntimeFreshnessReport>;
 }
 
 export interface PreviewApplication {
   setJobEvidenceRequirement(jobId: string, requirement: BrowserEvidenceRequirement): Promise<void>;
-  setJobPreviewProfile(jobId: string, command: string): Promise<DurablePreviewProfile>;
+  setJobPreviewProfile(jobId: string, command: string, authenticationRequired?: boolean): Promise<DurablePreviewProfile>;
+  beginPreviewAuthentication(jobId: string): Promise<DurableAuthenticatedPreviewSession>;
+  verifyPreviewAuthentication(jobId: string): Promise<DurableAuthenticatedPreviewSession>;
+  revokePreviewAuthentication(jobId: string): Promise<DurableAuthenticatedPreviewSession>;
   startJobPreview(jobId: string): Promise<DurablePreviewSession>;
   refreshJobEvidence(jobId: string): Promise<DurableBrowserEvidence>;
   ensureJobEvidence(jobId: string): Promise<DurableBrowserEvidence>;
@@ -236,6 +304,7 @@ export interface PreviewApplication {
     readonly profile: DurablePreviewProfile | null;
     readonly session: DurablePreviewSession | null;
     readonly evidence: readonly DurableBrowserEvidence[];
+    readonly authentication: DurableAuthenticatedPreviewSession | null;
   }>;
 }
 
@@ -265,7 +334,10 @@ export type OrchestratorToolName =
   | 'ao.jobs.create'
   | 'ao.jobs.get'
   | 'ao.jobs.list'
-  | 'ao.jobs.status';
+  | 'ao.jobs.status'
+  | 'ao.jobs.guide'
+  | 'ao.jobs.authorize-one-more-attempt'
+  | 'ao.previews.authenticate';
 
 export interface OrchestratorToolRequest {
   readonly name: OrchestratorToolName;

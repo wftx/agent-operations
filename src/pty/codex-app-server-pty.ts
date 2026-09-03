@@ -324,7 +324,6 @@ export const AO_ORCHESTRATOR_DYNAMIC_TOOLS = [{
           task: { type: 'string' }, acceptanceCriteria: { type: 'string' },
           executionMode: { type: 'string', enum: ['repository-read-only', 'repository-write-isolated'] },
           reviewerRequired: { type: 'boolean', const: true },
-          maxWorkerAttempts: { type: 'integer', const: 2 },
           inputIds: { type: 'array', items: { type: 'string' }, maxItems: 20, uniqueItems: true },
           evidenceRequirements: {
             type: 'array', maxItems: 1, uniqueItems: true,
@@ -368,6 +367,27 @@ export const AO_ORCHESTRATOR_DYNAMIC_TOOLS = [{
       },
     },
     {
+      type: 'function', name: 'jobs_guide', description: 'Persist human guidance and continue one actionable AO escalation.',
+      inputSchema: {
+        type: 'object', properties: { escalationId: { type: 'string' }, instruction: { type: 'string' } },
+        required: ['escalationId', 'instruction'], additionalProperties: false,
+      },
+    },
+    {
+      type: 'function', name: 'jobs_authorize_one_more_attempt', description: 'Record explicit human authorization for exactly one additional Worker execution.',
+      inputSchema: {
+        type: 'object', properties: { escalationId: { type: 'string' }, instruction: { type: 'string' } },
+        required: ['escalationId'], additionalProperties: false,
+      },
+    },
+    {
+      type: 'function', name: 'previews_authenticate', description: 'Open a controlled local browser for a human to authenticate an exact Job Preview. Never handles passwords.',
+      inputSchema: {
+        type: 'object', properties: { jobId: { type: 'string' } },
+        required: ['jobId'], additionalProperties: false,
+      },
+    },
+    {
       type: 'function', name: 'conversation_respond', description: 'Return the final bounded response for this web turn.',
       inputSchema: {
         type: 'object',
@@ -392,6 +412,9 @@ const AO_TOOL_NAMES = {
   jobs_get: 'ao.jobs.get',
   jobs_list: 'ao.jobs.list',
   jobs_status: 'ao.jobs.status',
+  jobs_guide: 'ao.jobs.guide',
+  jobs_authorize_one_more_attempt: 'ao.jobs.authorize-one-more-attempt',
+  previews_authenticate: 'ao.previews.authenticate',
   conversation_respond: 'ao.conversation.respond',
 } as const;
 

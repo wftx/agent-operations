@@ -5,6 +5,7 @@ import {
   createRepositoryCheckoutBindingId,
   type BoundedBrowserAdapter,
   type InputMetadata,
+  type PreviewAuthenticationAdapter,
   type PreviewProcessAdapter,
   type PreviewWorkspaceAdapter,
   type RepositoryInventoryAdapter,
@@ -67,6 +68,86 @@ describe('PreviewApplicationService', () => {
     expect(await store.listJobInputIds('job:preview')).toEqual(['input:screenshot']);
     expect((await store.getInput('input:screenshot'))).not.toHaveProperty('bytes');
     expect((await service.getJobPreview('job:preview')).evidence).toHaveLength(1);
+  });
+
+  it('uses human established authentication only for the exact Project, profile, and origin', async () => {
+    const store = await fixtureStore();
+    let clock = new Date(timestamp);
+    const process: PreviewProcessAdapter = {
+      reservePort: async () => 4312,
+      start: async () => ({ pid: 92, origin: 'http://127.0.0.1:4312', logs: 'ready' }),
+      inspect: async () => ({ running: true, pid: 92 }),
+      stop: async () => undefined,
+    };
+    const previewWorkspace: PreviewWorkspaceAdapter = {
+      prepareReadOnlyWorkspace: async input => ({
+        exists: true, registered: true, canonicalPath: input.destinationPath,
+        repositoryId, revisionCommit: revision, detachedHead: true, clean: true,
+      }),
+      inspectReadOnlyWorkspace: async () => ({ exists: true, registered: true, detachedHead: true, clean: true }),
+      removeReadOnlyWorkspace: async () => ({ exists: false, registered: false }),
+    };
+    const calls: string[] = [];
+    const authentication: PreviewAuthenticationAdapter = {
+      begin: async input => { calls.push(`begin:${input.sessionId}:${input.origin}`); },
+      verify: async input => { calls.push(`verify:${input.sessionId}:${input.origin}`); return true; },
+      isUsable: async input => { calls.push(`usable:${input.sessionId}:${input.origin}`); return true; },
+      revoke: async input => { calls.push(`revoke:${input.sessionId}:${input.origin}`); },
+    };
+    let captureSessionId: string | undefined;
+    const browser: BoundedBrowserAdapter = {
+      capture: async request => {
+        captureSessionId = request.authenticationSessionId;
+        return {
+          title: 'Private dashboard', finalUrl: `${request.origin}/dashboard`,
+          screenshot: Uint8Array.from([1, 2, 3]), screenshotWidth: request.viewport.width,
+          screenshotHeight: request.viewport.height, visibleText: 'Authenticated fixture',
+          consoleFailures: [], failedResources: [], audit: [],
+        };
+      },
+    };
+    const service = new PreviewApplicationService(
+      store, fakeRepositories(), previewWorkspace, fakeWriteWorkspace(), process, browser, fakeInputs(store),
+      {
+        previewWorkspaceRoot: '/ao/preview-workspaces', authentication,
+        authenticationLifetimeMs: 60_000, now: () => clock,
+      },
+    );
+    await service.setJobPreviewProfile('job:preview', 'npm run dev', true);
+
+    const pending = await service.beginPreviewAuthentication('job:preview');
+    expect(pending).toMatchObject({
+      projectId, previewProfileId: expect.stringMatching(/^preview-profile:/),
+      origin: 'http://127.0.0.1:4312', status: 'pending-human-login',
+    });
+    expect(JSON.stringify(pending)).not.toMatch(/cookie|password|token|storage/i);
+    const ready = await service.verifyPreviewAuthentication('job:preview');
+    expect(ready).toMatchObject({ status: 'ready', lastVerifiedAt: timestamp });
+    const evidence = await service.refreshJobEvidence('job:preview');
+    expect(captureSessionId).toBe(ready.id);
+    expect(JSON.stringify(evidence)).not.toContain(ready.id);
+
+    clock = new Date('2026-09-02T12:02:00.000Z');
+    await expect(service.refreshJobEvidence('job:preview')).rejects.toThrow('expired');
+    expect((await store.getAuthenticatedPreviewSession(ready.id))?.status).toBe('expired');
+    await store.applyProjectConfiguration({
+      project: { id: 'project:other', name: 'Other', createdAt: timestamp, updatedAt: timestamp },
+      repositories: [], checkoutBindings: [], runtimeAgentIds: [],
+    });
+    await store.savePreviewProfile({
+      id: 'preview-profile:other', projectId: 'project:other', name: 'default',
+      command: { executable: 'npm', arguments: ['run', 'dev'] }, status: 'validated',
+      authenticationRequired: true, revision: 0, createdAt: timestamp, updatedAt: timestamp,
+    });
+    await store.createAuthenticatedPreviewSession({
+      id: 'preview-auth:other', projectId: 'project:other', previewProfileId: 'preview-profile:other',
+      installationId: (await store.getInstallation()).id, origin: 'http://127.0.0.1:4999',
+      status: 'pending-human-login', revision: 0, createdAt: timestamp, updatedAt: timestamp,
+    });
+    const revoked = await service.revokePreviewAuthentication('job:preview');
+    expect(revoked.status).toBe('revoked');
+    expect((await store.getAuthenticatedPreviewSession('preview-auth:other'))?.status).toBe('pending-human-login');
+    expect(calls.some(call => call.startsWith('revoke:'))).toBe(true);
   });
 });
 

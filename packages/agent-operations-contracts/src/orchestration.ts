@@ -16,6 +16,7 @@ export const ESCALATION_REASONS = [
   'human_judgment_required',
 ] as const;
 export type EscalationReason = (typeof ESCALATION_REASONS)[number];
+export type EscalationResolutionClass = 'machine-resolvable' | 'operator-resolvable' | 'terminal';
 
 export const EXECUTION_RESULT_MAX_CHARS = 16_384;
 
@@ -64,4 +65,38 @@ export function createEscalationId(uuid: string = randomUUID()): string {
   const value = uuid.trim();
   if (!value) throw new Error('Escalation UUID is required');
   return `escalation:${value}`;
+}
+
+/** Pure read model classification. Durable history remains unchanged. */
+export function classifyEscalationResolution(
+  escalation: Pick<DurableEscalation, 'reason' | 'summary'>,
+): EscalationResolutionClass {
+  if (escalation.reason === 'observation_timeout') return 'machine-resolvable';
+  if (escalation.reason === 'runtime_failure'
+    && /stale|preview process|tool catalog|ephemeral|observation failed/i.test(escalation.summary)) {
+    return 'machine-resolvable';
+  }
+  if (escalation.reason === 'human_judgment_required'
+    || escalation.reason === 'review_failed_after_budget'
+    || escalation.reason === 'reviewer_uncertain') return 'operator-resolvable';
+  if (escalation.reason === 'policy_blocked'
+    && /authentication|required credential|resource unavailable|missing information/i.test(escalation.summary)) {
+    return 'operator-resolvable';
+  }
+  return 'terminal';
+}
+
+export function actionableEscalationText(
+  escalation: Pick<DurableEscalation, 'reason' | 'summary'>,
+): string {
+  const classification = classifyEscalationResolution(escalation);
+  if (classification === 'machine-resolvable') {
+    return `AO can retry the local recovery step without resending accepted work. ${escalation.summary}`;
+  }
+  if (classification === 'operator-resolvable') {
+    if (/authentication/i.test(escalation.summary)) return 'Preview authentication required. Open the Job and authenticate the exact local Preview Profile.';
+    if (escalation.reason === 'review_failed_after_budget') return 'Choose whether to authorize exactly one additional Worker execution, or cancel the Job.';
+    return `Your decision or guidance is required. ${escalation.summary}`;
+  }
+  return `AO cannot continue truthfully under the current capabilities. ${escalation.summary}`;
 }

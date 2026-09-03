@@ -37,7 +37,10 @@ import type {
   DurableBrowserEvidence,
   DurablePreviewProfile,
   DurablePreviewSession,
+  DurableAuthenticatedPreviewSession,
 } from '../preview.js';
+import type { DurableTrustProfile } from '../trust.js';
+import { validateTrustProfile } from '../trust.js';
 
 export type InMemoryStateStoreOperation =
   | 'get-installation'
@@ -102,6 +105,10 @@ function copyProjectProfile(value: DurableProjectProfile): DurableProjectProfile
   };
 }
 
+function copyTrustProfile(value: DurableTrustProfile): DurableTrustProfile {
+  return { ...value, policy: { ...value.policy } };
+}
+
 function copyInput(value: DurableInput): DurableInput {
   return { ...value };
 }
@@ -112,6 +119,7 @@ function copyPreviewProfile(value: DurablePreviewProfile): DurablePreviewProfile
 }
 
 function copyPreviewSession(value: DurablePreviewSession): DurablePreviewSession { return { ...value }; }
+function copyAuthenticatedPreviewSession(value: DurableAuthenticatedPreviewSession): DurableAuthenticatedPreviewSession { return { ...value }; }
 
 function copyBrowserEvidence(value: DurableBrowserEvidence): DurableBrowserEvidence {
   return {
@@ -267,12 +275,14 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   private readonly projectRuntimeAgents = new Map<string, Set<string>>();
   private readonly localFolderResources = new Map<string, DurableLocalFolderResource>();
   private readonly projectProfiles = new Map<string, DurableProjectProfile>();
+  private readonly trustProfiles = new Map<string, DurableTrustProfile>();
   private readonly inputs = new Map<string, DurableInput>();
   private readonly conversationInputs = new Map<string, Set<string>>();
   private readonly jobInputs = new Map<string, Set<string>>();
   private readonly previewProfiles = new Map<string, DurablePreviewProfile>();
   private readonly browserRequirements = new Map<string, BrowserEvidenceRequirement>();
   private readonly previewSessions = new Map<string, DurablePreviewSession>();
+  private readonly authenticatedPreviewSessions = new Map<string, DurableAuthenticatedPreviewSession>();
   private readonly browserEvidence = new Map<string, DurableBrowserEvidence>();
   private readonly repositoryObservations = new Map<string, DurableRepositoryObservation[]>();
   private readonly runtimeObservations = new Map<string, DurableRuntimeObservation[]>();
@@ -447,6 +457,42 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     return profile ? copyProjectProfile(profile) : null;
   }
 
+  async saveTrustProfile(profile: DurableTrustProfile): Promise<void> {
+    this.assertAvailable('apply-configuration');
+    validateTrustProfile(profile);
+    if (profile.scope === 'project' && !this.projects.has(profile.scopeId!)) {
+      throw new Error(`Project not found: ${profile.scopeId}`);
+    }
+    if (profile.scope === 'job' && !this.jobs.has(profile.scopeId!)) {
+      throw new Error(`Job not found: ${profile.scopeId}`);
+    }
+    const existing = this.trustProfiles.get(profile.id);
+    if (profile.revision !== (existing ? existing.revision + 1 : 0)
+      || (existing && (existing.scope !== profile.scope
+        || existing.scopeId !== profile.scopeId
+        || existing.createdAt !== profile.createdAt))) {
+      throw new Error(`Stale or rewritten Trust Profile: ${profile.id}`);
+    }
+    const duplicate = [...this.trustProfiles.values()].find(value =>
+      value.id !== profile.id && value.scope === profile.scope && value.scopeId === profile.scopeId);
+    if (duplicate) throw new Error(`Trust Profile already exists for ${profile.scope}:${profile.scopeId ?? 'global'}`);
+    this.trustProfiles.set(profile.id, copyTrustProfile(profile));
+  }
+
+  async getTrustProfile(id: string): Promise<DurableTrustProfile | null> {
+    this.assertAvailable('read');
+    const profile = this.trustProfiles.get(id);
+    return profile ? copyTrustProfile(profile) : null;
+  }
+
+  async listTrustProfiles(): Promise<readonly DurableTrustProfile[]> {
+    this.assertAvailable('read');
+    return [...this.trustProfiles.values()]
+      .sort((left, right) => left.scope.localeCompare(right.scope)
+        || (left.scopeId ?? '').localeCompare(right.scopeId ?? ''))
+      .map(copyTrustProfile);
+  }
+
   async savePreviewProfile(profile: DurablePreviewProfile): Promise<void> {
     this.assertAvailable('apply-configuration');
     const existing = this.previewProfiles.get(profile.id);
@@ -466,6 +512,48 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     this.assertAvailable('read');
     return [...this.previewProfiles.values()].filter(profile => !projectId || profile.projectId === projectId)
       .sort((a, b) => a.name.localeCompare(b.name)).map(copyPreviewProfile);
+  }
+
+  async createAuthenticatedPreviewSession(session: DurableAuthenticatedPreviewSession): Promise<void> {
+    this.assertAvailable('apply-configuration');
+    if (!session.id.startsWith('preview-auth:') || session.status !== 'pending-human-login'
+      || session.revision !== 0 || this.authenticatedPreviewSessions.has(session.id)) {
+      throw new Error(`Invalid Authenticated Preview Session: ${session.id}`);
+    }
+    const profile = this.previewProfiles.get(session.previewProfileId);
+    if (!profile || profile.projectId !== session.projectId || !profile.authenticationRequired) {
+      throw new Error(`Authenticated Preview Session has no matching required Profile: ${session.id}`);
+    }
+    this.authenticatedPreviewSessions.set(session.id, copyAuthenticatedPreviewSession(session));
+  }
+
+  async getAuthenticatedPreviewSession(id: string): Promise<DurableAuthenticatedPreviewSession | null> {
+    this.assertAvailable('read');
+    const value = this.authenticatedPreviewSessions.get(id);
+    return value ? copyAuthenticatedPreviewSession(value) : null;
+  }
+
+  async listAuthenticatedPreviewSessions(projectId?: string): Promise<readonly DurableAuthenticatedPreviewSession[]> {
+    this.assertAvailable('read');
+    return [...this.authenticatedPreviewSessions.values()]
+      .filter(value => !projectId || value.projectId === projectId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id))
+      .map(copyAuthenticatedPreviewSession);
+  }
+
+  async saveAuthenticatedPreviewSessionTransition(
+    session: DurableAuthenticatedPreviewSession,
+    expectedRevision: number,
+  ): Promise<void> {
+    this.assertAvailable('apply-configuration');
+    const existing = this.authenticatedPreviewSessions.get(session.id);
+    if (!existing || existing.revision !== expectedRevision || session.revision !== expectedRevision + 1
+      || existing.projectId !== session.projectId || existing.previewProfileId !== session.previewProfileId
+      || existing.installationId !== session.installationId || existing.origin !== session.origin
+      || existing.createdAt !== session.createdAt || !validAuthTransition(existing.status, session.status)) {
+      throw new Error(`Invalid Authenticated Preview Session transition: ${session.id}`);
+    }
+    this.authenticatedPreviewSessions.set(session.id, copyAuthenticatedPreviewSession(session));
   }
 
   async createInput(input: DurableInput): Promise<void> {
@@ -1399,4 +1487,10 @@ function isValidOperatorRunTransition(from: string, to: string): boolean {
   return from === 'pending' && (to === 'running' || to === 'failed')
     || from === 'running' && ['completed', 'needs_human', 'failed'].includes(to)
     || from === 'needs_human' && (to === 'pending' || to === 'cancelled');
+}
+
+function validAuthTransition(from: string, to: string): boolean {
+  return from === 'pending-human-login' && (to === 'ready' || to === 'expired' || to === 'revoked')
+    || from === 'ready' && (to === 'expired' || to === 'revoked')
+    || from === 'expired' && to === 'revoked';
 }

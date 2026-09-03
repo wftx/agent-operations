@@ -8,7 +8,12 @@ import type {
   OrchestratorConversationState,
   RuntimeStartResult,
   ProjectOnboardingResult,
+  DurableTrustProfile,
+  EffectiveTrustProfile,
+  DailyDriverMetrics,
+  RuntimeFreshnessReport,
 } from '../../../packages/agent-operations-application/src/index.js';
+import { actionableEscalationText } from '../../../packages/agent-operations-application/src/index.js';
 
 export function renderOrchestrator(
   conversation: OrchestratorConversationState,
@@ -111,6 +116,8 @@ export function renderDashboard(
     readonly telegramConfigured?: boolean;
     readonly runtimeStart?: RuntimeStartResult;
   } = {},
+  metrics?: DailyDriverMetrics,
+  freshness?: RuntimeFreshnessReport,
 ): string {
   const runnable = projects.filter(project => project.runnable);
   const selectedProject = options.input?.projectId ?? runnable[0]?.project.id ?? '';
@@ -128,10 +135,12 @@ export function renderDashboard(
       <div><p class="eyebrow">Notifications</p><strong>Telegram: ${options.telegramConfigured ? 'Configured' : 'Not configured'}</strong></div>
       <div><span>${running}</span><small>Running</small></div><div><span>${needsMe}</span><small>Needs Me</small></div><div><span>${doneToday}</span><small>Done Today</small></div>
     </section>
+    ${freshness ? `<section class="criteria"><p class="eyebrow">Runtime freshness</p><p><strong>${escapeHtml(freshness.message)}</strong> · ${freshness.activeAcceptedWork} active accepted execution(s)</p></section>` : ''}
+    ${metrics ? `<section class="criteria"><p class="eyebrow">Daily Driver summary</p><dl class="facts"><div><dt>Jobs completed</dt><dd>${metrics.jobsCompleted} of ${metrics.jobsCreated}</dd></div><div><dt>Failed or cancelled</dt><dd>${metrics.jobsFailed + metrics.jobsCancelled}</dd></div><div><dt>Autonomous completions</dt><dd>${formatRate(metrics.autonomousCompletionRate)}</dd></div><div><dt>Jobs needing a person</dt><dd>${metrics.jobsRequiringHumanIntervention} (${formatRate(metrics.humanInterventionRate)})</dd></div><div><dt>Average Worker executions</dt><dd>${metrics.averageWorkerExecutions?.toFixed(1) ?? 'Not enough data'}</dd></div><div><dt>Reviewer revisions</dt><dd>${metrics.reviewerRevisionCount}</dd></div><div><dt>Recoveries</dt><dd>${metrics.recoveryCount}</dd></div></dl></section>` : ''}
     ${options.runtimeStart ? renderRuntimeStart(options.runtimeStart) : ''}
     <section class="hero">
       <div><p class="eyebrow">New repository job</p><h1>What should Agent Operations do?</h1>
-      <p class="lede">One bounded Worker, one independent Reviewer, and at most one revision. Read-only by default.</p></div>
+      <p class="lede">Bounded Workers, independent review, and risk aware limits. Read only by default.</p></div>
       <form method="post" action="/jobs" class="task-form">
         ${options.error ? `<div class="alert error">${escapeHtml(options.error)}</div>` : ''}
         ${options.preview ? renderPreview(options.preview) : ''}
@@ -168,6 +177,16 @@ export function renderDashboard(
   return layout('Jobs', form, 'jobs');
 }
 
+export function renderTrustProfiles(
+  profiles: readonly DurableTrustProfile[],
+  projects: readonly { readonly projectId: string; readonly projectName: string; readonly effective: EffectiveTrustProfile }[],
+): string {
+  const global = profiles.find(profile => profile.scope === 'global');
+  const presetOptions = (selected: string) => `<option value="conservative" ${selected === 'conservative' ? 'selected' : ''}>Conservative</option><option value="daily-driver" ${selected === 'daily-driver' ? 'selected' : ''}>Daily Driver</option>`;
+  const cards = projects.map(project => `<article class="card"><div class="card-head"><div><p class="eyebrow">Project policy</p><h2>${escapeHtml(project.projectName)}</h2><p>Effective source: ${escapeHtml(project.effective.source)}</p></div><span class="status ${project.effective.profile?.preset === 'daily-driver' ? 'done' : 'neutral'}">${escapeHtml(project.effective.profile?.preset ?? 'conservative')}</span></div><form method="post" action="/trust" class="task-form"><input type="hidden" name="scope" value="project"><input type="hidden" name="scopeId" value="${escapeAttr(project.projectId)}"><label>Project override<select name="preset">${presetOptions(project.effective.profile?.preset ?? 'conservative')}</select></label><div class="actions"><button>Save Project Policy</button></div></form><p class="muted">Daily Driver allows Green work automatically and isolated Yellow work within bounded budgets. Red actions always require human approval.</p></article>`).join('');
+  return layout('Trust Profiles', `<header class="page-head"><div><p class="eyebrow">Bounded autonomy</p><h1>Trust Profiles</h1><p>Choose how much routine reversible work AO may complete without another interruption.</p></div></header><section class="panel"><h2>Global default</h2><form method="post" action="/trust" class="task-form"><input type="hidden" name="scope" value="global"><label>Default preset<select name="preset">${presetOptions(global?.preset ?? 'conservative')}</select></label><div class="actions"><button>Save Global Default</button></div></form><p class="muted">Existing Projects remain Conservative until you explicitly change the global default or set a Project override. Custom policies are available through the bounded application API.</p></section><section class="stack">${cards}</section>`, 'trust');
+}
+
 function renderRuntimeStart(result: RuntimeStartResult): string {
   const inventory = `${result.inventory.configuredAgents.length} configured agent(s), ${result.inventory.configuredCronCount} cron(s), ${result.inventory.configuredIntegrationCount} integration credential file(s)`;
   return `<div class="alert ${result.status === 'failed' ? 'error' : 'preview'}"><strong>${escapeHtml(result.message)}</strong><br>${escapeHtml(inventory)}${result.diagnostic ? `<br><small>${escapeHtml(result.diagnostic)}</small>` : ''}</div>`;
@@ -191,7 +210,7 @@ export function renderNeedsMe(jobs: readonly OperatorJobDetail[]): string {
       <div><dt>Decision type</dt><dd>${escapeHtml(humanize(detail.escalationKinds[escalation.id] ?? 'terminal'))}</dd></div>
       <div><dt>Latest Worker result</dt><dd>${escapeHtml(detail.finalWorkerResult ?? 'No bounded Worker result was available before AO stopped.')}</dd></div>
       <div><dt>Reviewer feedback</dt><dd>${escapeHtml(reviewForEscalation(detail, escalation.id)?.feedback ?? reviewForEscalation(detail, escalation.id)?.summary ?? 'No Reviewer decision was recorded.')}</dd></div>
-      <div><dt>What I need from you</dt><dd>${detail.escalationActions[escalation.id]?.includes('authorize-worker-budget-extension') ? 'Explicitly authorize one additional Worker execution, with optional guidance, or cancel this Job.' : detail.escalationActions[escalation.id]?.includes('reconcile-execution') ? 'Check the existing accepted execution again. This does not resend the task.' : detail.escalationActions[escalation.id]?.includes('provide-guidance') ? 'Provide bounded guidance for a fresh Worker Attempt, or cancel this Job.' : detail.escalationKinds[escalation.id] === 'human-approval' ? 'Review the approved evidence. AO will not continue or publish automatically.' : detail.escalationActions[escalation.id]?.includes('cancel-job') ? 'Cancel this Job, or repair the blocking condition outside Agent Operations.' : 'Repair or reconcile the blocking condition outside Agent Operations. AO will not retry uncertain work.'}</dd></div></dl>
+      <div><dt>What I need from you</dt><dd>${escapeHtml(detail.escalationActions[escalation.id]?.includes('authorize-worker-budget-extension') ? 'Explicitly authorize one additional Worker execution, with optional guidance, or cancel this Job.' : detail.escalationActions[escalation.id]?.includes('reconcile-execution') ? 'Check the existing accepted execution again. This does not resend the task.' : detail.escalationActions[escalation.id]?.includes('provide-guidance') ? 'Provide bounded guidance for a fresh Worker Attempt, or cancel this Job.' : detail.escalationKinds[escalation.id] === 'human-approval' ? 'Review the approved evidence. AO will not continue or publish automatically.' : actionableEscalationText(escalation))}</dd></div></dl>
       ${renderEscalationActions(detail, escalation.id)}
     </article>`)) : ['<div class="empty"><h2>Nothing needs you</h2><p>Unresolved durable escalations will appear here.</p></div>'];
   return layout('Needs Me', `<header class="page-head"><div><p class="eyebrow">Human boundary</p><h1>Needs Me</h1><p>Work Agent Operations stopped rather than guessing or exceeding its budget.</p></div><a class="refresh" href="/needs-me">Refresh</a></header><section class="stack">${cards.join('')}</section>`, 'needs-me');
@@ -251,12 +270,14 @@ function renderBrowserEvidence(detail: OperatorJobDetail): string {
   </section>`;
   const session = detail.previewSession;
   const evidence = detail.browserEvidence?.at(-1);
+  const authentication = detail.authenticatedPreviewSession;
   return `<section class="criteria"><p class="eyebrow">Browser evidence</p>
     <p><strong>${evidence ? 'Captured' : session?.state === 'running' ? 'Preview ready' : 'Required'}</strong> · route ${escapeHtml(requirement.route)} · viewport ${requirement.viewport.width} × ${requirement.viewport.height}</p>
     ${session ? `<p>Preview ${escapeHtml(session.state)} · exact revision ${escapeHtml(session.revisionCommit.slice(0, 12))} · source state ${escapeHtml(session.sourceStateHash.slice(0, 12))}${session.state === 'running' ? ` · <a href="${escapeAttr(`${session.origin}${requirement.route}`)}" target="_blank" rel="noopener">View Preview</a>` : ''}</p>` : ''}
     ${evidence ? `<p>Screenshot SHA256 ${escapeHtml(evidence.screenshotSha256)} · ${evidence.screenshotByteSize} bytes · ${evidence.screenshotWidth} × ${evidence.screenshotHeight} · evidence ${escapeHtml(evidence.evidenceHash)}</p><details><summary>Bounded page evidence</summary><pre>${escapeHtml(evidence.visibleText)}\n\nConsole failures: ${escapeHtml(evidence.consoleFailures.join('\n') || 'none')}\nFailed resources: ${escapeHtml(evidence.failedResources.join('\n') || 'none')}</pre></details>` : ''}
     ${detail.previewProfile?.status === 'invalid' ? `<div class="alert error"><strong>Preview command needs attention.</strong><br>${escapeHtml(detail.previewProfile.validation?.message ?? 'The selected command did not produce a healthy local preview.')}</div>` : ''}
-    <form method="post" action="/jobs/${jobId}/preview/profile"><label>Selected preview command<input name="command" value="${escapeAttr(detail.previewProfile ? displayPreviewCommand(detail.previewProfile.command) : '')}" placeholder="npm run dev" required></label><div class="actions"><button class="secondary">Save Preview Profile</button></div></form>
+    <form method="post" action="/jobs/${jobId}/preview/profile"><label>Selected preview command<input name="command" value="${escapeAttr(detail.previewProfile ? displayPreviewCommand(detail.previewProfile.command) : '')}" placeholder="npm run dev" required></label><label><input type="checkbox" name="authenticationRequired" value="yes" ${detail.previewProfile?.authenticationRequired ? 'checked' : ''}> Human login required for this preview</label><div class="actions"><button class="secondary">Save Preview Profile</button></div></form>
+    ${detail.previewProfile?.authenticationRequired ? `<div class="alert ${authentication?.status === 'ready' ? 'preview' : 'error'}"><strong>Preview authentication: ${escapeHtml(authentication?.status ?? 'required')}</strong><br>Login happens in a controlled local browser. AO stores only safe session metadata and never exposes cookies, tokens, or passwords to an agent.</div><div class="actions">${!authentication || ['expired', 'revoked'].includes(authentication.status) ? `<form method="post" action="/jobs/${jobId}/preview/authentication/begin"><button>Authenticate Preview</button></form>` : authentication.status === 'pending-human-login' ? `<form method="post" action="/jobs/${jobId}/preview/authentication/verify"><button>Verify Login</button></form>` : ''}${authentication && authentication.status !== 'revoked' ? `<form method="post" action="/jobs/${jobId}/preview/authentication/revoke"><button class="secondary">Revoke Session</button></form>` : ''}</div>` : ''}
     <div class="actions"><form method="post" action="/jobs/${jobId}/preview/start"><button>${session?.state === 'running' ? 'Check Preview' : 'Start Preview'}</button></form>${session?.state === 'running' ? `<form method="post" action="/jobs/${jobId}/preview/evidence"><button class="secondary">${evidence ? 'Refresh Evidence' : 'Capture Evidence'}</button></form>` : ''}</div>
   </section>`;
 }
@@ -275,7 +296,7 @@ export function renderError(message: string, status = 500): string {
 
 function renderPreview(preview: OperatorTaskPreview): string {
   const write = preview.executionMode === 'repository-write-isolated';
-  return `<div class="alert preview"><strong>Safe preview, no Job or Dispatch created.</strong> No workspace created.<br>${escapeHtml(preview.project.name)} / ${escapeHtml(preview.repository.name)} · ${escapeHtml(preview.runtimeAgentId)} · ${write ? 'workspace write in isolated AO worktree' : 'read only'} / deny / empty · 2 Worker executions · Reviewer enabled · ${write ? 'human approval required after PASS' : 'automatic completion after PASS'}</div>`;
+  return `<div class="alert preview"><strong>Safe preview, no Job or Dispatch created.</strong> No workspace created.<br>${escapeHtml(preview.project.name)} / ${escapeHtml(preview.repository.name)} · ${escapeHtml(preview.runtimeAgentId)} · ${write ? 'workspace write in isolated AO worktree' : 'read only'} / deny / empty · up to ${preview.defaults.maxWorkerAttempts} Worker executions · Reviewer enabled · ${write ? 'human approval required after PASS' : 'automatic completion after PASS'}</div>`;
 }
 
 function renderJobTable(jobs: readonly OperatorJobSummary[], title: string): string {
@@ -286,10 +307,14 @@ function renderJobTable(jobs: readonly OperatorJobSummary[], title: string): str
   </a>`).join('')}</div></section>`;
 }
 
-function layout(title: string, content: string, active: 'orchestrator' | 'projects' | 'jobs' | 'running' | 'needs-me' | 'done', refreshSeconds?: number): string {
-  const nav = [['orchestrator', '/orchestrator', 'Orchestrator'], ['projects', '/projects', 'Projects'], ['jobs', '/', 'Jobs'], ['running', '/running', 'Running'], ['needs-me', '/needs-me', 'Needs Me'], ['done', '/done', 'Done']]
+function layout(title: string, content: string, active: 'orchestrator' | 'projects' | 'trust' | 'jobs' | 'running' | 'needs-me' | 'done', refreshSeconds?: number): string {
+  const nav = [['orchestrator', '/orchestrator', 'Orchestrator'], ['projects', '/projects', 'Projects'], ['trust', '/trust', 'Trust'], ['jobs', '/', 'Jobs'], ['running', '/running', 'Running'], ['needs-me', '/needs-me', 'Needs Me'], ['done', '/done', 'Done']]
     .map(([key, href, label]) => `<a href="${href}" ${active === key ? 'aria-current="page"' : ''}>${label}</a>`).join('');
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refreshSeconds ? `<meta http-equiv="refresh" content="${refreshSeconds}">` : ''}<title>${escapeHtml(title)} · Agent Operations</title><style>${styles}</style></head><body><header class="topbar"><a class="brand" href="/"><span>AO</span><strong>Agent Operations</strong></a><nav>${nav}</nav><span class="local">Local only</span></header><main>${content}</main><footer>Agent Operations mission control · controlled repository work</footer></body></html>`;
+}
+
+function formatRate(value: number | null): string {
+  return value === null ? 'Not enough data' : `${Math.round(value * 100)}%`;
 }
 
 function statusClass(job: OperatorJobSummary): string {

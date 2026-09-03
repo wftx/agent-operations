@@ -20,6 +20,7 @@ export interface DurablePreviewProfile {
   readonly name: string;
   readonly command: PreviewCommand;
   readonly status: PreviewProfileStatus;
+  readonly authenticationRequired?: boolean;
   readonly validation?: PreviewProfileValidation;
   readonly revision: number;
   readonly createdAt: string;
@@ -103,6 +104,8 @@ export interface BrowserCaptureRequest {
   readonly origin: string;
   readonly route: string;
   readonly viewport: BrowserViewport;
+  /** Opaque AO identity. The adapter resolves node local secret material privately. */
+  readonly authenticationSessionId?: string;
 }
 
 export interface BrowserCaptureResult {
@@ -120,6 +123,31 @@ export interface BrowserCaptureResult {
 /** Browser implementation port. Implementations may only reach the supplied loopback origin. */
 export interface BoundedBrowserAdapter {
   capture(request: BrowserCaptureRequest): Promise<BrowserCaptureResult>;
+}
+
+export type AuthenticatedPreviewSessionStatus = 'pending-human-login' | 'ready' | 'expired' | 'revoked';
+
+/** Durable safe metadata only. Cookies, tokens, storage paths, and passwords are forbidden. */
+export interface DurableAuthenticatedPreviewSession {
+  readonly id: string;
+  readonly projectId: string;
+  readonly previewProfileId: string;
+  readonly installationId: string;
+  readonly origin: string;
+  readonly status: AuthenticatedPreviewSessionStatus;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly lastVerifiedAt?: string;
+  readonly expiresAt?: string;
+  readonly revokedAt?: string;
+  readonly revision: number;
+}
+
+export interface PreviewAuthenticationAdapter {
+  begin(input: { readonly sessionId: string; readonly origin: string }): Promise<void>;
+  verify(input: { readonly sessionId: string; readonly origin: string }): Promise<boolean>;
+  isUsable(input: { readonly sessionId: string; readonly origin: string }): Promise<boolean>;
+  revoke(input: { readonly sessionId: string; readonly origin: string }): Promise<void>;
 }
 
 export interface ReadOnlyPreviewWorkspaceRequest {
@@ -181,4 +209,10 @@ export function createPreviewSessionId(uuid: string = randomUUID()): string {
 
 export function createBrowserEvidenceId(uuid: string = randomUUID()): string {
   return `browser-evidence:${uuid}`;
+}
+
+export function createAuthenticatedPreviewSessionId(uuid: string = randomUUID()): string {
+  const value = uuid.trim();
+  if (!value) throw new Error('Authenticated Preview Session UUID is required');
+  return `preview-auth:${value}`;
 }

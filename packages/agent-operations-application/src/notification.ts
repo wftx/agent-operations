@@ -3,6 +3,8 @@ export type OperatorNotificationEvent =
       readonly kind: 'job_completed';
       readonly jobId: string;
       readonly title: string;
+      readonly projectName?: string;
+      readonly aoPath?: string;
       readonly result: string;
       readonly reviewerSummary: string;
       readonly workerAttemptCount: number;
@@ -12,6 +14,8 @@ export type OperatorNotificationEvent =
       readonly jobId: string;
       readonly escalationId: string;
       readonly title: string;
+      readonly projectName?: string;
+      readonly aoPath?: string;
       readonly reason: string;
       readonly reviewerFeedback?: string;
     };

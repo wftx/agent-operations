@@ -66,6 +66,7 @@ export class CortextOSRuntimeLifecycleAdapter implements RuntimeLifecycleAdapter
   private readonly spawnProcess: NonNullable<CortextOSRuntimeLifecycleAdapterOptions['spawnProcess']>;
   private readonly isProcessAlive: (pid: number) => boolean;
   private startInFlight: Promise<RuntimeStartResult> | null = null;
+  private restartInFlight: Promise<RuntimeStartResult> | null = null;
 
   constructor(options: CortextOSRuntimeLifecycleAdapterOptions = {}) {
     this.instanceId = options.instanceId ?? options.environment?.CTX_INSTANCE_ID
@@ -95,6 +96,40 @@ export class CortextOSRuntimeLifecycleAdapter implements RuntimeLifecycleAdapter
       this.startInFlight = null;
     });
     return this.startInFlight;
+  }
+
+  async restart(): Promise<RuntimeStartResult> {
+    if (this.restartInFlight) return this.restartInFlight;
+    this.restartInFlight = this.restartOnce().finally(() => { this.restartInFlight = null; });
+    return this.restartInFlight;
+  }
+
+  private async restartOnce(): Promise<RuntimeStartResult> {
+    const agents = await this.runtime.listAgents().catch(() => [] as readonly AgentRuntimeSummary[]);
+    const inventory = this.readInventory(agents);
+    const cliPath = join(this.frameworkRoot, 'dist', 'cli.js');
+    if (!existsSync(cliPath)) return this.failed(inventory, 'CortextOS is not built.', `Missing canonical startup entry: ${cliPath}`);
+    if (this.readLiveOwner()) {
+      const stopped = spawnSync(process.execPath, [cliPath, 'stop', '--instance', this.instanceId], {
+        cwd: this.frameworkRoot,
+        env: { ...this.environment, CTX_INSTANCE_ID: this.instanceId, CTX_ROOT: this.ctxRoot },
+        encoding: 'utf8',
+        timeout: this.readinessTimeoutMs,
+      });
+      if (stopped.status !== 0) {
+        return this.failed(
+          inventory,
+          'Runtime could not be stopped cleanly.',
+          boundedDiagnostic(stopped.stderr || stopped.stdout || 'Canonical stop command failed.'),
+        );
+      }
+      const deadline = Date.now() + this.readinessTimeoutMs;
+      while (Date.now() < deadline && this.readLiveOwner()) await this.sleep(this.readinessIntervalMs);
+      if (this.readLiveOwner()) {
+        return this.failed(inventory, 'Runtime stop did not settle.', 'The canonical owner remained live after the bounded stop window.');
+      }
+    }
+    return this.start();
   }
 
   private async startOnce(): Promise<RuntimeStartResult> {

@@ -42,12 +42,24 @@ export type {
   OrchestratorTurnInput,
   OrchestratorTurnResult,
   PreviewApplication,
+  EffectiveTrustProfile,
+  SaveTrustProfileInput,
+  TrustProfileApplication,
+  DailyDriverMetrics,
+  DailyDriverMetricsApplication,
+  RuntimeFreshnessApplication,
+  DurableTrustProfile,
+  RuntimeFreshnessReport,
 } from './types.js';
 export { OrchestratorConversationApplicationService } from './orchestrator-conversation-service.js';
 export { OrchestratorToolApplicationService } from './orchestrator-tool-application-service.js';
 export { ProjectApplicationService, type ProjectApplicationServiceOptions } from './project-application-service.js';
 export { InputApplicationService, type InputApplicationServiceOptions } from './input-application-service.js';
 export { PreviewApplicationService, type PreviewApplicationServiceOptions } from './preview-application-service.js';
+export { TrustProfileApplicationService } from './trust-profile-application-service.js';
+export { DailyDriverMetricsService } from './daily-driver-metrics-service.js';
+export { RuntimeFreshnessService, type RuntimeFreshnessServiceOptions } from './runtime-freshness-service.js';
+export { actionableEscalationText } from '../../agent-operations-contracts/src/index.js';
 export type {
   CreateProjectInput,
   CreateProjectResourceInput,

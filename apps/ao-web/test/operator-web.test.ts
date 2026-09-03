@@ -10,6 +10,7 @@ import type {
   OperatorTaskPreview,
   RuntimeStartResult,
   PreviewApplication,
+  TrustProfileApplication,
 } from '../../../packages/agent-operations-application/src/index.js';
 import {
   OPERATOR_ISOLATED_WRITE_DEFAULTS,
@@ -159,6 +160,44 @@ describe('OperatorWebApplication', () => {
     expect(service.previewCalls).toBe(0);
     expect(service.runCalls).toBe(0);
     expect(service.startRuntimeCalls).toBe(0);
+  });
+
+  it('shows and updates bounded Trust Profile presets only through explicit POST', async () => {
+    const saved: unknown[] = [];
+    const conservative = {
+      readOnlyJobsAutoRun: false, isolatedWriteJobsAutoRun: false,
+      maxGreenWorkerExecutions: 2, maxYellowWorkerExecutions: 2,
+      maxGreenReviewerCycles: 2, maxYellowReviewerCycles: 2,
+      validatedPreviewsAutoStart: false, authenticatedPreviewsAllowed: false,
+      staleRuntimeAutoRestart: false, buildsAndTestsAllowed: true,
+      assetTransformationsAllowed: false, redActionsRequireHumanApproval: true as const,
+    };
+    const trust: TrustProfileApplication = {
+      list: async () => [],
+      save: async input => {
+        saved.push(input);
+        return { id: 'trust-profile:global', scope: 'global', name: 'Daily Driver global policy',
+          preset: 'daily-driver', policy: { ...conservative, readOnlyJobsAutoRun: true },
+          revision: 0, createdAt: TIME, updatedAt: TIME };
+      },
+      effectiveForProject: async () => ({ profile: null, policy: conservative, source: 'conservative-fallback' }),
+      effectiveForJob: async () => ({ profile: null, policy: conservative, source: 'conservative-fallback' }),
+    };
+    const app = new OperatorWebApplication(new StubOperatorApplication(), {}, {}, undefined, undefined, undefined, trust);
+
+    const page = await app.handle(new Request('http://localhost/trust'));
+    const body = await page.text();
+    expect(body).toContain('Trust Profiles');
+    expect(body).toContain('Daily Driver');
+    expect(body).toContain('Red actions always require human approval');
+    expect(saved).toHaveLength(0);
+
+    const response = await app.handle(new Request('http://localhost/trust', {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ scope: 'project', scopeId: PROJECT_ID, preset: 'daily-driver' }),
+    }));
+    expect(response.status).toBe(303);
+    expect(saved).toEqual([{ scope: 'project', scopeId: PROJECT_ID, preset: 'daily-driver' }]);
   });
 
   it('shows retained preflight history separately from the Worker execution budget', async () => {
@@ -598,6 +637,9 @@ describe('Job Preview HTTP actions', () => {
     let captures = 0;
     let requirements = 0;
     let profiles = 0;
+    let authenticationBegins = 0;
+    let authenticationVerifications = 0;
+    let authenticationRevocations = 0;
     const preview: PreviewApplication = {
       setJobEvidenceRequirement: async (_jobId, requirement) => {
         requirements += 1;
@@ -610,6 +652,9 @@ describe('Job Preview HTTP actions', () => {
         expect(command).toBe('npm exec --offline -- next dev');
         throw new Error('profile fixture');
       },
+      beginPreviewAuthentication: async () => { authenticationBegins += 1; throw new Error('begin fixture'); },
+      verifyPreviewAuthentication: async () => { authenticationVerifications += 1; throw new Error('verify fixture'); },
+      revokePreviewAuthentication: async () => { authenticationRevocations += 1; throw new Error('revoke fixture'); },
       startJobPreview: async jobId => {
         starts += 1;
         return { id: 'preview-session:test', jobId, projectId: PROJECT_ID, repositoryId: REPOSITORY_ID,
@@ -624,7 +669,7 @@ describe('Job Preview HTTP actions', () => {
         throw new Error('capture fixture');
       },
       ensureJobEvidence: async () => { throw new Error('not used'); },
-      getJobPreview: async () => ({ requirement: null, profile: null, session: null, evidence: [] }),
+      getJobPreview: async () => ({ requirement: null, profile: null, session: null, evidence: [], authentication: null }),
     };
     const app = new OperatorWebApplication(operator, {}, {}, undefined, undefined, preview);
 
@@ -657,5 +702,14 @@ describe('Job Preview HTTP actions', () => {
     ));
     expect(captured.status).toBe(400);
     expect(captures).toBe(1);
+    const authenticationActions = await Promise.all([
+      app.handle(new Request(`http://localhost/jobs/${encodeURIComponent(JOB_ID)}/preview/authentication/begin`, { method: 'POST' })),
+      app.handle(new Request(`http://localhost/jobs/${encodeURIComponent(JOB_ID)}/preview/authentication/verify`, { method: 'POST' })),
+      app.handle(new Request(`http://localhost/jobs/${encodeURIComponent(JOB_ID)}/preview/authentication/revoke`, { method: 'POST' })),
+    ]);
+    expect(authenticationActions.map(response => response.status)).toEqual([400, 400, 400]);
+    expect(authenticationBegins).toBe(1);
+    expect(authenticationVerifications).toBe(1);
+    expect(authenticationRevocations).toBe(1);
   });
 });

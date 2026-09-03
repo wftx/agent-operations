@@ -32,6 +32,7 @@ import { stripBom } from '../utils/strip-bom.js';
 import { BuzzRelayClient, BuzzDispatcher, loadBuzzConfig, type NostrEvent } from '../buzz/index.js';
 import { computeDormancy, parseHeartbeatIntervalMs } from '../utils/dormancy.js';
 import { CRONS_DIRECTORY, CRONS_FILENAME } from '../bus/crons-schema.js';
+import { routeAoTelegramConversation } from './ao-telegram-conversation-router.js';
 
 type LogFn = (msg: string) => void;
 
@@ -901,6 +902,15 @@ export class AgentManager {
 
         if (checker.isDuplicate(formatted)) {
           log('Duplicate Telegram message suppressed');
+          return;
+        }
+        if (config.tool_profile === 'agent-operations-orchestrator'
+          && config.startup_behavior === 'idle-conversation') {
+          void routeAoTelegramConversation({
+            agentProcess, telegramApi: telegramApi!, chatId: effectiveChatId,
+            ctxRoot: this.ctxRoot, agentName: name, messageId: msg.message_id,
+            operatorMessage: text, replyContext: replyToText || lastSent || undefined, log,
+          }).catch(error => log(`AO Telegram conversation routing failed: ${error instanceof Error ? error.message : String(error)}`));
           return;
         }
         checker.queueTelegramMessage(formatted);

@@ -13,6 +13,9 @@ const TOOL_NAMES = new Set<OrchestratorToolName>([
   'ao.jobs.get',
   'ao.jobs.list',
   'ao.jobs.status',
+  'ao.jobs.guide',
+  'ao.jobs.authorize-one-more-attempt',
+  'ao.previews.authenticate',
 ]);
 
 async function main(): Promise<void> {

@@ -18,6 +18,7 @@ import type {
   RuntimeExecutionPolicy,
   RuntimeExecutionCapabilities,
   WorkspaceTestResult,
+  TrustProfilePolicy,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   EXECUTION_RESULT_MAX_CHARS,
@@ -31,6 +32,10 @@ import {
   isBoundedExecutionResult,
   isExactCompletionObservation,
   executionModeForJob,
+  CONSERVATIVE_TRUST_POLICY,
+  workerMaximumForPolicy,
+  reviewerMaximumForPolicy,
+  canAutonomouslyPerformRiskTier,
 } from '../../agent-operations-contracts/src/index.js';
 import { ExecutionObservationService, type AttemptExecutionDetail } from './execution-observation-service.js';
 import { ExecutionPlanningService } from './execution-planning-service.js';
@@ -56,6 +61,7 @@ export interface OrchestrationServiceOptions {
   readonly outcomeDecisionIdFactory?: () => string;
   readonly workspaceService?: RepositoryWorkspaceService;
   readonly browserEvidence?: { ensureJobEvidence(jobId: string): Promise<unknown> };
+  readonly resolveTrustPolicy?: (jobId: string) => Promise<TrustProfilePolicy>;
 }
 
 export interface OrchestrationPreview {
@@ -67,8 +73,8 @@ export interface OrchestrationPreview {
   readonly capabilities?: RuntimeExecutionCapabilities;
   readonly executionMode?: 'repository-read-only' | 'repository-write-isolated';
   readonly repositoryRead: true;
-  readonly maxWorkerAttempts: 2;
-  readonly maxReviewerPassesPerAttempt: 1;
+  readonly maxWorkerAttempts: number;
+  readonly maxReviewerPassesPerAttempt: number;
   readonly autoCompleteAllowed: boolean;
   readonly escalationEnabled: true;
   readonly executionAuthorized: false;
@@ -156,6 +162,7 @@ export class OrchestrationService {
   private readonly outcomeDecisionIdFactory: () => string;
   private readonly workspaceService?: RepositoryWorkspaceService;
   private readonly browserEvidence?: { ensureJobEvidence(jobId: string): Promise<unknown> };
+  private readonly resolveTrustPolicy: (jobId: string) => Promise<TrustProfilePolicy>;
 
   constructor(
     private readonly store: AgentOperationsStateStore,
@@ -187,6 +194,8 @@ export class OrchestrationService {
       ?? (() => createAttemptOutcomeDecisionId());
     this.workspaceService = options.workspaceService;
     this.browserEvidence = options.browserEvidence;
+    this.resolveTrustPolicy = options.resolveTrustPolicy
+      ?? (async () => ({ ...CONSERVATIVE_TRUST_POLICY }));
   }
 
   async preview(jobId: string): Promise<OrchestrationPreview> {
@@ -196,6 +205,7 @@ export class OrchestrationService {
     const findings = await this.eligibilityFindings(job, workerRuntimeAgentId, reviewerRuntimeAgentId);
     const writeMode = executionModeForJob(job) === 'repository-write-isolated';
     const hasInputs = (await this.store.listJobInputIds(job.id)).length > 0;
+    const trustPolicy = await this.resolveTrustPolicy(job.id);
     return {
       job,
       repositoryId: job.repositoryId ?? null,
@@ -209,7 +219,7 @@ export class OrchestrationService {
         : { ...REPOSITORY_READ_EXECUTION_CAPABILITIES, ...(hasInputs ? { inputRead: true } : {}) },
       executionMode: executionModeForJob(job),
       repositoryRead: true,
-      maxWorkerAttempts: MVP_MAX_WORKER_ATTEMPTS,
+      maxWorkerAttempts: workerMaximumForPolicy(trustPolicy, executionModeForJob(job)),
       maxReviewerPassesPerAttempt: MVP_MAX_REVIEWER_PASSES_PER_ATTEMPT,
       autoCompleteAllowed: !writeMode && job.automaticReadOnlyCompletion === true,
       escalationEnabled: true,
@@ -299,10 +309,13 @@ export class OrchestrationService {
       }
 
       const workers = attempts.filter(attempt => attempt.executionRole === 'worker');
+      const trustPolicy = await this.resolveTrustPolicy(job.id);
+      const workerMaximum = workerMaximumForPolicy(trustPolicy, executionModeForJob(job));
+      const reviewerMaximum = reviewerMaximumForPolicy(trustPolicy, executionModeForJob(job));
       const workerBudget = await readWorkerExecutionBudget(
         this.store,
         attempts,
-        MVP_MAX_WORKER_ATTEMPTS,
+        workerMaximum,
       );
       const reviewers = attempts.filter(attempt => attempt.executionRole === 'reviewer');
       const latestWorker = workers.at(-1);
@@ -347,7 +360,7 @@ export class OrchestrationService {
               await this.escalate(
                 job.id,
                 'review_failed_after_budget',
-                `Worker execution budget of ${MVP_MAX_WORKER_ATTEMPTS} is exhausted.`,
+                `Worker execution budget of ${workerMaximum} is exhausted.`,
                 latestWorker.id,
                 review.id,
               );
@@ -432,7 +445,8 @@ export class OrchestrationService {
           && await this.hasHumanWorkerExtensionForReview(job.id, latestWorker.id, review.id);
         if (review.decision === 'REVISION_REQUIRED'
           && await this.isHumanGuidedWorkerAttempt(job.id, latestWorker)
-          && !humanContinuationAuthorized) {
+          && !humanContinuationAuthorized
+          && !this.autonomousRevisionAllowed(trustPolicy, job)) {
           await this.escalate(
             job.id,
             'human_judgment_required',
@@ -442,11 +456,23 @@ export class OrchestrationService {
           );
           return this.readModel(job.id, 'ESCALATED');
         }
+        if (review.decision === 'REVISION_REQUIRED'
+          && this.autonomousRevisionAllowed(trustPolicy, job)
+          && this.repeatedRevisionFeedback(reviews)) {
+          await this.escalate(
+            job.id,
+            'human_judgment_required',
+            `Autonomous revision stopped early because two consecutive Reviews requested the same correction: ${review.feedback ?? review.summary}`,
+            latestWorker.id,
+            review.id,
+          );
+          return this.readModel(job.id, 'ESCALATED');
+        }
         if (workerBudget.exhausted) {
           await this.escalate(
             job.id,
             'review_failed_after_budget',
-            `Worker execution budget of ${MVP_MAX_WORKER_ATTEMPTS} is exhausted.`,
+            `Worker execution budget of ${workerMaximum} is exhausted.`,
             latestWorker.id,
             review.id,
           );
@@ -471,6 +497,16 @@ export class OrchestrationService {
       const reviewer = reviewers.find(candidate => candidate.sequence > latestWorker.sequence
         && !reviewedReviewerIds.has(candidate.id));
       if (!reviewer) {
+        if (reviews.length >= reviewerMaximum + workerBudget.humanExtensions.length) {
+          await this.escalate(
+            job.id,
+            'review_failed_after_budget',
+            `Reviewer cycle budget of ${reviewerMaximum + workerBudget.humanExtensions.length} is exhausted.`,
+            latestWorker.id,
+            reviews.at(-1)?.id,
+          );
+          return this.readModel(job.id, 'ESCALATED');
+        }
         if (executionModeForJob(job) === 'repository-write-isolated') {
           try {
             await this.captureWriteEvidence(job, latestWorker.id);
@@ -1214,6 +1250,12 @@ export class OrchestrationService {
     attemptId?: string,
     reviewId?: string,
   ): Promise<DurableEscalation> {
+    const existing = (await this.store.listEscalations(jobId, true)).find(candidate =>
+      candidate.reason === reason
+      && candidate.attemptId === attemptId
+      && candidate.reviewId === reviewId,
+    );
+    if (existing) return existing;
     const escalation: DurableEscalation = {
       id: this.escalationIdFactory(),
       jobId,
@@ -1252,10 +1294,11 @@ export class OrchestrationService {
     if (attempts.some(attempt => attempt.status === 'created' || attempt.status === 'running')) {
       findings.push('Job already has active execution state requiring reconciliation');
     }
+    const workerMaximum = await this.workerMaximum(job);
     const workerBudget = await readWorkerExecutionBudget(
       this.store,
       attempts,
-      MVP_MAX_WORKER_ATTEMPTS,
+      workerMaximum,
     );
     if (workerBudget.exhausted) {
       findings.push('Worker execution budget is already exhausted');
@@ -1264,6 +1307,26 @@ export class OrchestrationService {
       findings.push('Job already has an unresolved Escalation');
     }
     return findings;
+  }
+
+  private async workerMaximum(job: DurableJob): Promise<number> {
+    return workerMaximumForPolicy(await this.resolveTrustPolicy(job.id), executionModeForJob(job));
+  }
+
+  private autonomousRevisionAllowed(policy: TrustProfilePolicy, job: DurableJob): boolean {
+    return canAutonomouslyPerformRiskTier(
+      policy,
+      executionModeForJob(job) === 'repository-write-isolated' ? 'yellow' : 'green',
+    );
+  }
+
+  private repeatedRevisionFeedback(reviews: readonly DurableAttemptReview[]): boolean {
+    const revisions = reviews.filter(review => review.decision === 'REVISION_REQUIRED');
+    if (revisions.length < 2) return false;
+    const latest = revisions.at(-1)!;
+    const previous = revisions.at(-2)!;
+    return normalizeProgressText(latest.feedback ?? latest.summary)
+      === normalizeProgressText(previous.feedback ?? previous.summary);
   }
 
   private async continuationEligibilityFindings(
@@ -1423,6 +1486,10 @@ function required(value: string | undefined, field: string): string {
 function cleanOptional(value: string | undefined): string | undefined {
   const clean = value?.trim();
   return clean || undefined;
+}
+
+function normalizeProgressText(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
 function boundedDuration(value: number, field: string): number {

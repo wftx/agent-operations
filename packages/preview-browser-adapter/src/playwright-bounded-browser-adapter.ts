@@ -1,26 +1,98 @@
-import { existsSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { chromium } from '@playwright/test';
+import type { BrowserContext } from '@playwright/test';
 import type {
   BoundedBrowserAdapter,
   BrowserCaptureRequest,
   BrowserCaptureResult,
   BrowserEvidenceAuditOperation,
+  PreviewAuthenticationAdapter,
 } from '../../agent-operations-contracts/src/index.js';
 
 const MAX_TEXT = 32_768;
 const MAX_FAILURES = 100;
 
-export class PlaywrightBoundedBrowserAdapter implements BoundedBrowserAdapter {
+export interface PlaywrightBoundedBrowserAdapterOptions {
+  readonly authenticationRoot?: string;
+}
+
+export class PlaywrightBoundedBrowserAdapter implements BoundedBrowserAdapter, PreviewAuthenticationAdapter {
+  private readonly authenticationRoot: string;
+  private readonly pendingContexts = new Map<string, BrowserContext>();
+
+  constructor(options: PlaywrightBoundedBrowserAdapterOptions = {}) {
+    this.authenticationRoot = resolve(options.authenticationRoot
+      ?? join(homedir(), '.agent-operations', 'preview-auth'));
+  }
+
+  async begin(input: { readonly sessionId: string; readonly origin: string }): Promise<void> {
+    const origin = requireLoopbackOrigin(input.origin);
+    const directory = this.sessionDirectory(input.sessionId);
+    if (this.pendingContexts.has(input.sessionId)) throw new Error('Preview authentication is already open');
+    mkdirSync(this.authenticationRoot, { recursive: true, mode: 0o700 });
+    chmodSync(this.authenticationRoot, 0o700);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    chmodSync(directory, 0o700);
+    const context = await chromium.launchPersistentContext(directory, {
+      headless: false,
+      executablePath: resolveChromiumExecutable(),
+      acceptDownloads: false,
+      serviceWorkers: 'block',
+    });
+    this.pendingContexts.set(input.sessionId, context);
+    try {
+      await context.newPage().then(page => page.goto(origin, { waitUntil: 'domcontentloaded', timeout: 30_000 }));
+    } catch (error) {
+      this.pendingContexts.delete(input.sessionId);
+      await context.close();
+      throw error;
+    }
+  }
+
+  async verify(input: { readonly sessionId: string; readonly origin: string }): Promise<boolean> {
+    const origin = requireLoopbackOrigin(input.origin);
+    const context = this.pendingContexts.get(input.sessionId);
+    if (!context) return false;
+    const verified = context.pages().some(page => {
+      try { return new URL(page.url()).origin === origin; } catch { return false; }
+    });
+    if (!verified) return false;
+    this.pendingContexts.delete(input.sessionId);
+    await context.close();
+    chmodSync(this.sessionDirectory(input.sessionId), 0o700);
+    return true;
+  }
+
+  async isUsable(input: { readonly sessionId: string; readonly origin: string }): Promise<boolean> {
+    requireLoopbackOrigin(input.origin);
+    return existsSync(this.sessionDirectory(input.sessionId));
+  }
+
+  async revoke(input: { readonly sessionId: string; readonly origin: string }): Promise<void> {
+    requireLoopbackOrigin(input.origin);
+    const pending = this.pendingContexts.get(input.sessionId);
+    if (pending) {
+      this.pendingContexts.delete(input.sessionId);
+      await pending.close();
+    }
+    rmSync(this.sessionDirectory(input.sessionId), { recursive: true, force: true });
+  }
+
   async capture(request: BrowserCaptureRequest): Promise<BrowserCaptureResult> {
     const origin = requireLoopbackOrigin(request.origin);
     const target = resolvePreviewTarget(origin, request.route);
     validateViewport(request.viewport.width, request.viewport.height);
-    const browser = await chromium.launch({ headless: true, executablePath: resolveChromiumExecutable() });
-    const context = await browser.newContext({
-      viewport: { ...request.viewport },
-      acceptDownloads: false,
-      serviceWorkers: 'block',
-    });
+    const browser = request.authenticationSessionId
+      ? null
+      : await chromium.launch({ headless: true, executablePath: resolveChromiumExecutable() });
+    const context = request.authenticationSessionId
+      ? await chromium.launchPersistentContext(this.sessionDirectory(request.authenticationSessionId), {
+          headless: true, executablePath: resolveChromiumExecutable(), viewport: { ...request.viewport },
+          acceptDownloads: false, serviceWorkers: 'block',
+        })
+      : await browser!.newContext({ viewport: { ...request.viewport }, acceptDownloads: false, serviceWorkers: 'block' });
     const page = await context.newPage();
     const consoleFailures: string[] = [];
     const failedResources: string[] = [];
@@ -68,8 +140,17 @@ export class PlaywrightBoundedBrowserAdapter implements BoundedBrowserAdapter {
       };
     } finally {
       await context.close();
-      await browser.close();
+      await browser?.close();
     }
+  }
+
+  private sessionDirectory(sessionId: string): string {
+    if (!/^preview-auth:[A-Za-z0-9-]+$/.test(sessionId)) throw new Error('Invalid Authenticated Preview Session ID');
+    const directory = resolve(this.authenticationRoot, sessionId.replace(':', '-'));
+    if (directory === this.authenticationRoot || !directory.startsWith(`${this.authenticationRoot}/`)) {
+      throw new Error('Authenticated Preview Session escaped its secret root');
+    }
+    return directory;
   }
 }
 

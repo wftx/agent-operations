@@ -1,4 +1,5 @@
 import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
+import { createHash } from 'node:crypto';
 import { join, sep } from 'path';
 import { homedir } from 'os';
 import type {
@@ -24,6 +25,17 @@ import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
 
 type LogFn = (msg: string) => void;
+
+const LOADED_APPLICATION_REVISION = (() => {
+  try {
+    const entry = process.argv[1];
+    return entry && existsSync(entry)
+      ? `sha256:${createHash('sha256').update(readFileSync(entry)).digest('hex')}`
+      : undefined;
+  } catch {
+    return undefined;
+  }
+})();
 
 export type CorrelatedInjectionResult =
   | {
@@ -633,7 +645,10 @@ export class AgentProcess {
       crashCount: this.crashCount,
       model: this.config.model,
       ...(this.config.tool_profile === 'agent-operations-orchestrator'
-        ? { toolCatalogRevision: AO_ORCHESTRATOR_TOOL_CATALOG_REVISION }
+        ? {
+            toolCatalogRevision: AO_ORCHESTRATOR_TOOL_CATALOG_REVISION,
+            ...(LOADED_APPLICATION_REVISION ? { loadedRevision: LOADED_APPLICATION_REVISION } : {}),
+          }
         : {}),
       awaitingConfirmation:
         this.pty && 'isAwaitingInteractiveConfirmation' in this.pty

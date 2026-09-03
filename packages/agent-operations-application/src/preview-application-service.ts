@@ -7,6 +7,8 @@ import type {
   DurableJob,
   DurablePreviewProfile,
   DurablePreviewSession,
+  DurableAuthenticatedPreviewSession,
+  PreviewAuthenticationAdapter,
   PreviewProcessAdapter,
   PreviewWorkspaceAdapter,
   RepositoryInventoryAdapter,
@@ -16,6 +18,7 @@ import {
   createBrowserEvidenceId,
   createPreviewProfileId,
   createPreviewSessionId,
+  createAuthenticatedPreviewSessionId,
   executionModeForJob,
 } from '../../agent-operations-contracts/src/index.js';
 import type { InputApplication, PreviewApplication } from './types.js';
@@ -23,11 +26,15 @@ import type { InputApplication, PreviewApplication } from './types.js';
 export interface PreviewApplicationServiceOptions {
   readonly previewWorkspaceRoot: string;
   readonly now?: () => Date;
+  readonly authentication?: PreviewAuthenticationAdapter;
+  readonly authenticationLifetimeMs?: number;
 }
 
 export class PreviewApplicationService implements PreviewApplication {
   private readonly now: () => Date;
   private readonly previewWorkspaceRoot: string;
+  private readonly authentication?: PreviewAuthenticationAdapter;
+  private readonly authenticationLifetimeMs: number;
 
   constructor(
     private readonly store: AgentOperationsStateStore,
@@ -41,6 +48,8 @@ export class PreviewApplicationService implements PreviewApplication {
   ) {
     this.now = options.now ?? (() => new Date());
     this.previewWorkspaceRoot = resolve(options.previewWorkspaceRoot);
+    this.authentication = options.authentication;
+    this.authenticationLifetimeMs = options.authenticationLifetimeMs ?? 8 * 60 * 60_000;
   }
 
   async setJobEvidenceRequirement(
@@ -52,7 +61,11 @@ export class PreviewApplicationService implements PreviewApplication {
     await this.store.setJobBrowserEvidenceRequirement(job.id, requirement);
   }
 
-  async setJobPreviewProfile(jobId: string, command: string): Promise<DurablePreviewProfile> {
+  async setJobPreviewProfile(
+    jobId: string,
+    command: string,
+    authenticationRequired = false,
+  ): Promise<DurablePreviewProfile> {
     const job = await this.requireJob(jobId);
     const project = await this.store.getProjectProfile(job.projectId);
     if (!project) throw new Error(`Project Profile not found: ${job.projectId}`);
@@ -64,6 +77,7 @@ export class PreviewApplicationService implements PreviewApplication {
       name: 'default',
       command: parseCandidate(command, project.detectedStack),
       status: 'candidate',
+      ...(authenticationRequired ? { authenticationRequired: true } : {}),
       revision: (existing?.revision ?? -1) + 1,
       createdAt: existing?.createdAt ?? timestamp,
       updatedAt: timestamp,
@@ -137,10 +151,15 @@ export class PreviewApplicationService implements PreviewApplication {
     if (!await this.isSessionSourceCurrent(job, session)) {
       throw new Error('Preview source state changed after startup. Restart Preview before capture.');
     }
+    const profile = await this.store.getPreviewProfile(session.profileId);
+    const authentication = profile?.authenticationRequired
+      ? await this.requireUsableAuthentication(session)
+      : null;
     const capture = await this.browser.capture({
       origin: session.origin,
       route: requirement.route,
       viewport: requirement.viewport,
+      ...(authentication ? { authenticationSessionId: authentication.id } : {}),
     });
     const screenshot = await this.inputs.createUploadedInput({
       displayName: `AO browser evidence ${job.id}.png`,
@@ -207,7 +226,71 @@ export class PreviewApplicationService implements PreviewApplication {
       profile,
       session,
       evidence: await this.store.listBrowserEvidenceForJob(job.id),
+      authentication: await this.latestAuthentication(job.projectId, profile?.id, session?.origin),
     };
+  }
+
+  async beginPreviewAuthentication(jobId: string): Promise<DurableAuthenticatedPreviewSession> {
+    if (!this.authentication) throw new Error('Preview authentication is not configured');
+    const job = await this.requireJob(jobId);
+    const preview = await this.startJobPreview(job.id);
+    const profile = await this.store.getPreviewProfile(preview.profileId);
+    if (!profile?.authenticationRequired) throw new Error('Preview Profile does not require authentication');
+    const existing = await this.latestAuthentication(job.projectId, profile.id, preview.origin);
+    if (existing?.status === 'ready'
+      && (!existing.expiresAt || new Date(existing.expiresAt).getTime() > this.now().getTime())
+      && await this.authentication.isUsable({ sessionId: existing.id, origin: existing.origin })) {
+      return existing;
+    }
+    const timestamp = this.now().toISOString();
+    const session: DurableAuthenticatedPreviewSession = {
+      id: createAuthenticatedPreviewSessionId(), projectId: job.projectId,
+      previewProfileId: profile.id, installationId: (await this.store.getInstallation()).id,
+      origin: preview.origin, status: 'pending-human-login', revision: 0,
+      createdAt: timestamp, updatedAt: timestamp,
+    };
+    await this.store.createAuthenticatedPreviewSession(session);
+    try {
+      await this.authentication.begin({ sessionId: session.id, origin: session.origin });
+    } catch (error) {
+      const expired = this.transitionAuthentication(session, 'expired', {});
+      await this.store.saveAuthenticatedPreviewSessionTransition(expired, session.revision);
+      throw error;
+    }
+    return session;
+  }
+
+  async verifyPreviewAuthentication(jobId: string): Promise<DurableAuthenticatedPreviewSession> {
+    if (!this.authentication) throw new Error('Preview authentication is not configured');
+    const job = await this.requireJob(jobId);
+    const preview = await this.store.getPreviewSessionForJob(job.id);
+    const profile = preview ? await this.store.getPreviewProfile(preview.profileId) : null;
+    const session = await this.latestAuthentication(job.projectId, profile?.id, preview?.origin);
+    if (!session || session.status !== 'pending-human-login') throw new Error('No pending human Preview authentication session exists');
+    if (!await this.authentication.verify({ sessionId: session.id, origin: session.origin })) {
+      throw new Error('Human login is not yet verified at the exact Preview origin');
+    }
+    const timestamp = this.now().toISOString();
+    const ready = this.transitionAuthentication(session, 'ready', {
+      lastVerifiedAt: timestamp,
+      expiresAt: new Date(this.now().getTime() + this.authenticationLifetimeMs).toISOString(),
+    });
+    await this.store.saveAuthenticatedPreviewSessionTransition(ready, session.revision);
+    return ready;
+  }
+
+  async revokePreviewAuthentication(jobId: string): Promise<DurableAuthenticatedPreviewSession> {
+    if (!this.authentication) throw new Error('Preview authentication is not configured');
+    const job = await this.requireJob(jobId);
+    const preview = await this.store.getPreviewSessionForJob(job.id);
+    const profile = preview ? await this.store.getPreviewProfile(preview.profileId) : null;
+    const session = await this.latestAuthentication(job.projectId, profile?.id, preview?.origin);
+    if (!session || session.status === 'revoked') throw new Error('No revocable Preview authentication session exists');
+    await this.authentication.revoke({ sessionId: session.id, origin: session.origin });
+    const timestamp = this.now().toISOString();
+    const revoked = this.transitionAuthentication(session, 'revoked', { revokedAt: timestamp });
+    await this.store.saveAuthenticatedPreviewSessionTransition(revoked, session.revision);
+    return revoked;
   }
 
   private async restartSession(session: DurablePreviewSession): Promise<DurablePreviewSession> {
@@ -247,6 +330,43 @@ export class PreviewApplicationService implements PreviewApplication {
       validation: { status: validationStatus, checkedAt: timestamp, message },
       revision: profile.revision + 1, updatedAt: timestamp,
     });
+  }
+
+  private async requireUsableAuthentication(
+    preview: DurablePreviewSession,
+  ): Promise<DurableAuthenticatedPreviewSession> {
+    if (!this.authentication) throw new Error('Preview authentication required, but no secure node local adapter is configured');
+    const session = await this.latestAuthentication(preview.projectId, preview.profileId, preview.origin);
+    if (!session || session.status !== 'ready') throw new Error('Preview authentication required');
+    if (session.expiresAt && new Date(session.expiresAt).getTime() <= this.now().getTime()) {
+      const expired = this.transitionAuthentication(session, 'expired', {});
+      await this.store.saveAuthenticatedPreviewSessionTransition(expired, session.revision);
+      throw new Error('Preview authentication expired');
+    }
+    if (!await this.authentication.isUsable({ sessionId: session.id, origin: session.origin })) {
+      const expired = this.transitionAuthentication(session, 'expired', {});
+      await this.store.saveAuthenticatedPreviewSessionTransition(expired, session.revision);
+      throw new Error('Preview authentication expired');
+    }
+    return session;
+  }
+
+  private async latestAuthentication(
+    projectId: string,
+    profileId?: string,
+    origin?: string,
+  ): Promise<DurableAuthenticatedPreviewSession | null> {
+    return [...await this.store.listAuthenticatedPreviewSessions(projectId)].reverse()
+      .find(session => (!profileId || session.previewProfileId === profileId)
+        && (!origin || session.origin === origin)) ?? null;
+  }
+
+  private transitionAuthentication(
+    session: DurableAuthenticatedPreviewSession,
+    status: DurableAuthenticatedPreviewSession['status'],
+    change: Partial<DurableAuthenticatedPreviewSession>,
+  ): DurableAuthenticatedPreviewSession {
+    return { ...session, ...change, status, revision: session.revision + 1, updatedAt: this.now().toISOString() };
   }
 
   private async ensureCandidateProfile(projectId: string): Promise<DurablePreviewProfile> {

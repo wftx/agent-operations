@@ -6,6 +6,9 @@ import type {
   ProjectApplication,
   InputApplication,
   PreviewApplication,
+  TrustProfileApplication,
+  DailyDriverMetricsApplication,
+  RuntimeFreshnessApplication,
 } from '../../../packages/agent-operations-application/src/index.js';
 import {
   renderDashboard,
@@ -17,6 +20,7 @@ import {
   renderOrchestrator,
   renderProjects,
   renderNewProject,
+  renderTrustProfiles,
 } from './render.js';
 
 export class OperatorWebApplication {
@@ -30,6 +34,9 @@ export class OperatorWebApplication {
     private readonly projects?: ProjectApplication,
     private readonly inputs?: InputApplication,
     private readonly preview?: PreviewApplication,
+    private readonly trustProfiles?: TrustProfileApplication,
+    private readonly metrics?: DailyDriverMetricsApplication,
+    private readonly runtimeFreshness?: RuntimeFreshnessApplication,
   ) {
     if ('sendTurn' in conversationOrOptions) {
       this.conversation = conversationOrOptions;
@@ -49,7 +56,37 @@ export class OperatorWebApplication {
           await this.application.listJobs('all'),
           await this.application.getRuntimeStatus(),
           { telegramConfigured: this.options.telegramConfigured ?? false },
+          this.metrics ? await this.metrics.read() : undefined,
+          this.runtimeFreshness ? await this.runtimeFreshness.inspect() : undefined,
         ));
+      }
+      if (request.method === 'GET' && url.pathname === '/trust') {
+        if (!this.trustProfiles) throw new Error('Trust Profiles are not configured.');
+        const projects = await this.application.listProjects();
+        return html(renderTrustProfiles(
+          await this.trustProfiles.list(),
+          await Promise.all(projects.map(async project => ({
+            projectId: project.project.id,
+            projectName: project.project.name,
+            effective: await this.trustProfiles!.effectiveForProject(project.project.id),
+          }))),
+        ));
+      }
+      if (request.method === 'POST' && url.pathname === '/trust') {
+        if (!this.trustProfiles) throw new Error('Trust Profiles are not configured.');
+        const form = await request.formData();
+        const scope = textValue(form, 'scope');
+        if (scope !== 'global' && scope !== 'project') throw new Error('Trust Profile scope is invalid');
+        const preset = textValue(form, 'preset');
+        if (preset !== 'conservative' && preset !== 'daily-driver') {
+          throw new Error('Use the application API for an advanced Custom Trust Profile');
+        }
+        await this.trustProfiles.save({
+          scope,
+          ...(scope === 'project' ? { scopeId: textValue(form, 'scopeId') } : {}),
+          preset,
+        });
+        return redirect('/trust');
       }
       if (request.method === 'GET' && url.pathname === '/orchestrator') {
         return this.orchestratorPage();
@@ -152,7 +189,11 @@ export class OperatorWebApplication {
         if (!this.preview) throw new Error('Job Preview is not configured.');
         const form = await request.formData();
         const jobId = decodeURIComponent(previewProfile[1]);
-        await this.preview.setJobPreviewProfile(jobId, textValue(form, 'command'));
+        await this.preview.setJobPreviewProfile(
+          jobId,
+          textValue(form, 'command'),
+          textValue(form, 'authenticationRequired') === 'yes',
+        );
         return redirect(`/jobs/${encodeURIComponent(jobId)}`);
       }
       const previewStart = url.pathname.match(/^\/jobs\/([^/]+)\/preview\/start$/);
@@ -167,6 +208,27 @@ export class OperatorWebApplication {
         if (!this.preview) throw new Error('Browser Evidence is not configured.');
         const jobId = decodeURIComponent(evidenceRefresh[1]);
         await this.preview.refreshJobEvidence(jobId);
+        return redirect(`/jobs/${encodeURIComponent(jobId)}`);
+      }
+      const authenticationBegin = url.pathname.match(/^\/jobs\/([^/]+)\/preview\/authentication\/begin$/);
+      if (request.method === 'POST' && authenticationBegin) {
+        if (!this.preview) throw new Error('Preview authentication is not configured.');
+        const jobId = decodeURIComponent(authenticationBegin[1]);
+        await this.preview.beginPreviewAuthentication(jobId);
+        return redirect(`/jobs/${encodeURIComponent(jobId)}`);
+      }
+      const authenticationVerify = url.pathname.match(/^\/jobs\/([^/]+)\/preview\/authentication\/verify$/);
+      if (request.method === 'POST' && authenticationVerify) {
+        if (!this.preview) throw new Error('Preview authentication is not configured.');
+        const jobId = decodeURIComponent(authenticationVerify[1]);
+        await this.preview.verifyPreviewAuthentication(jobId);
+        return redirect(`/jobs/${encodeURIComponent(jobId)}`);
+      }
+      const authenticationRevoke = url.pathname.match(/^\/jobs\/([^/]+)\/preview\/authentication\/revoke$/);
+      if (request.method === 'POST' && authenticationRevoke) {
+        if (!this.preview) throw new Error('Preview authentication is not configured.');
+        const jobId = decodeURIComponent(authenticationRevoke[1]);
+        await this.preview.revokePreviewAuthentication(jobId);
         return redirect(`/jobs/${encodeURIComponent(jobId)}`);
       }
       const guidance = url.pathname.match(/^\/escalations\/([^/]+)\/guidance$/);

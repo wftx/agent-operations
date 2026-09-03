@@ -13,6 +13,7 @@ import {
   type TelegramNotificationTestReceipt,
   type TelegramNotificationTestRecorder,
 } from '../src/index.js';
+import { readLastSent } from '../../../src/telegram/logging.js';
 
 const FAKE_BOT_TOKEN = ['123456789', 'fixture-token-value-never-used'].join(':');
 const FAKE_CHAT_ID = ['-987', '654', '321'].join('');
@@ -87,6 +88,29 @@ describe('TelegramOperatorNotifier', () => {
     })]);
   });
 
+  it('shares concise outbound context with native CortextOS reply routing', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ao-telegram-context-'));
+    try {
+      const sender = new FakeSender();
+      const notifier = new TelegramOperatorNotifier(
+        { botToken: 'not-used', chatId: '123' },
+        sender,
+        { ctxRoot: root, agentName: 'ao-orchestrator' },
+      );
+      await notifier.notify({
+        kind: 'needs_human', jobId: 'job:1', escalationId: 'escalation:1',
+        projectName: 'Frusterio Pulse', title: 'Verify the dashboard',
+        reason: 'Preview authentication required.', aoPath: '/jobs/job%3A1',
+      });
+
+      expect(readLastSent(root, 'ao-orchestrator', 123)).toContain('Frusterio Pulse');
+      expect(readLastSent(root, 'ao-orchestrator', 123)).toContain('/jobs/job%3A1');
+      expect(sender.calls).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('redacts dedicated credentials from normal delivery failures', async () => {
     const config = {
       botToken: FAKE_BOT_TOKEN,
@@ -118,7 +142,7 @@ describe('TelegramOperatorNotifier', () => {
       reason: 'Reviewer cannot determine intended behavior.',
       reviewerFeedback: 'Choose the intended behavior.',
     });
-    expect(text).toContain('Agent Operations needs you');
+    expect(text).toContain('AO needs you');
     expect(text).toContain('Choose the intended behavior.');
     expect(text).not.toContain('job:hidden');
     expect(text).not.toContain('escalation:hidden');

@@ -4,6 +4,7 @@ import type {
   OperatorJobDetail,
   OperatorProjectOption,
   InputApplication,
+  PreviewApplication,
 } from '../src/index.js';
 import { OrchestratorToolApplicationService } from '../src/index.js';
 
@@ -48,7 +49,6 @@ describe('OrchestratorToolApplicationService', () => {
         acceptanceCriteria: 'Verify the page source and local optimized asset reference.',
         executionMode: 'repository-read-only',
         reviewerRequired: true,
-        maxWorkerAttempts: 2,
       },
     });
 
@@ -129,6 +129,55 @@ describe('OrchestratorToolApplicationService', () => {
     expect(result.data).not.toHaveProperty('storageReference');
     expect(result.data).not.toHaveProperty('path');
   });
+
+  it('routes guidance and one bounded human extension through AO authority', async () => {
+    const operator = fakeOperator();
+    const tools = new OrchestratorToolApplicationService(operator);
+
+    const guidance = await tools.execute({
+      name: 'ao.jobs.guide',
+      arguments: { escalationId: 'escalation:one', instruction: 'Use the Reviewer feedback.' },
+    });
+    const extension = await tools.execute({
+      name: 'ao.jobs.authorize-one-more-attempt',
+      arguments: { escalationId: 'escalation:one', instruction: 'Try one more bounded execution.' },
+    });
+
+    expect(operator.provideGuidanceAndContinue).toHaveBeenCalledWith(
+      'escalation:one',
+      'Use the Reviewer feedback.',
+    );
+    expect(operator.authorizeOneMoreWorkerAttempt).toHaveBeenCalledWith(
+      'escalation:one',
+      'Try one more bounded execution.',
+    );
+    expect(guidance).toMatchObject({ ok: true, data: { jobId: 'job:created' } });
+    expect(extension).toMatchObject({
+      ok: true,
+      data: { jobId: 'job:created', additionalWorkerExecutions: 1 },
+    });
+  });
+
+  it('opens human preview authentication without handling credentials', async () => {
+    const preview = fakePreview();
+    const tools = new OrchestratorToolApplicationService(fakeOperator(), fakeInputs(), preview);
+    const result = await tools.execute({
+      name: 'ao.previews.authenticate',
+      arguments: { jobId: 'job:created' },
+    });
+
+    expect(preview.beginPreviewAuthentication).toHaveBeenCalledWith('job:created');
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        jobId: 'job:created',
+        authenticationSessionId: 'preview-auth:one',
+        status: 'pending-human-login',
+      },
+    });
+    expect(JSON.stringify(result)).not.toContain('cookie');
+    expect(JSON.stringify(result)).not.toContain('password');
+  });
 });
 
 function validCreate(overrides: Record<string, unknown> = {}) {
@@ -139,7 +188,6 @@ function validCreate(overrides: Record<string, unknown> = {}) {
     acceptanceCriteria: 'Report the source truth.',
     executionMode: 'repository-read-only',
     reviewerRequired: true,
-    maxWorkerAttempts: 2,
     ...overrides,
   };
 }
@@ -163,12 +211,26 @@ function fakeOperator(): OperatorApplication {
     previewTask: vi.fn(),
     runOperatorJob: vi.fn(async () => ({ jobId: 'job:created', status: 'pending' as const, startedAt: TIME })),
     waitForRun: vi.fn(),
-    provideGuidanceAndContinue: vi.fn(),
-    authorizeOneMoreWorkerAttempt: vi.fn(),
+    provideGuidanceAndContinue: vi.fn(async () => ({ jobId: 'job:created', status: 'running' as const, startedAt: TIME })),
+    authorizeOneMoreWorkerAttempt: vi.fn(async () => ({ jobId: 'job:created', status: 'running' as const, startedAt: TIME })),
     reconcileTimedOutExecution: vi.fn(),
     cancelEscalatedJob: vi.fn(),
     listJobs: vi.fn(async () => []),
     getJobDetail: vi.fn(async () => detail),
+  };
+}
+
+function fakePreview(): PreviewApplication {
+  return {
+    setJobEvidenceRequirement: vi.fn(), setJobPreviewProfile: vi.fn(),
+    beginPreviewAuthentication: vi.fn(async () => ({
+      id: 'preview-auth:one', projectId: PROJECT.project.id,
+      previewProfileId: 'preview-profile:one', origin: 'http://127.0.0.1:3000',
+      installationId: 'installation:one', status: 'pending-human-login' as const,
+      createdAt: TIME, updatedAt: TIME, revision: 0,
+    })),
+    verifyPreviewAuthentication: vi.fn(), revokePreviewAuthentication: vi.fn(),
+    startJobPreview: vi.fn(), refreshJobEvidence: vi.fn(), ensureJobEvidence: vi.fn(), getJobPreview: vi.fn(),
   };
 }
 

@@ -11,12 +11,14 @@ import type {
   RuntimeExecutionObservationRequest,
   RepositoryWorkspaceAdapter,
   RepositoryWorkspaceInspection,
+  TrustProfilePolicy,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   FakeAgentRuntimeAdapter,
   FakeRepositoryInventoryAdapter,
   InMemoryAgentOperationsStateStore,
   createRepositoryCheckoutBindingId,
+  DAILY_DRIVER_TRUST_POLICY,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   JobLifecycleService,
@@ -179,6 +181,7 @@ async function harness(
   dispatchResults: readonly ('accepted' | 'rejected' | 'uncertain')[] = [],
   runtimePolicySupported = true,
   writeMode = false,
+  trustPolicy?: TrustProfilePolicy,
 ) {
   const store = new CrashOnceStore({
     installation: { id: INSTALLATION_ID, createdAt: TIME },
@@ -330,6 +333,7 @@ async function harness(
     escalationIdFactory: () => `escalation:${++escalation}`,
     outcomeDecisionIdFactory: () => `outcome:${++outcome}`,
     ...(workspaceService ? { workspaceService } : {}),
+    ...(trustPolicy ? { resolveTrustPolicy: async () => trustPolicy } : {}),
   });
   return { store, service, execution, observer, runtimes, repositories, job, workspaceService };
 }
@@ -379,6 +383,57 @@ describe('OrchestrationService', () => {
       'cortextos:codex-turn:v1:thread-1:turn-1',
       'cortextos:codex-turn:v1:thread-2:turn-2',
     ]);
+  });
+
+  it('uses the bounded Daily Driver Green budget for useful autonomous revisions', async () => {
+    const differentRevision = JSON.stringify({
+      decision: 'REVISION_REQUIRED',
+      summary: 'The second answer is still incomplete.',
+      feedback: 'Read the exact contract declaration and report every policy dimension.',
+    });
+    const setup = await harness([
+      { kind: 'completed', resultText: WRONG_RESULT },
+      { kind: 'completed', resultText: REVISION },
+      { kind: 'completed', resultText: WRONG_RESULT },
+      { kind: 'completed', resultText: differentRevision },
+      { kind: 'completed', resultText: CORRECT_RESULT },
+      { kind: 'completed', resultText: PASS },
+    ], [], true, false, DAILY_DRIVER_TRUST_POLICY);
+
+    expect((await setup.service.preview(JOB_ID)).maxWorkerAttempts).toBe(5);
+    const result = await setup.service.runJob(JOB_ID);
+    expect(result.finalDecision).toBe('PASS');
+    expect(result.workerAttempts).toHaveLength(3);
+    expect(result.reviewerAttempts).toHaveLength(3);
+    expect(setup.execution.requests).toHaveLength(6);
+    expect(new Set(setup.execution.requests.map(request => request.executionPlanId)).size).toBe(6);
+  });
+
+  it('stops a Daily Driver revision loop early when consecutive feedback shows no progress', async () => {
+    const setup = await harness([
+      { kind: 'completed', resultText: WRONG_RESULT },
+      { kind: 'completed', resultText: REVISION },
+      { kind: 'completed', resultText: WRONG_RESULT },
+      { kind: 'completed', resultText: REVISION },
+    ], [], true, false, DAILY_DRIVER_TRUST_POLICY);
+
+    const result = await setup.service.runJob(JOB_ID);
+    expect(result.finalDecision).toBe('ESCALATED');
+    expect(result.workerAttempts).toHaveLength(2);
+    expect(result.escalations).toEqual([expect.objectContaining({
+      reason: 'human_judgment_required',
+      summary: expect.stringContaining('stopped early'),
+    })]);
+    const attempts = await setup.store.listAttemptsForJob(JOB_ID);
+    const escalations = await setup.store.listEscalations(JOB_ID);
+    await setup.service.runJob(JOB_ID);
+    expect(await setup.store.listAttemptsForJob(JOB_ID)).toEqual(attempts);
+    expect(await setup.store.listEscalations(JOB_ID)).toEqual(escalations);
+  });
+
+  it('uses a smaller bounded Daily Driver Yellow budget', async () => {
+    const setup = await harness([], [], true, true, DAILY_DRIVER_TRUST_POLICY);
+    expect((await setup.service.preview(JOB_ID)).maxWorkerAttempts).toBe(3);
   });
 
   it('keeps an isolated write PASS ready for human approval without commit or Job completion', async () => {

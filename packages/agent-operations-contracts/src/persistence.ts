@@ -33,7 +33,9 @@ import type {
   DurableBrowserEvidence,
   DurablePreviewProfile,
   DurablePreviewSession,
+  DurableAuthenticatedPreviewSession,
 } from './preview.js';
+import type { DurableTrustProfile } from './trust.js';
 
 export interface AgentOperationsInstallation {
   readonly id: string;
@@ -120,9 +122,19 @@ export interface AgentOperationsStateStore {
   listLocalFolderResources(projectId?: string): Promise<readonly DurableLocalFolderResource[]>;
   saveProjectProfile(profile: DurableProjectProfile): Promise<void>;
   getProjectProfile(projectId: string): Promise<DurableProjectProfile | null>;
+  saveTrustProfile(profile: DurableTrustProfile): Promise<void>;
+  getTrustProfile(id: string): Promise<DurableTrustProfile | null>;
+  listTrustProfiles(): Promise<readonly DurableTrustProfile[]>;
   savePreviewProfile(profile: DurablePreviewProfile): Promise<void>;
   getPreviewProfile(id: string): Promise<DurablePreviewProfile | null>;
   listPreviewProfiles(projectId?: string): Promise<readonly DurablePreviewProfile[]>;
+  createAuthenticatedPreviewSession(session: DurableAuthenticatedPreviewSession): Promise<void>;
+  getAuthenticatedPreviewSession(id: string): Promise<DurableAuthenticatedPreviewSession | null>;
+  listAuthenticatedPreviewSessions(projectId?: string): Promise<readonly DurableAuthenticatedPreviewSession[]>;
+  saveAuthenticatedPreviewSessionTransition(
+    session: DurableAuthenticatedPreviewSession,
+    expectedRevision: number,
+  ): Promise<void>;
   createInput(input: DurableInput): Promise<void>;
   getInput(id: string): Promise<DurableInput | null>;
   listInputs(projectId?: string): Promise<readonly DurableInput[]>;

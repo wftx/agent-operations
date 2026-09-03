@@ -11,6 +11,7 @@ export * from './dispatch.js';
 export * from './observation.js';
 export * from './orchestration.js';
 export * from './operator.js';
+export * from './trust.js';
 export * from './testing/fake-agent-runtime-adapter.js';
 export * from './testing/fake-repository-inventory-adapter.js';
 export * from './testing/in-memory-agent-operations-state-store.js';

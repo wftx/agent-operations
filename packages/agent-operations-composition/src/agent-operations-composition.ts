@@ -1,9 +1,16 @@
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import {
   NoopOperatorNotifier,
   OperatorApplicationService,
   ProjectApplicationService,
   InputApplicationService,
   PreviewApplicationService,
+  TrustProfileApplicationService,
+  RuntimeFreshnessService,
+  DailyDriverMetricsService,
   OrchestratorConversationApplicationService,
   OrchestratorToolApplicationService,
   type OperatorApplication,
@@ -11,13 +18,19 @@ import {
   type ProjectApplication,
   type InputApplication,
   type PreviewApplication,
+  type TrustProfileApplication,
+  type RuntimeFreshnessApplication,
+  type DailyDriverMetricsApplication,
 } from '../../agent-operations-application/src/index.js';
 import { OrchestrationService, RepositoryWorkspaceService } from '../../agent-operations-core/src/index.js';
 import {
   CortextOSRuntimeAdapter,
   CortextOSRuntimeLifecycleAdapter,
 } from '../../cortextos-adapter/src/index.js';
-import { CortextOSOrchestratorConversationAdapter } from '../../cortextos-conversation-adapter/src/index.js';
+import {
+  CortextOSOrchestratorConversationAdapter,
+  EXPECTED_AO_ORCHESTRATOR_TOOL_CATALOG_REVISION,
+} from '../../cortextos-conversation-adapter/src/index.js';
 import { CortextOSExecutionAdapter } from '../../cortextos-execution-adapter/src/index.js';
 import { CortextOSExecutionObserver } from '../../cortextos-execution-observer/src/index.js';
 import { GitPreviewWorkspaceAdapter, GitRepositoryAdapter, GitRepositoryWorkspaceAdapter } from '../../git-adapter/src/index.js';
@@ -36,8 +49,6 @@ import {
   loadAgentOperationsTelegramEnvironmentFile,
   loadTelegramOperatorNotificationConfig,
 } from '../../telegram-notification-adapter/src/index.js';
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
 
 export interface AgentOperationsCompositionOptions {
   readonly startRunner?: boolean;
@@ -52,6 +63,9 @@ export interface AgentOperationsComposition {
   readonly projects: ProjectApplication;
   readonly inputs: InputApplication;
   readonly preview: PreviewApplication;
+  readonly trustProfiles: TrustProfileApplication;
+  readonly runtimeFreshness: RuntimeFreshnessApplication;
+  readonly metrics: DailyDriverMetricsApplication;
   readonly telegramConfigured: boolean;
   close(): Promise<void>;
 }
@@ -69,6 +83,18 @@ export function createAgentOperationsComposition(
   const projects = new ProjectApplicationService(store, repositories, new LocalProjectResourceInspector(), {
     runtimeAgentIds: ['agent-operations/rehearsal'],
   });
+  const trustProfiles = new TrustProfileApplicationService(store);
+  const runtimeFreshness = new RuntimeFreshnessService(
+    store,
+    runtime,
+    runtimeLifecycle,
+    trustProfiles,
+    {
+      expectedToolCatalogRevision: EXPECTED_AO_ORCHESTRATOR_TOOL_CATALOG_REVISION,
+      ...expectedRuntimeRevision(frameworkRoot),
+    },
+  );
+  const metrics = new DailyDriverMetricsService(store);
   const inputs = new InputApplicationService(
     store,
     new FileInputObjectStorage(`${stateLocation.stateDirectory}/inputs`),
@@ -81,15 +107,21 @@ export function createAgentOperationsComposition(
     writeWorkspaceAdapter,
     { stateDirectory: stateLocation.stateDirectory },
   );
+  const browser = new PlaywrightBoundedBrowserAdapter({
+    authenticationRoot: `${stateLocation.stateDirectory}/preview-auth`,
+  });
   const preview = new PreviewApplicationService(
     store,
     repositories,
     new GitPreviewWorkspaceAdapter({ workspaceRoot: `${stateLocation.stateDirectory}/preview-workspaces` }),
     writeWorkspaceAdapter,
     new NodePreviewProcessAdapter(),
-    new PlaywrightBoundedBrowserAdapter(),
+    browser,
     inputs,
-    { previewWorkspaceRoot: `${stateLocation.stateDirectory}/preview-workspaces` },
+    {
+      previewWorkspaceRoot: `${stateLocation.stateDirectory}/preview-workspaces`,
+      authentication: browser,
+    },
   );
   const orchestration = new OrchestrationService(
     store,
@@ -97,20 +129,26 @@ export function createAgentOperationsComposition(
     repositories,
     new CortextOSExecutionAdapter(),
     new CortextOSExecutionObserver(),
-    { workspaceService: repositoryWorkspace, browserEvidence: preview },
+    {
+      workspaceService: repositoryWorkspace,
+      browserEvidence: preview,
+      resolveTrustPolicy: async jobId => (await trustProfiles.effectiveForJob(jobId)).policy,
+    },
   );
   const notification = loadNotifier();
   const operator = new OperatorApplicationService(store, orchestration, {
     runtime,
     runtimeLifecycle,
     notifier: notification.notifier,
+    trustProfiles,
+    runtimeFreshness,
     ...(options.deferRunnerWake !== undefined ? { deferRunnerWake: options.deferRunnerWake } : {}),
   });
   const conversation = new OrchestratorConversationApplicationService(
     new CortextOSOrchestratorConversationAdapter(),
     store,
   );
-  const tools = new OrchestratorToolApplicationService(operator, inputs);
+  const tools = new OrchestratorToolApplicationService(operator, inputs, preview);
   let runnerTimer: ReturnType<typeof setInterval> | null = null;
   if (options.startRunner) {
     operator.startRunner();
@@ -127,12 +165,23 @@ export function createAgentOperationsComposition(
     projects,
     inputs,
     preview,
+    trustProfiles,
+    runtimeFreshness,
+    metrics,
     telegramConfigured: notification.configured,
     async close() {
       if (runnerTimer) clearInterval(runnerTimer);
       await store.close();
     },
   };
+}
+
+function expectedRuntimeRevision(frameworkRoot: string): { readonly expectedRevision?: string } {
+  const configured = process.env['AO_EXPECTED_RUNTIME_REVISION']?.trim();
+  if (configured) return { expectedRevision: configured };
+  const entry = resolve(frameworkRoot, 'dist', 'cli.js');
+  if (!existsSync(entry)) return {};
+  return { expectedRevision: `sha256:${createHash('sha256').update(readFileSync(entry)).digest('hex')}` };
 }
 
 /** Stable in source and bundled dist execution. Never falls back silently to caller CWD. */
@@ -150,7 +199,10 @@ function loadNotifier() {
     loadAgentOperationsTelegramEnvironmentFile();
     const config = loadTelegramOperatorNotificationConfig();
     return {
-      notifier: config ? new TelegramOperatorNotifier(config) : new NoopOperatorNotifier(),
+      notifier: config ? new TelegramOperatorNotifier(config, undefined, {
+        ctxRoot: process.env.CTX_ROOT ?? join(homedir(), '.cortextos', process.env.CTX_INSTANCE_ID ?? 'default'),
+        agentName: process.env.AO_ORCHESTRATOR_AGENT_NAME ?? 'ao-orchestrator',
+      }) : new NoopOperatorNotifier(),
       configured: config !== null,
     };
   } catch (error) {

@@ -62,12 +62,19 @@ import type {
   PreviewProcessState,
   PreviewProfileStatus,
   PreviewWorkspaceKind,
+  DurableAuthenticatedPreviewSession,
+  AuthenticatedPreviewSessionStatus,
+  DurableTrustProfile,
+  TrustProfilePolicy,
+  TrustProfilePreset,
+  TrustProfileScope,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   createRepositoryCheckoutBindingId,
   isRuntimeExecutionCapabilitiesNoBroaderThan,
   isRuntimeExecutionPolicyNoBroaderThan,
   isBoundedExecutionResult,
+  validateTrustProfile,
 } from '../../agent-operations-contracts/src/index.js';
 import { applyStateMigrations, type SqliteStateMigration } from './migrations.js';
 import { resolveAgentOperationsStateLocation } from './state-location.js';
@@ -120,6 +127,18 @@ interface ProjectProfileRow {
   revision: number;
 }
 
+interface TrustProfileRow {
+  id: string;
+  scope: TrustProfileScope;
+  scope_id: string | null;
+  name: string;
+  preset: TrustProfilePreset;
+  policy_json: string;
+  revision: number;
+  created_at: string;
+  updated_at: string;
+}
+
 interface InputRow {
   id: string;
   display_name: string;
@@ -142,10 +161,26 @@ interface PreviewProfileRow {
   name: string;
   command_json: string;
   status: PreviewProfileStatus;
+  authentication_required?: number;
   validation_json: string | null;
   revision: number;
   created_at: string;
   updated_at: string;
+}
+
+interface AuthenticatedPreviewSessionRow {
+  id: string;
+  project_id: string;
+  preview_profile_id: string;
+  installation_id: string;
+  origin: string;
+  status: AuthenticatedPreviewSessionStatus;
+  created_at: string;
+  updated_at: string;
+  last_verified_at: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  revision: number;
 }
 
 interface PreviewSessionRow {
@@ -525,6 +560,20 @@ function toProjectProfile(row: ProjectProfileRow): DurableProjectProfile {
   };
 }
 
+function toTrustProfile(row: TrustProfileRow): DurableTrustProfile {
+  return {
+    id: row.id,
+    scope: row.scope,
+    ...(row.scope_id ? { scopeId: row.scope_id } : {}),
+    name: row.name,
+    preset: row.preset,
+    policy: JSON.parse(row.policy_json) as TrustProfilePolicy,
+    revision: row.revision,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
 function toInput(row: InputRow): DurableInput {
   return {
     id: row.id,
@@ -550,12 +599,25 @@ function toPreviewProfile(row: PreviewProfileRow): DurablePreviewProfile {
     name: row.name,
     command: JSON.parse(row.command_json) as DurablePreviewProfile['command'],
     status: row.status,
+    ...(row.authentication_required === 1 ? { authenticationRequired: true } : {}),
     ...(row.validation_json
       ? { validation: JSON.parse(row.validation_json) as NonNullable<DurablePreviewProfile['validation']> }
       : {}),
     revision: row.revision,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function toAuthenticatedPreviewSession(row: AuthenticatedPreviewSessionRow): DurableAuthenticatedPreviewSession {
+  return {
+    id: row.id, projectId: row.project_id, previewProfileId: row.preview_profile_id,
+    installationId: row.installation_id, origin: row.origin, status: row.status,
+    createdAt: row.created_at, updatedAt: row.updated_at,
+    ...(row.last_verified_at ? { lastVerifiedAt: row.last_verified_at } : {}),
+    ...(row.expires_at ? { expiresAt: row.expires_at } : {}),
+    ...(row.revoked_at ? { revokedAt: row.revoked_at } : {}),
+    revision: row.revision,
   };
 }
 
@@ -1005,6 +1067,15 @@ function isValidPreviewSessionTransition(from: PreviewProcessState, to: PreviewP
     || from === 'failed' && to === 'starting';
 }
 
+function validAuthenticatedPreviewTransition(
+  from: AuthenticatedPreviewSessionStatus,
+  to: AuthenticatedPreviewSessionStatus,
+): boolean {
+  return from === 'pending-human-login' && (to === 'ready' || to === 'expired' || to === 'revoked')
+    || from === 'ready' && (to === 'expired' || to === 'revoked')
+    || from === 'expired' && to === 'revoked';
+}
+
 function validateBrowserRequirement(requirement: BrowserEvidenceRequirement): void {
   if (requirement.kind !== 'browser-render' || !/^\/(?!\/)/.test(requirement.route)
     || requirement.route.includes('\0') || requirement.route.includes('://')
@@ -1029,6 +1100,8 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
   private readonly supportsProjectInputs: boolean;
   private readonly supportsWorkerBudgetExtensions: boolean;
   private readonly supportsPreviewBrowserEvidence: boolean;
+  private readonly supportsDailyDriverTrust: boolean;
+  private readonly supportsAuthenticatedPreview: boolean;
 
   private constructor(databasePath: string, database: Database.Database) {
     this.databasePath = databasePath;
@@ -1062,6 +1135,12 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     ).get() as unknown) !== undefined;
     this.supportsPreviewBrowserEvidence = (database.prepare(
       "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'browser_evidence'",
+    ).get() as unknown) !== undefined;
+    this.supportsDailyDriverTrust = (database.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'trust_profiles'",
+    ).get() as unknown) !== undefined;
+    this.supportsAuthenticatedPreview = (database.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'authenticated_preview_sessions'",
     ).get() as unknown) !== undefined;
   }
 
@@ -1322,6 +1401,52 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     return row ? toProjectProfile(row) : null;
   }
 
+  async saveTrustProfile(profile: DurableTrustProfile): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsDailyDriverTrust) throw new Error('Trust Profiles require Agent Operations schema v16');
+    validateTrustProfile(profile);
+    if (profile.scope === 'project' && !await this.getProject(profile.scopeId!)) {
+      throw new Error(`Project not found: ${profile.scopeId}`);
+    }
+    if (profile.scope === 'job' && !await this.getJob(profile.scopeId!)) {
+      throw new Error(`Job not found: ${profile.scopeId}`);
+    }
+    const existing = this.database.prepare('SELECT * FROM trust_profiles WHERE id = ?')
+      .get(profile.id) as TrustProfileRow | undefined;
+    if (profile.revision !== (existing ? existing.revision + 1 : 0)
+      || (existing && (existing.scope !== profile.scope
+        || (existing.scope_id ?? undefined) !== profile.scopeId
+        || existing.created_at !== profile.createdAt))) {
+      throw new Error(`Stale or rewritten Trust Profile: ${profile.id}`);
+    }
+    this.database.prepare(`
+      INSERT INTO trust_profiles
+        (id, scope, scope_id, name, preset, policy_json, revision, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET name=excluded.name, preset=excluded.preset,
+        policy_json=excluded.policy_json, revision=excluded.revision, updated_at=excluded.updated_at
+    `).run(
+      profile.id, profile.scope, profile.scopeId ?? null, profile.name, profile.preset,
+      JSON.stringify(profile.policy), profile.revision, profile.createdAt, profile.updatedAt,
+    );
+  }
+
+  async getTrustProfile(id: string): Promise<DurableTrustProfile | null> {
+    this.assertOpen();
+    if (!this.supportsDailyDriverTrust) return null;
+    const row = this.database.prepare('SELECT * FROM trust_profiles WHERE id = ?')
+      .get(id) as TrustProfileRow | undefined;
+    return row ? toTrustProfile(row) : null;
+  }
+
+  async listTrustProfiles(): Promise<readonly DurableTrustProfile[]> {
+    this.assertOpen();
+    if (!this.supportsDailyDriverTrust) return [];
+    return (this.database.prepare(
+      'SELECT * FROM trust_profiles ORDER BY scope, COALESCE(scope_id, \'\'), id',
+    ).all() as TrustProfileRow[]).map(toTrustProfile);
+  }
+
   async savePreviewProfile(profile: DurablePreviewProfile): Promise<void> {
     this.assertOpen();
     if (!this.supportsPreviewBrowserEvidence) throw new Error('Preview Profiles require Agent Operations schema v15');
@@ -1335,17 +1460,32 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         || existing.created_at !== profile.createdAt))) {
       throw new Error(`Stale or rewritten Preview Profile: ${profile.id}`);
     }
-    this.database.prepare(`
-      INSERT INTO preview_profiles
-        (id, project_id, name, command_json, status, validation_json, revision, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET command_json=excluded.command_json, status=excluded.status,
-        validation_json=excluded.validation_json, revision=excluded.revision, updated_at=excluded.updated_at
-    `).run(
-      profile.id, profile.projectId, profile.name, JSON.stringify(profile.command), profile.status,
-      profile.validation ? JSON.stringify(profile.validation) : null, profile.revision,
-      profile.createdAt, profile.updatedAt,
-    );
+    if (this.supportsAuthenticatedPreview) {
+      this.database.prepare(`
+        INSERT INTO preview_profiles
+          (id, project_id, name, command_json, status, validation_json, revision, created_at, updated_at, authentication_required)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET command_json=excluded.command_json, status=excluded.status,
+          validation_json=excluded.validation_json, revision=excluded.revision, updated_at=excluded.updated_at,
+          authentication_required=excluded.authentication_required
+      `).run(
+        profile.id, profile.projectId, profile.name, JSON.stringify(profile.command), profile.status,
+        profile.validation ? JSON.stringify(profile.validation) : null, profile.revision,
+        profile.createdAt, profile.updatedAt, profile.authenticationRequired ? 1 : 0,
+      );
+    } else {
+      this.database.prepare(`
+        INSERT INTO preview_profiles
+          (id, project_id, name, command_json, status, validation_json, revision, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET command_json=excluded.command_json, status=excluded.status,
+          validation_json=excluded.validation_json, revision=excluded.revision, updated_at=excluded.updated_at
+      `).run(
+        profile.id, profile.projectId, profile.name, JSON.stringify(profile.command), profile.status,
+        profile.validation ? JSON.stringify(profile.validation) : null, profile.revision,
+        profile.createdAt, profile.updatedAt,
+      );
+    }
   }
 
   async getPreviewProfile(id: string): Promise<DurablePreviewProfile | null> {
@@ -1363,6 +1503,65 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
       ? this.database.prepare('SELECT * FROM preview_profiles WHERE project_id = ? ORDER BY name, id').all(projectId)
       : this.database.prepare('SELECT * FROM preview_profiles ORDER BY project_id, name, id').all();
     return (rows as PreviewProfileRow[]).map(toPreviewProfile);
+  }
+
+  async createAuthenticatedPreviewSession(session: DurableAuthenticatedPreviewSession): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsAuthenticatedPreview) throw new Error('Authenticated Preview Sessions require Agent Operations schema v17');
+    const profile = await this.getPreviewProfile(session.previewProfileId);
+    if (!session.id.startsWith('preview-auth:') || session.status !== 'pending-human-login'
+      || session.revision !== 0 || !profile || profile.projectId !== session.projectId
+      || !profile.authenticationRequired) throw new Error(`Invalid Authenticated Preview Session: ${session.id}`);
+    this.database.prepare(`
+      INSERT INTO authenticated_preview_sessions
+        (id, project_id, preview_profile_id, installation_id, origin, status, created_at,
+         updated_at, last_verified_at, expires_at, revoked_at, revision)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      session.id, session.projectId, session.previewProfileId, session.installationId,
+      session.origin, session.status, session.createdAt, session.updatedAt,
+      session.lastVerifiedAt ?? null, session.expiresAt ?? null, session.revokedAt ?? null, session.revision,
+    );
+  }
+
+  async getAuthenticatedPreviewSession(id: string): Promise<DurableAuthenticatedPreviewSession | null> {
+    this.assertOpen();
+    if (!this.supportsAuthenticatedPreview) return null;
+    const row = this.database.prepare('SELECT * FROM authenticated_preview_sessions WHERE id = ?')
+      .get(id) as AuthenticatedPreviewSessionRow | undefined;
+    return row ? toAuthenticatedPreviewSession(row) : null;
+  }
+
+  async listAuthenticatedPreviewSessions(projectId?: string): Promise<readonly DurableAuthenticatedPreviewSession[]> {
+    this.assertOpen();
+    if (!this.supportsAuthenticatedPreview) return [];
+    const rows = projectId
+      ? this.database.prepare('SELECT * FROM authenticated_preview_sessions WHERE project_id = ? ORDER BY created_at, id').all(projectId)
+      : this.database.prepare('SELECT * FROM authenticated_preview_sessions ORDER BY created_at, id').all();
+    return (rows as AuthenticatedPreviewSessionRow[]).map(toAuthenticatedPreviewSession);
+  }
+
+  async saveAuthenticatedPreviewSessionTransition(
+    session: DurableAuthenticatedPreviewSession,
+    expectedRevision: number,
+  ): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsAuthenticatedPreview) throw new Error('Authenticated Preview Sessions require Agent Operations schema v17');
+    const existing = await this.getAuthenticatedPreviewSession(session.id);
+    if (!existing || existing.revision !== expectedRevision || session.revision !== expectedRevision + 1
+      || existing.projectId !== session.projectId || existing.previewProfileId !== session.previewProfileId
+      || existing.installationId !== session.installationId || existing.origin !== session.origin
+      || existing.createdAt !== session.createdAt || !validAuthenticatedPreviewTransition(existing.status, session.status)) {
+      throw new Error(`Invalid Authenticated Preview Session transition: ${session.id}`);
+    }
+    const result = this.database.prepare(`
+      UPDATE authenticated_preview_sessions SET status=?, updated_at=?, last_verified_at=?,
+        expires_at=?, revoked_at=?, revision=? WHERE id=? AND revision=?
+    `).run(
+      session.status, session.updatedAt, session.lastVerifiedAt ?? null, session.expiresAt ?? null,
+      session.revokedAt ?? null, session.revision, session.id, expectedRevision,
+    );
+    if (result.changes !== 1) throw new Error(`Authenticated Preview Session transition conflict: ${session.id}`);
   }
 
   async createInput(input: DurableInput): Promise<void> {

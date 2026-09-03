@@ -18,6 +18,10 @@ import {
   createOperatorRunId,
   isActiveAttemptStatus,
   isExactCompletionObservation,
+  executionModeForJob,
+  workerMaximumForPolicy,
+  classifyEscalationResolution,
+  canAutonomouslyPerformRiskTier,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   JobLifecycleService,
@@ -30,6 +34,7 @@ import {
 } from '../../agent-operations-core/src/index.js';
 import type { OperatorNotifier } from './notification.js';
 import { OperatorRunner } from './operator-runner.js';
+import { TrustProfileApplicationService } from './trust-profile-application-service.js';
 import type {
   OperatorApplication,
   OperatorAttemptStory,
@@ -45,6 +50,8 @@ import type {
   OperatorRunSession,
   OperatorTaskInput,
   OperatorTaskPreview,
+  TrustProfileApplication,
+  RuntimeFreshnessApplication,
 } from './types.js';
 
 export interface OperatorOrchestrationPort {
@@ -64,6 +71,8 @@ export interface OperatorApplicationServiceOptions {
   readonly escalationIdFactory?: () => string;
   /** Persist mutations without waking this process's runner. Used by bounded external tool adapters. */
   readonly deferRunnerWake?: boolean;
+  readonly trustProfiles?: TrustProfileApplication;
+  readonly runtimeFreshness?: RuntimeFreshnessApplication;
 }
 
 export const OPERATOR_READ_ONLY_DEFAULTS: OperatorPolicyDefaults = {
@@ -98,6 +107,7 @@ export class OperatorApplicationService implements OperatorApplication {
   private readonly workerBudgetExtensionIdFactory: () => string;
   private readonly escalationIdFactory: () => string;
   private readonly deferRunnerWake: boolean;
+  private readonly trustProfiles: TrustProfileApplication;
 
   constructor(
     private readonly store: AgentOperationsStateStore,
@@ -114,14 +124,18 @@ export class OperatorApplicationService implements OperatorApplication {
       ?? (() => createWorkerBudgetExtensionId());
     this.escalationIdFactory = options.escalationIdFactory ?? (() => createEscalationId());
     this.deferRunnerWake = options.deferRunnerWake ?? false;
+    this.trustProfiles = options.trustProfiles ?? new TrustProfileApplicationService(store, { now: this.now });
     this.runner = new OperatorRunner(store, orchestration, {
       now: this.now,
       ...(options.notifier ? { notifier: options.notifier } : {}),
+      ...(options.runtimeFreshness ? { runtimeFreshness: options.runtimeFreshness } : {}),
     });
   }
 
   startRunner(): void {
-    this.runner.start();
+    void this.reconcileMachineResolvableRuns()
+      .catch(() => undefined)
+      .finally(() => this.runner.start());
   }
 
   async getRuntimeStatus(): Promise<OperatorRuntimeStatus> {
@@ -202,6 +216,12 @@ export class OperatorApplicationService implements OperatorApplication {
       }
     }
     if (input.browserEvidenceRequirement) validateBrowserEvidenceRequirement(input.browserEvidenceRequirement);
+    const trust = await this.trustProfiles.effectiveForProject(projectId);
+    const defaults = executionMode === 'repository-write-isolated'
+      ? { ...OPERATOR_ISOLATED_WRITE_DEFAULTS,
+          maxWorkerAttempts: workerMaximumForPolicy(trust.policy, executionMode) }
+      : { ...OPERATOR_READ_ONLY_DEFAULTS,
+          maxWorkerAttempts: workerMaximumForPolicy(trust.policy, executionMode) };
     return {
       project,
       repository,
@@ -209,9 +229,7 @@ export class OperatorApplicationService implements OperatorApplication {
       ...(title ? { title } : {}),
       task,
       acceptanceCriteria,
-      defaults: executionMode === 'repository-write-isolated'
-        ? OPERATOR_ISOLATED_WRITE_DEFAULTS
-        : OPERATOR_READ_ONLY_DEFAULTS,
+      defaults,
       executionMode,
       executionAuthorized: false,
       ...(input.inputIds?.length ? { inputIds: [...input.inputIds] } : {}),
@@ -285,13 +303,14 @@ export class OperatorApplicationService implements OperatorApplication {
     if (attempts.some(attempt => isActiveAttemptStatus(attempt.status))) {
       throw new Error('Guided continuation requires no active Attempt');
     }
+    const workerMaximum = await this.workerMaximumForJob(escalation.jobId);
     const workerBudget = await readWorkerExecutionBudget(
       this.store,
       attempts,
-      MVP_MAX_WORKER_ATTEMPTS,
+      workerMaximum,
     );
     if (workerBudget.exhausted) {
-      throw new Error(`Worker execution budget of ${MVP_MAX_WORKER_ATTEMPTS} is exhausted`);
+      throw new Error(`Worker execution budget of ${workerMaximum} is exhausted`);
     }
     if (await this.hasUncertainDispatch(attempts)) {
       throw new Error('Guided continuation is forbidden while a Dispatch is uncertain');
@@ -334,7 +353,7 @@ export class OperatorApplicationService implements OperatorApplication {
     const workerBudget = await readWorkerExecutionBudget(
       this.store,
       attempts,
-      MVP_MAX_WORKER_ATTEMPTS,
+      await this.workerMaximumForJob(escalation.jobId),
     );
     if (!workerBudget.exhausted
       || !await this.allowsWorkerBudgetExtension(escalation, attempts)) {
@@ -535,6 +554,8 @@ export class OperatorApplicationService implements OperatorApplication {
     const previewSession = await this.store.getPreviewSessionForJob(job.id);
     const previewProfile = previewSession ? await this.store.getPreviewProfile(previewSession.profileId) : null;
     const browserEvidence = await this.store.listBrowserEvidenceForJob(job.id);
+    const authenticatedPreviewSession = [...await this.store.listAuthenticatedPreviewSessions(job.projectId)]
+      .reverse().find(session => !previewProfile || session.previewProfileId === previewProfile.id);
     const inputs = (await Promise.all((await this.store.listJobInputIds(job.id)).map(id => this.store.getInput(id))))
       .filter(value => value !== null)
       .map(value => ({
@@ -574,6 +595,7 @@ export class OperatorApplicationService implements OperatorApplication {
       ...(previewSession ? { previewSession } : {}),
       ...(previewProfile ? { previewProfile } : {}),
       ...(browserEvidence.length ? { browserEvidence } : {}),
+      ...(authenticatedPreviewSession ? { authenticatedPreviewSession } : {}),
     };
   }
 
@@ -586,10 +608,11 @@ export class OperatorApplicationService implements OperatorApplication {
     const latestAttempt = attempts.at(-1) ?? null;
     const activeAttempt = [...attempts].reverse().find(attempt => isActiveAttemptStatus(attempt.status));
     const operatorRun = await this.store.getOperatorRunForJob(job.id);
+    const workerMaximum = await this.workerMaximumForJob(job.id);
     const workerBudget = await readWorkerExecutionBudget(
       this.store,
       attempts,
-      MVP_MAX_WORKER_ATTEMPTS,
+      workerMaximum,
     );
     const currentRole = activeAttempt?.executionRole ?? null;
     const currentStage = await this.deriveStage(job, attempts, reviews, unresolved, operatorRun);
@@ -604,7 +627,7 @@ export class OperatorApplicationService implements OperatorApplication {
       orchestrationState: currentStage,
       workerAttemptCount: attempts.filter(attempt => attempt.executionRole === 'worker').length,
       workerExecutionCount: workerBudget.consumed,
-      automaticWorkerExecutionLimit: MVP_MAX_WORKER_ATTEMPTS,
+      automaticWorkerExecutionLimit: workerMaximum,
       humanWorkerBudgetExtensionCount: workerBudget.humanExtensions.length,
       authorizedWorkerExecutionLimit: workerBudget.authorizedMaximum,
       latestReviewDecision: reviews.at(-1)?.decision ?? null,
@@ -657,7 +680,7 @@ export class OperatorApplicationService implements OperatorApplication {
       const workerBudget = await readWorkerExecutionBudget(
         this.store,
         attempts,
-        MVP_MAX_WORKER_ATTEMPTS,
+        await this.workerMaximumForJob(job.id),
       );
       const plan = await this.store.getExecutionPlanForAttempt(active.id);
       if (!plan) {
@@ -713,7 +736,7 @@ export class OperatorApplicationService implements OperatorApplication {
     const workerBudget = await readWorkerExecutionBudget(
       this.store,
       attempts,
-      MVP_MAX_WORKER_ATTEMPTS,
+      await this.workerMaximumForJob(escalation.jobId),
     );
     if (workerBudget.exhausted
       && await this.allowsWorkerBudgetExtension(escalation, attempts)) {
@@ -775,6 +798,27 @@ export class OperatorApplicationService implements OperatorApplication {
     const run = await this.store.getOperatorRunForJob(jobId);
     if (!run) throw new Error(`Operator Run not found for Job: ${jobId}`);
     return run;
+  }
+
+  private async workerMaximumForJob(jobId: string): Promise<number> {
+    const job = await this.store.getJob(jobId);
+    if (!job) throw new Error(`Job not found: ${jobId}`);
+    const trust = await this.trustProfiles.effectiveForJob(job.id);
+    return workerMaximumForPolicy(trust.policy, executionModeForJob(job));
+  }
+
+  private async reconcileMachineResolvableRuns(): Promise<void> {
+    for (const run of await this.store.listOperatorRuns()) {
+      if (run.status !== 'needs_human') continue;
+      const trust = await this.trustProfiles.effectiveForJob(run.jobId);
+      if (!canAutonomouslyPerformRiskTier(trust.policy, 'green')) continue;
+      const escalations = await this.store.listEscalations(run.jobId, true);
+      for (const escalation of escalations) {
+        if (classifyEscalationResolution(escalation) !== 'machine-resolvable') continue;
+        if (!isRecoverableObservationEscalation(escalation)) continue;
+        await this.reconcileTimedOutExecution(escalation.id);
+      }
+    }
   }
 }
 

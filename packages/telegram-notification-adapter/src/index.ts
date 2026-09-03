@@ -10,6 +10,7 @@ import {
 } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { TelegramAPI } from '../../../src/telegram/api.js';
+import { cacheLastSent, logOutboundMessage } from '../../../src/telegram/logging.js';
 import type {
   OperatorNotificationEvent,
   OperatorNotificationResult,
@@ -37,6 +38,11 @@ export interface TelegramMessageSender {
     replyMarkup?: object,
     options?: { readonly parseMode?: 'HTML' | null },
   ): Promise<unknown>;
+}
+
+export interface TelegramOperatorNotifierOptions {
+  readonly ctxRoot?: string;
+  readonly agentName?: string;
 }
 
 export function loadTelegramOperatorNotificationConfig(
@@ -84,22 +90,41 @@ export class TelegramOperatorNotifier implements OperatorNotifier {
   constructor(
     private readonly config: TelegramOperatorNotificationConfig,
     sender?: TelegramMessageSender,
+    private readonly options: TelegramOperatorNotifierOptions = {},
   ) {
     this.sender = sender ?? new TelegramAPI(config.botToken);
   }
 
   async notify(event: OperatorNotificationEvent): Promise<OperatorNotificationResult> {
     try {
-      await this.sender.sendMessage(
+      const message = formatOperatorTelegramMessage(event);
+      const result = await this.sender.sendMessage(
         this.config.chatId,
-        formatOperatorTelegramMessage(event),
+        message,
         undefined,
         { parseMode: null },
       );
+      this.recordCortextOSOutboundContext(message, result);
     } catch (error) {
       throw new Error(redactTelegramCredentials(errorMessage(error), this.config));
     }
     return { status: 'sent' };
+  }
+
+  private recordCortextOSOutboundContext(message: string, result: unknown): void {
+    if (!this.options.ctxRoot) return;
+    try {
+      const ctxRoot = this.options.ctxRoot;
+      const agentName = this.options.agentName ?? 'ao-orchestrator';
+      const messageId = isRecord(result) && isRecord(result['result'])
+        && typeof result['result']['message_id'] === 'number'
+        ? result['result']['message_id']
+        : 0;
+      logOutboundMessage(ctxRoot, agentName, this.config.chatId, message, messageId, { parseMode: 'none' });
+      cacheLastSent(ctxRoot, agentName, this.config.chatId, message);
+    } catch {
+      // Conversation context is advisory. Durable AO delivery truth is already recorded separately.
+    }
   }
 }
 
@@ -244,30 +269,30 @@ export async function runTelegramNotificationTest(
 
 export function formatOperatorTelegramMessage(event: OperatorNotificationEvent): string {
   if (event.kind === 'job_completed') {
-    return bounded(`✅ Agent Operations completed a job
+    return bounded(`✅ AO completed a Job
 
+${event.projectName ?? 'Agent Operations'}
 ${event.title}
 
 Result:
 ${event.result}
 
-Reviewer: PASS — ${event.reviewerSummary}
-Worker attempts: ${event.workerAttemptCount}
+Reviewer: PASS
+Worker executions: ${event.workerAttemptCount}
 
-Open Agent Operations for details.`);
+View full result: ${event.aoPath ?? 'Open Agent Operations for details.'}`);
   }
-  return bounded(`⚠️ Agent Operations needs you
+  return bounded(`⚠️ AO needs you
 
-Job:
+${event.projectName ?? 'Agent Operations'}
 ${event.title}
 
-Reason:
 ${event.reason}${event.reviewerFeedback ? `
 
 Reviewer feedback:
 ${event.reviewerFeedback}` : ''}
 
-Open Agent Operations to respond.`);
+Reply here or open AO: ${event.aoPath ?? 'Open Agent Operations to respond.'}`);
 }
 
 function bounded(value: string): string {
@@ -294,6 +319,10 @@ function unquote(value: string): string {
   if (value.length >= 2 && ((value.startsWith('"') && value.endsWith('"'))
     || (value.startsWith("'") && value.endsWith("'")))) return value.slice(1, -1);
   return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
 async function recordTerminalReceipt(

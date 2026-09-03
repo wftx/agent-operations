@@ -21,7 +21,9 @@ export const ISOLATED_WRITE_WORKSPACE_SCHEMA_VERSION = 12;
 export const PROJECT_ONBOARDING_INPUTS_SCHEMA_VERSION = 13;
 export const WORKER_BUDGET_EXTENSIONS_SCHEMA_VERSION = 14;
 export const PREVIEW_BROWSER_EVIDENCE_SCHEMA_VERSION = 15;
-export const CURRENT_SCHEMA_VERSION = PREVIEW_BROWSER_EVIDENCE_SCHEMA_VERSION;
+export const DAILY_DRIVER_TRUST_SCHEMA_VERSION = 16;
+export const AUTHENTICATED_PREVIEW_SCHEMA_VERSION = 17;
+export const CURRENT_SCHEMA_VERSION = AUTHENTICATED_PREVIEW_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -795,6 +797,50 @@ const PREVIEW_BROWSER_EVIDENCE_SCHEMA_SQL = `
   CREATE INDEX browser_evidence_by_job ON browser_evidence(job_id, captured_at, id);
 `;
 
+const DAILY_DRIVER_TRUST_SCHEMA_SQL = `
+  CREATE TABLE trust_profiles (
+    id TEXT PRIMARY KEY CHECK (id LIKE 'trust-profile:%'),
+    scope TEXT NOT NULL CHECK (scope IN ('global', 'project', 'job')),
+    scope_id TEXT,
+    name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+    preset TEXT NOT NULL CHECK (preset IN ('conservative', 'daily-driver', 'custom')),
+    policy_json TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK ((scope = 'global' AND scope_id IS NULL) OR (scope != 'global' AND scope_id IS NOT NULL)),
+    UNIQUE (scope, scope_id)
+  );
+
+  CREATE UNIQUE INDEX one_global_trust_profile
+    ON trust_profiles(scope)
+    WHERE scope = 'global';
+`;
+
+const AUTHENTICATED_PREVIEW_SCHEMA_SQL = `
+  ALTER TABLE preview_profiles
+    ADD COLUMN authentication_required INTEGER NOT NULL DEFAULT 0
+    CHECK (authentication_required IN (0, 1));
+
+  CREATE TABLE authenticated_preview_sessions (
+    id TEXT PRIMARY KEY CHECK (id LIKE 'preview-auth:%'),
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    preview_profile_id TEXT NOT NULL REFERENCES preview_profiles(id),
+    installation_id TEXT NOT NULL REFERENCES installations(id),
+    origin TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending-human-login', 'ready', 'expired', 'revoked')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_verified_at TEXT,
+    expires_at TEXT,
+    revoked_at TEXT,
+    revision INTEGER NOT NULL CHECK (revision >= 0)
+  );
+
+  CREATE INDEX authenticated_preview_sessions_by_profile
+    ON authenticated_preview_sessions(project_id, preview_profile_id, created_at, id);
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -870,6 +916,16 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: PREVIEW_BROWSER_EVIDENCE_SCHEMA_VERSION,
     name: 'preview-profiles-and-browser-evidence',
     up: database => database.exec(PREVIEW_BROWSER_EVIDENCE_SCHEMA_SQL),
+  },
+  {
+    version: DAILY_DRIVER_TRUST_SCHEMA_VERSION,
+    name: 'daily-driver-trust-profiles',
+    up: database => database.exec(DAILY_DRIVER_TRUST_SCHEMA_SQL),
+  },
+  {
+    version: AUTHENTICATED_PREVIEW_SCHEMA_VERSION,
+    name: 'authenticated-preview-session-metadata',
+    up: database => database.exec(AUTHENTICATED_PREVIEW_SCHEMA_SQL),
   },
 ];
 

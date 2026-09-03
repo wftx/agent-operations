@@ -3,6 +3,7 @@ import type {
   OperatorJobDetail,
   OperatorProjectOption,
   InputApplication,
+  PreviewApplication,
   OrchestratorToolRequest,
   OrchestratorToolResult,
 } from './types.js';
@@ -12,6 +13,7 @@ export class OrchestratorToolApplicationService {
   constructor(
     private readonly operator: OperatorApplication,
     private readonly inputs?: InputApplication,
+    private readonly preview?: PreviewApplication,
   ) {}
 
   async execute(request: OrchestratorToolRequest): Promise<OrchestratorToolResult> {
@@ -63,6 +65,29 @@ export class OrchestratorToolApplicationService {
             latestReviewDecision: detail.summary.latestReviewDecision,
           }, [detail.summary.job.id]);
         }
+        case 'ao.jobs.guide': {
+          const escalationId = text(request.arguments, 'escalationId');
+          const instruction = text(request.arguments, 'instruction');
+          const session = await this.operator.provideGuidanceAndContinue(escalationId, instruction);
+          return success({ jobId: session.jobId, status: session.status, link: `/jobs/${encodeURIComponent(session.jobId)}` }, [session.jobId]);
+        }
+        case 'ao.jobs.authorize-one-more-attempt': {
+          const escalationId = text(request.arguments, 'escalationId');
+          const session = await this.operator.authorizeOneMoreWorkerAttempt(
+            escalationId,
+            optionalText(request.arguments, 'instruction'),
+          );
+          return success({ jobId: session.jobId, status: session.status, additionalWorkerExecutions: 1, link: `/jobs/${encodeURIComponent(session.jobId)}` }, [session.jobId]);
+        }
+        case 'ao.previews.authenticate': {
+          if (!this.preview) throw new Error('Preview authentication is not configured');
+          const jobId = text(request.arguments, 'jobId');
+          const session = await this.preview.beginPreviewAuthentication(jobId);
+          return success({
+            jobId, authenticationSessionId: session.id, status: session.status,
+            message: 'A controlled local browser is open for human login. Verify it in AO Web after login.',
+          }, [jobId]);
+        }
       }
     } catch (error) {
       return {
@@ -81,8 +106,8 @@ export class OrchestratorToolApplicationService {
     if (argumentsValue['reviewerRequired'] !== undefined && argumentsValue['reviewerRequired'] !== true) {
       throw new Error('reviewerRequired must remain true');
     }
-    if (argumentsValue['maxWorkerAttempts'] !== undefined && argumentsValue['maxWorkerAttempts'] !== 2) {
-      throw new Error('maxWorkerAttempts must remain 2');
+    if (argumentsValue['maxWorkerAttempts'] !== undefined) {
+      throw new Error('Worker execution budgets are determined by the effective Trust Profile');
     }
     const executionMode = optionalText(argumentsValue, 'executionMode') ?? 'repository-read-only';
     if (executionMode !== 'repository-read-only' && executionMode !== 'repository-write-isolated') {
@@ -161,6 +186,12 @@ function jobView(detail: OperatorJobDetail) {
     needsHuman: detail.summary.needsHuman,
     latestReviewDecision: detail.summary.latestReviewDecision,
     inputs: detail.inputs ?? [],
+    unresolvedEscalations: detail.escalations.filter(escalation => !escalation.resolvedAt).map(escalation => ({
+      escalationId: escalation.id,
+      reason: escalation.reason,
+      summary: escalation.summary,
+      actions: detail.escalationActions[escalation.id] ?? [],
+    })),
   };
 }
 

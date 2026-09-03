@@ -4,6 +4,9 @@ import type {
   ProjectApplication,
   InputApplication,
   PreviewApplication,
+  TrustProfileApplication,
+  DailyDriverMetricsApplication,
+  RuntimeFreshnessApplication,
 } from '../../../packages/agent-operations-application/src/index.js';
 import { OperatorWebApplication } from './app.js';
 import { createOperatorHttpServer } from './http-server.js';
@@ -15,6 +18,9 @@ export interface OperatorWebServerDependencies {
   readonly projects?: ProjectApplication;
   readonly inputs?: InputApplication;
   readonly preview?: PreviewApplication;
+  readonly trustProfiles?: TrustProfileApplication;
+  readonly metrics?: DailyDriverMetricsApplication;
+  readonly runtimeFreshness?: RuntimeFreshnessApplication;
   close(): Promise<void>;
 }
 
@@ -28,6 +34,9 @@ export function startOperatorWebServer(dependencies: OperatorWebServerDependenci
     dependencies.projects,
     dependencies.inputs,
     dependencies.preview,
+    dependencies.trustProfiles,
+    dependencies.metrics,
+    dependencies.runtimeFreshness,
   );
   const server = createOperatorHttpServer(app, { host, port });
   server.listen(port, host, () => {

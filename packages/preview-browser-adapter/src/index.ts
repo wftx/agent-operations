@@ -3,4 +3,5 @@ export {
   PlaywrightBoundedBrowserAdapter,
   isAllowedPreviewResource,
   resolvePreviewTarget,
+  type PlaywrightBoundedBrowserAdapterOptions,
 } from './playwright-bounded-browser-adapter.js';

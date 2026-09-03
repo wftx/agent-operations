@@ -9,9 +9,11 @@ import {
   createEscalationId,
   createOperatorNotificationDeliveryId,
   createOperatorNotificationEventKey,
+  actionableEscalationText,
 } from '../../agent-operations-contracts/src/index.js';
 import type { OrchestrationReadModel } from '../../agent-operations-core/src/index.js';
 import type { OperatorNotifier } from './notification.js';
+import type { RuntimeFreshnessApplication } from './types.js';
 import { NoopOperatorNotifier } from './notification.js';
 
 export interface OperatorRunnerOrchestrationPort {
@@ -23,6 +25,7 @@ export interface OperatorRunnerOptions {
   readonly notifier?: OperatorNotifier;
   readonly notificationDeliveryIdFactory?: () => string;
   readonly escalationIdFactory?: () => string;
+  readonly runtimeFreshness?: RuntimeFreshnessApplication;
 }
 
 /** One-process durable runner for explicitly accepted Operator Runs only. */
@@ -31,8 +34,10 @@ export class OperatorRunner {
   private readonly notifier: OperatorNotifier;
   private readonly notificationDeliveryIdFactory: () => string;
   private readonly escalationIdFactory: () => string;
+  private readonly runtimeFreshness?: RuntimeFreshnessApplication;
   private drainPromise: Promise<void> | null = null;
   private wakeRequested = false;
+  private deferredWake: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly store: AgentOperationsStateStore,
@@ -44,6 +49,7 @@ export class OperatorRunner {
     this.notificationDeliveryIdFactory = options.notificationDeliveryIdFactory
       ?? (() => createOperatorNotificationDeliveryId());
     this.escalationIdFactory = options.escalationIdFactory ?? (() => createEscalationId());
+    this.runtimeFreshness = options.runtimeFreshness;
   }
 
   start(): void {
@@ -70,7 +76,7 @@ export class OperatorRunner {
       const runs = await this.store.listOperatorRuns();
       const next = runs.find(run => run.status === 'pending' || run.status === 'running');
       if (!next) break;
-      await this.process(next);
+      if (await this.process(next) === 'deferred') break;
     }
     await this.reconcileNotifications();
   }
@@ -82,8 +88,27 @@ export class OperatorRunner {
     } while (this.wakeRequested);
   }
 
-  private async process(run: DurableOperatorRun): Promise<void> {
+  private async process(run: DurableOperatorRun): Promise<'processed' | 'deferred'> {
     let running = run;
+    if (this.runtimeFreshness) {
+      try {
+        const freshness = await this.runtimeFreshness.ensureCurrentForJob(running.jobId);
+        if (freshness.state === 'restart-pending') {
+          this.scheduleDeferredWake();
+          return 'deferred';
+        }
+        if (freshness.state !== 'current') throw new Error(freshness.message);
+      } catch (error) {
+        if (running.status === 'pending') {
+          const timestamp = this.now().toISOString();
+          const started = transitionRun(running, 'running', timestamp, { startedAt: timestamp });
+          await this.store.saveOperatorRunTransition(started, running.revision);
+          running = started;
+        }
+        await this.failRun(running, error);
+        return 'processed';
+      }
+    }
     if (running.status === 'pending') {
       const timestamp = this.now().toISOString();
       running = transitionRun(running, 'running', timestamp, {
@@ -102,33 +127,48 @@ export class OperatorRunner {
       const terminal = transitionRun(running, terminalStatus, timestamp, { finishedAt: timestamp });
       await this.store.saveOperatorRunTransition(terminal, running.revision);
       await this.safeNotifyForRun(terminal);
+      return 'processed';
     } catch (error) {
-      const failure = errorMessage(error);
-      let hasEscalation = (await this.store.listEscalations(running.jobId, true)).length > 0;
-      if (!hasEscalation) {
-        try {
-          await this.store.createEscalation({
-            id: this.escalationIdFactory(),
-            jobId: running.jobId,
-            reason: 'runtime_failure',
-            summary: `Operator orchestration stopped unexpectedly: ${failure}`,
-            createdAt: this.now().toISOString(),
-          });
-          hasEscalation = true;
-        } catch {
-          hasEscalation = false;
-        }
-      }
-      const timestamp = this.now().toISOString();
-      const terminal = transitionRun(
-        running,
-        hasEscalation ? 'needs_human' : 'failed',
-        timestamp,
-        { finishedAt: timestamp, failureMessage: failure },
-      );
-      await this.store.saveOperatorRunTransition(terminal, running.revision);
-      if (hasEscalation) await this.safeNotifyForRun(terminal);
+      await this.failRun(running, error);
+      return 'processed';
     }
+  }
+
+  private scheduleDeferredWake(): void {
+    if (this.deferredWake) return;
+    this.deferredWake = setTimeout(() => {
+      this.deferredWake = null;
+      void this.wake();
+    }, 5_000);
+    this.deferredWake.unref?.();
+  }
+
+  private async failRun(running: DurableOperatorRun, error: unknown): Promise<void> {
+    const failure = errorMessage(error);
+    let hasEscalation = (await this.store.listEscalations(running.jobId, true)).length > 0;
+    if (!hasEscalation) {
+      try {
+        await this.store.createEscalation({
+          id: this.escalationIdFactory(),
+          jobId: running.jobId,
+          reason: 'runtime_failure',
+          summary: `Operator orchestration stopped unexpectedly: ${failure}`,
+          createdAt: this.now().toISOString(),
+        });
+        hasEscalation = true;
+      } catch {
+        hasEscalation = false;
+      }
+    }
+    const timestamp = this.now().toISOString();
+    const terminal = transitionRun(
+      running,
+      hasEscalation ? 'needs_human' : 'failed',
+      timestamp,
+      { finishedAt: timestamp, failureMessage: failure },
+    );
+    await this.store.saveOperatorRunTransition(terminal, running.revision);
+    if (hasEscalation) await this.safeNotifyForRun(terminal);
   }
 
   private async reconcileNotifications(): Promise<void> {
@@ -151,6 +191,8 @@ export class OperatorRunner {
   private async notifyForRun(run: DurableOperatorRun): Promise<void> {
     const job = await this.store.getJob(run.jobId);
     if (!job) return;
+    const projectName = (await this.store.getProject(job.projectId))?.name ?? job.projectId;
+    const aoPath = `/jobs/${encodeURIComponent(job.id)}`;
     if (run.status === 'completed') {
       const attempts = await this.store.listAttemptsForJob(job.id);
       const reviews = await this.store.listAttemptReviewsForJob(job.id);
@@ -162,6 +204,8 @@ export class OperatorRunner {
         kind: 'job_completed',
         jobId: job.id,
         title: job.title,
+        projectName,
+        aoPath,
         result: result ?? 'No bounded final result is available.',
         reviewerSummary: reviews.at(-1)?.summary ?? 'Reviewer PASS was recorded.',
         workerAttemptCount: workerAttempts.length,
@@ -178,7 +222,9 @@ export class OperatorRunner {
         jobId: job.id,
         escalationId: escalation.id,
         title: job.title,
-        reason: escalation.summary,
+        projectName,
+        aoPath,
+        reason: actionableEscalationText(escalation),
         ...(review?.feedback ? { reviewerFeedback: review.feedback } : {}),
       });
     }

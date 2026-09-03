@@ -23,6 +23,8 @@ interface CortextOSStatusRecord {
   awaitingConfirmation?: boolean;
   dormant?: boolean;
   dormancyReason?: string;
+  toolCatalogRevision?: string;
+  loadedRevision?: string;
 }
 
 interface DaemonSnapshot {
@@ -114,6 +116,12 @@ function parseStatusRecord(value: unknown): CortextOSStatusRecord | null {
       : {}),
     ...(typeof value.dormant === 'boolean' ? { dormant: value.dormant } : {}),
     ...(typeof value.dormancyReason === 'string' ? { dormancyReason: value.dormancyReason } : {}),
+    ...(typeof value.toolCatalogRevision === 'string' && value.toolCatalogRevision.trim()
+      ? { toolCatalogRevision: value.toolCatalogRevision }
+      : {}),
+    ...(typeof value.loadedRevision === 'string' && value.loadedRevision.trim()
+      ? { loadedRevision: value.loadedRevision }
+      : {}),
   };
 }
 
@@ -469,6 +477,8 @@ export class CortextOSRuntimeAdapter implements AgentRuntimeAdapter {
         configured: true,
         capabilities: capabilitiesFor(agent.provider),
         health,
+        ...(liveStatus?.toolCatalogRevision ? { toolCatalogRevision: liveStatus.toolCatalogRevision } : {}),
+        ...(liveStatus?.loadedRevision ? { loadedRevision: liveStatus.loadedRevision } : {}),
         observedAt,
       } satisfies AgentRuntimeDetail;
     });
@@ -494,6 +504,8 @@ export class CortextOSRuntimeAdapter implements AgentRuntimeAdapter {
             'Daemon reported an agent with no matching readable configuration',
           ]),
         },
+        ...(status.toolCatalogRevision ? { toolCatalogRevision: status.toolCatalogRevision } : {}),
+        ...(status.loadedRevision ? { loadedRevision: status.loadedRevision } : {}),
         observedAt,
       });
     }

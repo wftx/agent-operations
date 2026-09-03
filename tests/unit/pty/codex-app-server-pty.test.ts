@@ -188,12 +188,16 @@ describe('CodexAppServerPTY Agent Operations Orchestrator tools', () => {
       'jobs_get',
       'jobs_list',
       'jobs_status',
+      'jobs_guide',
+      'jobs_authorize_one_more_attempt',
+      'previews_authenticate',
       'conversation_respond',
     ]);
     const createJob = ao.tools.find(tool => tool.name === 'jobs_create');
     expect(createJob?.inputSchema).toMatchObject({
       properties: { inputIds: { type: 'array', items: { type: 'string' }, maxItems: 20 } },
     });
+    expect(ao.tools.map(tool => tool.name).join(' ')).not.toMatch(/publish|deploy|push|merge|credential|secret|shell/);
     expect(AO_ORCHESTRATOR_TOOL_CATALOG_REVISION)
       .toBe(EXPECTED_AO_ORCHESTRATOR_TOOL_CATALOG_REVISION);
   });

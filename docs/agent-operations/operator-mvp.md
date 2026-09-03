@@ -141,10 +141,73 @@ npm run ao -- cancel <escalation-id>
 The CLI waits while execution runs because it is a short-lived process. Use
 `npm run ao:web` for durable daytime operation that survives browser closure.
 
-## Telegram notifications
+## Daily Driver trust and autonomy
 
-The Telegram adapter is notification-only. It sends once for a newly unresolved
-Needs Me escalation and once when an operator-submitted Job completes. Worker,
+Trust Profiles define whether AO may proceed with already bounded actions
+without another operator interruption. The global profile is the default. A
+Project may override it, and a Job may only restrict the effective policy. A
+Job can never widen its Project or global ceiling.
+
+The Conservative preset keeps the previous two Worker execution ceiling and
+requires explicit continuation. The Daily Driver preset allows routine Green
+read only work for up to five Worker and Reviewer cycles and isolated Yellow
+write work for up to three cycles. These are ceilings, not targets. Repeated
+Reviewer feedback that is not producing progress stops early. Every revision
+still creates a new immutable Attempt, Plan, Dispatch, and exact provider turn.
+Accepted or uncertain Dispatches are never resent.
+
+Red actions always require human approval. Trust Profiles cannot authorize a
+production publish, protected branch push or merge, consequential external
+message, credential change, purchase, important deletion, destructive
+production data change, or irreversible live system change.
+
+Needs Me reasons are classified as machine resolvable, operator resolvable, or
+terminal. AO may reconcile exact late results, clean known ephemeral output,
+refresh validated evidence, or restart stale runtime code when policy permits
+and no accepted provider work is active. Missing human judgment, ambiguous
+intent, unavailable resources, preview authentication, and Red authority still
+come to the operator with a concrete action. The escalation store suppresses a
+second unresolved record for the same Job, Attempt, and reason.
+
+AO Web exposes the effective Trust Profile and a compact Daily Driver summary.
+The metrics report Jobs, autonomous completions, human interventions, Worker
+executions, Reviewer revisions, recoveries, provider submissions, and time to
+result. They are operational counts, not user analytics.
+
+## Runtime freshness
+
+Before starting eligible work, AO compares the expected application revision
+and dynamic tool catalog with the running dedicated Orchestrator. Daily Driver
+may use the canonical lifecycle restart only when no running Attempt has a
+submitting, accepted, or uncertain Dispatch. Active or potentially accepted
+work produces Restart pending and is left alone. After restart, AO verifies the loaded revision and catalog before
+resuming durable work. A mismatch that cannot be resolved safely stops before
+new provider submission.
+
+## Authenticated preview sessions
+
+A Preview Profile may declare that human login is required. AO Web then offers
+Authenticate Preview, Verify Login, and Revoke Session actions. Authentication
+opens a visible controlled browser for the exact local Preview origin. The
+human completes login directly in that browser.
+
+Only safe metadata is durable: authentication session ID, Project, Preview
+Profile, exact origin, installation, state, timestamps, and expiry. Browser
+cookies, tokens, passwords, and storage remain in a restrictive node local
+directory. They never enter model context, tool output, evidence, logs, or
+Telegram. An expired, revoked, wrong Project, wrong profile, or wrong origin
+session fails closed. A valid session may be reused only for bounded evidence
+against that exact origin.
+
+Project, Job, Input, Browser Evidence, and Trust Profile identity do not contain
+personal machine paths. Repository and folder bindings, preview processes, and
+authenticated session secrets are installation local. This preserves future
+dedicated execution node placement without adding multi node coordination now.
+
+## Telegram notifications and replies
+
+The durable notification path sends once for a newly unresolved Needs Me
+escalation and once when an operator submitted Job completes. Worker,
 Reviewer, observation, repository-read, and turn-ID events are never sent.
 
 Configure dedicated Operator credentials in the ignored local file
@@ -192,18 +255,36 @@ reconciliation checks, and the Telegram dry-run do not notify. Durable delivery
 event keys allow one completion notification per completed Job and one Needs Me
 notification per escalation, including across reload/restart.
 
+When inbound Telegram polling is explicitly enabled for the dedicated
+Orchestrator, CortextOS routes a reply into that same persistent Orchestrator
+session and exact correlated turn path used by AO Web. Telegram transport owns
+no second AO transcript or Job state. The Orchestrator may query bounded AO
+state, persist guidance, authorize exactly one additional Worker execution, or
+open the human preview authentication flow through AO application tools.
+Ambiguous replies require clarification. Telegram text cannot approve a Red
+action or bypass durable AO authority. Redelivered Telegram updates use a
+deterministic conversation identity and create no duplicate provider turn.
+
 Telegram failure is delivery truth only: it is recorded as failed, is not
 automatically retried, creates no Needs Me item, and never changes Job,
 Escalation, Review, or orchestration truth. AO durable state remains
 authoritative whether Telegram is configured, unavailable, or rejected.
 
-## Fixed MVP safety defaults
+## Daily Driver development principle
+
+When a defect is narrow, well understood, low risk, generic, and covered by a
+deterministic regression, fix it, validate it, publish it, and continue the
+workflow. Use a new architecture decision only when domain or authority
+boundaries materially change.
+
+## Fixed capability boundaries
 
 - filesystem: `read-only`
 - network: `deny`
 - environment: `empty`
 - tools: bounded repository list/read/search only
-- automatic Worker executions: at most 2
+- autonomous Worker executions: 2 in Conservative, 5 for Green Daily Driver
+  work, and 3 for Yellow Daily Driver work
 - additional Worker executions: one per explicit durable human authorization
 - Reviewer passes: 1 per Worker Attempt
 - automatic completion: only after Reviewer `PASS`
@@ -283,11 +364,10 @@ stale, while AO Web rejects a running daemon that does not advertise the
 catalog required by the current application build. This makes an application
 restart requirement explicit instead of silently omitting newly added tools.
 
-Phase 27B does not consolidate Telegram. Existing AO notification intent and
-deduplication remain unchanged. A later phase can route Telegram inbound and
-outbound through this same CortextOS Orchestrator while keeping AO action
-authority. Preview, visual review, and Approve and Publish remain separate
-follow on capabilities.
+Daily Driver routes Telegram replies through this same CortextOS Orchestrator
+while retaining AO notification intent, deduplication, and action authority.
+Preview, visual review, and Approve and Publish remain separate authority
+boundaries.
 
 ## Projects and Inputs
 
