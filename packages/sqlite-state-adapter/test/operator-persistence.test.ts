@@ -71,6 +71,68 @@ async function seed(store: SqliteAgentOperationsStateStore) {
 }
 
 describe('daily Operator persistence', () => {
+  it('persists immutable Red action receipts and deterministic Job verification', async () => {
+    const databasePath = path();
+    const store = open(databasePath);
+    const job = await seed(store);
+    const bindingId = createRepositoryCheckoutBindingId(INSTALLATION_ID, '/repo');
+    const action = {
+      id: 'repository-restore:receipt', projectId: PROJECT_ID, repositoryId: REPOSITORY_ID,
+      checkoutBindingId: bindingId, state: 'pending-approval' as const,
+      preconditions: {
+        repositoryId: REPOSITORY_ID, checkoutBindingId: bindingId, canonicalPath: '/repo',
+        branch: 'main', headRevision: 'a'.repeat(40),
+        restorePaths: [{ path: 'main.py', indexStatus: 'unmodified' as const, worktreeStatus: 'modified' as const, workingTreeSha256: 'b'.repeat(64), headSha256: 'c'.repeat(64) }],
+        preserveUntrackedPaths: [{ path: 'PLAN.md', sha256: 'd'.repeat(64) }],
+        statusEntries: [], evidenceHash: 'e'.repeat(64),
+      },
+      approvalSummary: 'Restore main.py and preserve PLAN.md.', requestedBy: 'operator',
+      createdAt: TIME, revision: 0,
+    };
+    await store.createRepositoryRestoreAction(action);
+    const approved = { ...action, state: 'approved' as const, approvedAt: TIME, approvedBy: 'operator', revision: 1 };
+    await store.saveRepositoryRestoreActionTransition(approved, 0);
+    await store.saveRepositoryRestoreActionTransition({
+      ...approved, state: 'completed', revision: 2,
+      result: { beforeEvidenceHash: 'e'.repeat(64), afterEvidenceHash: 'f'.repeat(64), restoredPaths: ['main.py'], preservedUntrackedPaths: [{ path: 'PLAN.md', sha256: 'd'.repeat(64) }], completedAt: TIME },
+    }, 1);
+    const receipt = {
+      actionId: action.id, operation: 'repository.restore_tracked_paths' as const,
+      projectId: PROJECT_ID, repositoryId: REPOSITORY_ID, checkoutBindingId: bindingId,
+      approvedPaths: ['main.py'], approvedBy: 'operator', approvedAt: TIME,
+      executedAt: TIME, recordedAt: TIME, evidenceSource: 'captured-during-execution' as const,
+      branchBefore: 'main', branchAfter: 'main', headBefore: 'a'.repeat(40), headAfter: 'a'.repeat(40),
+      approvedFileHashesBefore: [{ path: 'main.py', sha256: 'b'.repeat(64) }],
+      restoredFileHashesAfter: [{ path: 'main.py', sha256: 'c'.repeat(64) }],
+      preservedUntrackedFileHashesBefore: [{ path: 'PLAN.md', sha256: 'd'.repeat(64) }],
+      preservedUntrackedFileHashesAfter: [{ path: 'PLAN.md', sha256: 'd'.repeat(64) }],
+      finalStatus: [{ path: 'PLAN.md', indexStatus: 'unmodified' as const, worktreeStatus: 'untracked' as const }],
+      beforeEvidenceHash: 'e'.repeat(64), afterEvidenceHash: 'f'.repeat(64),
+      commitPerformed: false as const, pushPerformed: false as const, deployPerformed: false as const,
+      verificationResult: 'passed' as const,
+    };
+    await store.createRepositoryRestoreExecutionReceipt(receipt);
+    const verification = {
+      id: 'deterministic-verification:receipt', jobId: job.id, actionId: action.id,
+      projectId: PROJECT_ID, repositoryId: REPOSITORY_ID, checkoutBindingId: bindingId,
+      verifiedAt: TIME, verifiedBy: 'application:test', branch: 'main', headRevision: 'a'.repeat(40),
+      statusEntries: receipt.finalStatus, cleanPaths: ['main.py'],
+      preservedUntrackedFiles: receipt.preservedUntrackedFileHashesAfter,
+      commitPerformed: false as const, pushPerformed: false as const, deployPerformed: false as const,
+      providerRuntimeRequired: false as const, providerSubmissionsCreated: 0 as const,
+      result: 'passed' as const, summary: 'Exact repository facts verified.',
+    };
+    await store.createDeterministicRepositoryVerification(verification);
+    await store.close();
+
+    const reopened = open(databasePath);
+    expect(await reopened.getRepositoryRestoreExecutionReceipt(action.id)).toEqual(receipt);
+    expect(await reopened.getDeterministicRepositoryVerification(job.id)).toEqual(verification);
+    await expect(reopened.createRepositoryRestoreExecutionReceipt({ ...receipt, recordedAt: 'later' }))
+      .rejects.toThrow(/immutable/);
+    await reopened.close();
+  });
+
   it('atomically records a late-completion resolution and resumes the same Operator Run', async () => {
     const store = open(path());
     const job = await seed(store);

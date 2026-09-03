@@ -53,6 +53,8 @@ export type {
   ExecutionRuntimeReadinessReport,
   DurableJobRetirement,
   DurableRepositoryRestoreAction,
+  RepositoryRestoreExecutionReceipt,
+  DurableDeterministicRepositoryVerification,
   JobRetirementDisposition,
 } from './types.js';
 export { OrchestratorConversationApplicationService } from './orchestrator-conversation-service.js';

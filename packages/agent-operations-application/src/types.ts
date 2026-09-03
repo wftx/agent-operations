@@ -34,6 +34,9 @@ import type {
   ExecutionRuntimeReadinessReport,
   DurableJobRetirement,
   DurableRepositoryRestoreAction,
+  RepositoryRestoreExecutionReceipt,
+  DurableDeterministicRepositoryVerification,
+  RepositoryFileHashEvidence,
   JobRetirementDisposition,
 } from '../../agent-operations-contracts/src/index.js';
 
@@ -44,6 +47,8 @@ export type {
   RuntimeStartResult,
   DurableJobRetirement,
   DurableRepositoryRestoreAction,
+  RepositoryRestoreExecutionReceipt,
+  DurableDeterministicRepositoryVerification,
   JobRetirementDisposition,
 } from '../../agent-operations-contracts/src/index.js';
 
@@ -246,6 +251,7 @@ export interface OperatorJobDetail {
   readonly authenticatedPreviewSession?: DurableAuthenticatedPreviewSession;
   readonly retirementAllowed?: boolean;
   readonly retirementReasons?: readonly string[];
+  readonly deterministicVerification?: DurableDeterministicRepositoryVerification;
 }
 
 export interface EffectiveTrustProfile {
@@ -356,6 +362,18 @@ export interface OperatorApplication {
     readonly expectedHead?: string;
   }): Promise<DurableRepositoryRestoreAction>;
   approveAndExecuteRepositoryRestore?(id: string, approvedBy: string): Promise<DurableRepositoryRestoreAction>;
+  getRepositoryRestoreExecutionReceipt?(id: string): Promise<RepositoryRestoreExecutionReceipt | null>;
+  reconcileRepositoryRestoreExecutionReceipt?(id: string): Promise<RepositoryRestoreExecutionReceipt>;
+  verifyRepositoryRestoreResult?(input: {
+    readonly jobId: string;
+    readonly actionId: string;
+    readonly expectedBranch: string;
+    readonly expectedHead: string;
+    readonly cleanPaths: readonly string[];
+    readonly preservedUntrackedFiles: readonly RepositoryFileHashEvidence[];
+    readonly requireExactStatus?: boolean;
+    readonly verifiedBy: string;
+  }): Promise<DurableDeterministicRepositoryVerification>;
   listJobs(filter?: OperatorJobList): Promise<readonly OperatorJobSummary[]>;
   getJobDetail(jobId: string): Promise<OperatorJobDetail>;
 }

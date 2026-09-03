@@ -71,6 +71,8 @@ import type {
   DurableJobRetirement,
   JobRetirementDisposition,
   DurableRepositoryRestoreAction,
+  RepositoryRestoreExecutionReceipt,
+  DurableDeterministicRepositoryVerification,
   RepositoryRestoreState,
 } from '../../agent-operations-contracts/src/index.js';
 import {
@@ -447,6 +449,9 @@ interface RepositoryRestoreActionRow {
   failure_reason: string | null;
   revision: number;
 }
+
+interface RepositoryRestoreReceiptRow { receipt_json: string; }
+interface DeterministicRepositoryVerificationRow { verification_json: string; }
 
 interface AttemptReviewRow {
   id: string;
@@ -1105,7 +1110,7 @@ function isValidDispatchTransition(from: DispatchStatus, to: DispatchStatus): bo
 function isValidOperatorRunTransition(from: OperatorRunStatus, to: OperatorRunStatus): boolean {
   return from === 'pending' && (to === 'running' || to === 'failed')
     || from === 'running' && (to === 'completed' || to === 'needs_human' || to === 'failed')
-    || from === 'needs_human' && (to === 'pending' || to === 'cancelled');
+    || from === 'needs_human' && (to === 'pending' || to === 'completed' || to === 'cancelled');
 }
 
 function isValidRepositoryWorkspaceTransition(
@@ -1165,6 +1170,7 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
   private readonly supportsDailyDriverTrust: boolean;
   private readonly supportsAuthenticatedPreview: boolean;
   private readonly supportsJobRetirementAndRestore: boolean;
+  private readonly supportsRedActionReceipts: boolean;
 
   private constructor(databasePath: string, database: Database.Database) {
     this.databasePath = databasePath;
@@ -1207,6 +1213,9 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     ).get() as unknown) !== undefined;
     this.supportsJobRetirementAndRestore = (database.prepare(
       "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'job_retirements'",
+    ).get() as unknown) !== undefined;
+    this.supportsRedActionReceipts = (database.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'repository_restore_execution_receipts'",
     ).get() as unknown) !== undefined;
   }
 
@@ -2171,6 +2180,72 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
       action.revision, action.id, expectedRevision,
     );
     if (result.changes !== 1) throw new Error(`Repository Restore transition conflict: ${action.id}`);
+  }
+
+  async createRepositoryRestoreExecutionReceipt(receipt: RepositoryRestoreExecutionReceipt): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsRedActionReceipts) throw new Error('Red action receipts require Agent Operations schema v19');
+    const action = await this.getRepositoryRestoreAction(receipt.actionId);
+    if (!action || action.projectId !== receipt.projectId || action.repositoryId !== receipt.repositoryId
+      || action.checkoutBindingId !== receipt.checkoutBindingId) {
+      throw new Error(`Invalid Repository Restore receipt associations: ${receipt.actionId}`);
+    }
+    const existing = await this.getRepositoryRestoreExecutionReceipt(receipt.actionId);
+    if (existing) {
+      if (JSON.stringify(existing) !== JSON.stringify(receipt)) {
+        throw new Error(`Repository Restore receipt is immutable: ${receipt.actionId}`);
+      }
+      return;
+    }
+    this.database.prepare(`
+      INSERT INTO repository_restore_execution_receipts (action_id, receipt_json) VALUES (?, ?)
+    `).run(receipt.actionId, JSON.stringify(receipt));
+  }
+
+  async getRepositoryRestoreExecutionReceipt(actionId: string): Promise<RepositoryRestoreExecutionReceipt | null> {
+    this.assertOpen();
+    if (!this.supportsRedActionReceipts) return null;
+    const row = this.database.prepare(
+      'SELECT receipt_json FROM repository_restore_execution_receipts WHERE action_id = ?',
+    ).get(actionId) as RepositoryRestoreReceiptRow | undefined;
+    return row ? JSON.parse(row.receipt_json) as RepositoryRestoreExecutionReceipt : null;
+  }
+
+  async createDeterministicRepositoryVerification(
+    verification: DurableDeterministicRepositoryVerification,
+  ): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsRedActionReceipts) throw new Error('Deterministic verification requires Agent Operations schema v19');
+    const job = await this.getJob(verification.jobId);
+    const action = await this.getRepositoryRestoreAction(verification.actionId);
+    if (!job || !action || job.projectId !== verification.projectId
+      || job.repositoryId !== verification.repositoryId
+      || action.checkoutBindingId !== verification.checkoutBindingId) {
+      throw new Error(`Invalid deterministic verification associations: ${verification.id}`);
+    }
+    const existing = await this.getDeterministicRepositoryVerification(verification.jobId);
+    if (existing) {
+      if (JSON.stringify(existing) !== JSON.stringify(verification)) {
+        throw new Error(`Deterministic verification is immutable for Job ${verification.jobId}`);
+      }
+      return;
+    }
+    this.database.prepare(`
+      INSERT INTO deterministic_repository_verifications
+        (job_id, verification_id, action_id, verification_json)
+      VALUES (?, ?, ?, ?)
+    `).run(verification.jobId, verification.id, verification.actionId, JSON.stringify(verification));
+  }
+
+  async getDeterministicRepositoryVerification(
+    jobId: string,
+  ): Promise<DurableDeterministicRepositoryVerification | null> {
+    this.assertOpen();
+    if (!this.supportsRedActionReceipts) return null;
+    const row = this.database.prepare(
+      'SELECT verification_json FROM deterministic_repository_verifications WHERE job_id = ?',
+    ).get(jobId) as DeterministicRepositoryVerificationRow | undefined;
+    return row ? JSON.parse(row.verification_json) as DurableDeterministicRepositoryVerification : null;
   }
 
   async createJob(job: DurableJob): Promise<void> {

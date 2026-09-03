@@ -56,6 +56,7 @@ export interface CortextOSRuntimeLifecycleAdapterOptions {
     options: { readonly cwd: string; readonly env: NodeJS.ProcessEnv; readonly stdoutFd: number; readonly stderrFd: number },
   ) => SpawnedRuntimeProcess;
   readonly isProcessAlive?: (pid: number) => boolean;
+  readonly signalProcess?: (pid: number, signal: NodeJS.Signals) => void;
   readonly sendAgentCommand?: (
     agentName: string,
   ) => Promise<{ readonly success: boolean; readonly error?: string }>;
@@ -74,6 +75,7 @@ export class CortextOSRuntimeLifecycleAdapter implements RuntimeLifecycleAdapter
   private readonly codexCandidates: readonly string[];
   private readonly spawnProcess: NonNullable<CortextOSRuntimeLifecycleAdapterOptions['spawnProcess']>;
   private readonly isProcessAlive: (pid: number) => boolean;
+  private readonly signalProcess: (pid: number, signal: NodeJS.Signals) => void;
   private readonly sendAgentCommand: NonNullable<CortextOSRuntimeLifecycleAdapterOptions['sendAgentCommand']>;
   private startInFlight: Promise<RuntimeStartResult> | null = null;
   private restartInFlight: Promise<RuntimeStartResult> | null = null;
@@ -99,6 +101,7 @@ export class CortextOSRuntimeLifecycleAdapter implements RuntimeLifecycleAdapter
     this.codexCandidates = options.codexCandidates ?? DEFAULT_CODEX_CANDIDATES;
     this.spawnProcess = options.spawnProcess ?? spawnRuntimeProcess;
     this.isProcessAlive = options.isProcessAlive ?? defaultIsProcessAlive;
+    this.signalProcess = options.signalProcess ?? ((pid, signal) => process.kill(pid, signal));
     this.sendAgentCommand = options.sendAgentCommand
       ?? (agentName => sendStartAgent(this.instanceId, this.ctxRoot, agentName));
   }
@@ -220,24 +223,29 @@ export class CortextOSRuntimeLifecycleAdapter implements RuntimeLifecycleAdapter
     const inventory = this.readInventory(agents);
     const cliPath = join(this.frameworkRoot, 'dist', 'cli.js');
     if (!existsSync(cliPath)) return this.failed(inventory, 'CortextOS is not built.', `Missing canonical startup entry: ${cliPath}`);
-    if (this.readLiveOwner()) {
-      const stopped = spawnSync(process.execPath, [cliPath, 'stop', '--instance', this.instanceId], {
-        cwd: this.frameworkRoot,
-        env: { ...this.environment, CTX_INSTANCE_ID: this.instanceId, CTX_ROOT: this.ctxRoot },
-        encoding: 'utf8',
-        timeout: this.readinessTimeoutMs,
-      });
-      if (stopped.status !== 0) {
+    const owner = this.readLiveOwner();
+    if (owner) {
+      const health = await this.runtime.getHealth().catch(() => null);
+      if (health?.state !== 'available') {
         return this.failed(
           inventory,
-          'Runtime could not be stopped cleanly.',
-          boundedDiagnostic(stopped.stderr || stopped.stdout || 'Canonical stop command failed.'),
+          'Runtime ownership could not be proven safe to stop.',
+          `Ownership records PID ${owner.pid}, but the daemon IPC health check is unavailable.`,
         );
+      }
+      try {
+        this.signalProcess(owner.pid, 'SIGTERM');
+      } catch (error) {
+        return this.failed(inventory, 'Runtime could not be stopped cleanly.', boundedDiagnostic(errorMessage(error)));
       }
       const deadline = Date.now() + this.readinessTimeoutMs;
       while (Date.now() < deadline && this.readLiveOwner()) await this.sleep(this.readinessIntervalMs);
       if (this.readLiveOwner()) {
-        return this.failed(inventory, 'Runtime stop did not settle.', 'The canonical owner remained live after the bounded stop window.');
+        return this.failed(
+          inventory,
+          'Runtime stop did not settle.',
+          'The proven canonical owner remained live after SIGTERM and the bounded stop window. No force signal was sent.',
+        );
       }
     }
     return this.start();

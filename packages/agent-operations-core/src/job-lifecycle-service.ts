@@ -126,9 +126,10 @@ export class JobLifecycleService {
     if (attempts.some(attempt => isActiveAttemptStatus(attempt.status))) {
       throw new Error(`Job ${job.id} cannot complete while an attempt is active`);
     }
+    const deterministic = await this.store.getDeterministicRepositoryVerification(job.id);
     if (!attempts.some(attempt => attempt.executionRole === 'worker'
-      && attempt.status === 'completed')) {
-      throw new Error(`Job ${job.id} requires a completed attempt from the Worker role before completion`);
+      && attempt.status === 'completed') && deterministic?.result !== 'passed') {
+      throw new Error(`Job ${job.id} requires a completed attempt from the Worker role or passed deterministic verification before completion`);
     }
     return this.transitionJob(job, 'completed');
   }

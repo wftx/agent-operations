@@ -333,6 +333,16 @@ Restoring exact tracked files in a primary checkout is a separate Red action.
 AO records branch, HEAD, Git status, file hashes, and the exact path list before
 requesting human approval. The operation fails closed if any bound precondition
 changes and never deletes untracked files or exposes broad Git cleanup commands.
+After execution, AO preserves an immutable receipt containing approval identity,
+before and after hashes, final Git status, and explicit commit, push, and deploy
+effects. Completed actions that predate receipts can be reconciled only while
+their current repository evidence still exactly matches the recorded result.
+
+Exact factual verification can use this receipt and the bounded repository
+adapter directly. Branch, HEAD, status classification, and file hashes do not
+require a provider runtime. A Job may complete through this path only when its
+criteria are fully expressed as exact repository assertions. Semantic review
+continues to use the Worker and Reviewer model.
 
 There is no automatic merge, same repository concurrent write execution,
 interactive Telegram approval, production authentication, or remote deployment

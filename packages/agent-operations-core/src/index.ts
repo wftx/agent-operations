@@ -69,3 +69,7 @@ export {
 } from './repository-workspace-service.js';
 export { JobRetirementService, type JobRetirementAssessment } from './job-retirement-service.js';
 export { RepositoryRestoreService } from './repository-restore-service.js';
+export {
+  DeterministicRepositoryVerificationService,
+  type DeterministicRepositoryVerificationInput,
+} from './deterministic-repository-verification-service.js';

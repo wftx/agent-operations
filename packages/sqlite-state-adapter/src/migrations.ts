@@ -24,7 +24,8 @@ export const PREVIEW_BROWSER_EVIDENCE_SCHEMA_VERSION = 15;
 export const DAILY_DRIVER_TRUST_SCHEMA_VERSION = 16;
 export const AUTHENTICATED_PREVIEW_SCHEMA_VERSION = 17;
 export const JOB_RETIREMENT_AND_RESTORE_SCHEMA_VERSION = 18;
-export const CURRENT_SCHEMA_VERSION = JOB_RETIREMENT_AND_RESTORE_SCHEMA_VERSION;
+export const RED_ACTION_RECEIPT_AND_DETERMINISTIC_VERIFICATION_SCHEMA_VERSION = 19;
+export const CURRENT_SCHEMA_VERSION = RED_ACTION_RECEIPT_AND_DETERMINISTIC_VERIFICATION_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -877,6 +878,20 @@ const JOB_RETIREMENT_AND_RESTORE_SCHEMA_SQL = `
     ON repository_restore_actions(state, created_at, id);
 `;
 
+const RED_ACTION_RECEIPT_AND_DETERMINISTIC_VERIFICATION_SCHEMA_SQL = `
+  CREATE TABLE repository_restore_execution_receipts (
+    action_id TEXT PRIMARY KEY REFERENCES repository_restore_actions(id),
+    receipt_json TEXT NOT NULL
+  );
+
+  CREATE TABLE deterministic_repository_verifications (
+    job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+    verification_id TEXT NOT NULL UNIQUE,
+    action_id TEXT NOT NULL REFERENCES repository_restore_actions(id),
+    verification_json TEXT NOT NULL
+  );
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -967,6 +982,11 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: JOB_RETIREMENT_AND_RESTORE_SCHEMA_VERSION,
     name: 'job-retirement-and-selective-restore',
     up: database => database.exec(JOB_RETIREMENT_AND_RESTORE_SCHEMA_SQL),
+  },
+  {
+    version: RED_ACTION_RECEIPT_AND_DETERMINISTIC_VERIFICATION_SCHEMA_VERSION,
+    name: 'red-action-receipts-and-deterministic-verification',
+    up: database => database.exec(RED_ACTION_RECEIPT_AND_DETERMINISTIC_VERIFICATION_SCHEMA_SQL),
   },
 ];
 

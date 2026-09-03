@@ -150,6 +150,57 @@ describe('CortextOSRuntimeLifecycleAdapter', () => {
     expect(spawnProcess).toHaveBeenCalledTimes(1);
   });
 
+  it('restarts by signaling only the live owner proven by ownership and daemon health', async () => {
+    const fixture = setup();
+    fixture.runtime.ready = true;
+    const ownerDirectory = join(fixture.options.ctxRoot, 'daemon.owner');
+    mkdirSync(ownerDirectory, { recursive: true });
+    writeFileSync(join(ownerDirectory, 'owner.json'), JSON.stringify({
+      version: 1, instanceId: 'default', pid: 91, token: 'owner-token', startedAt: '2026-08-28T00:00:00.000Z',
+    }));
+    let alive = true;
+    const signalProcess = vi.fn((pid: number, signal: NodeJS.Signals) => {
+      expect(pid).toBe(91);
+      expect(signal).toBe('SIGTERM');
+      alive = false;
+      fixture.runtime.ready = false;
+    });
+    const child = new FakeChild();
+    const adapter = new CortextOSRuntimeLifecycleAdapter({
+      ...fixture.options,
+      runtime: fixture.runtime,
+      isProcessAlive: () => alive,
+      signalProcess,
+      spawnProcess: vi.fn(() => child),
+      readinessIntervalMs: 0,
+      sleep: async () => { fixture.runtime.ready = true; },
+    });
+
+    await expect(adapter.restart()).resolves.toMatchObject({ status: 'started', daemonPid: 44 });
+    expect(signalProcess).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses to signal a recorded PID when daemon health cannot prove ownership', async () => {
+    const fixture = setup();
+    const ownerDirectory = join(fixture.options.ctxRoot, 'daemon.owner');
+    mkdirSync(ownerDirectory, { recursive: true });
+    writeFileSync(join(ownerDirectory, 'owner.json'), JSON.stringify({
+      version: 1, instanceId: 'default', pid: 91, token: 'owner-token', startedAt: '2026-08-28T00:00:00.000Z',
+    }));
+    const signalProcess = vi.fn();
+    const adapter = new CortextOSRuntimeLifecycleAdapter({
+      ...fixture.options,
+      runtime: fixture.runtime,
+      isProcessAlive: () => true,
+      signalProcess,
+    });
+
+    await expect(adapter.restart()).resolves.toMatchObject({
+      status: 'failed', message: 'Runtime ownership could not be proven safe to stop.',
+    });
+    expect(signalProcess).not.toHaveBeenCalled();
+  });
+
   it('atomically enables and starts an execution only agent without activating Telegram or schedules', async () => {
     const fixture = setup();
     fixture.runtime.enabled = false;

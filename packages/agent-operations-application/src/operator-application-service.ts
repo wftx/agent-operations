@@ -8,6 +8,8 @@ import type {
   DurableOperatorRun,
   DurableJobRetirement,
   DurableRepositoryRestoreAction,
+  RepositoryRestoreExecutionReceipt,
+  DurableDeterministicRepositoryVerification,
   JobRetirementDisposition,
 } from '../../agent-operations-contracts/src/index.js';
 import {
@@ -31,6 +33,7 @@ import {
   JobLifecycleService,
   JobRetirementService,
   RepositoryRestoreService,
+  DeterministicRepositoryVerificationService,
   DEFAULT_GLOBAL_ACTIVE_REPOSITORY_WORKSPACE_LIMIT,
   isActiveRepositoryWorkspace,
   MVP_MAX_WORKER_ATTEMPTS,
@@ -83,6 +86,7 @@ export interface OperatorApplicationServiceOptions {
   readonly runtimeFreshness?: RuntimeFreshnessApplication;
   readonly jobRetirement?: JobRetirementService;
   readonly repositoryRestore?: RepositoryRestoreService;
+  readonly deterministicVerification?: DeterministicRepositoryVerificationService;
 }
 
 export const OPERATOR_READ_ONLY_DEFAULTS: OperatorPolicyDefaults = {
@@ -121,6 +125,7 @@ export class OperatorApplicationService implements OperatorApplication {
   private readonly runtimeFreshness?: RuntimeFreshnessApplication;
   private readonly jobRetirement?: JobRetirementService;
   private readonly repositoryRestore?: RepositoryRestoreService;
+  private readonly deterministicVerification?: DeterministicRepositoryVerificationService;
   private reconciliationPromise: Promise<void> | null = null;
 
   constructor(
@@ -142,6 +147,7 @@ export class OperatorApplicationService implements OperatorApplication {
     this.runtimeFreshness = options.runtimeFreshness;
     this.jobRetirement = options.jobRetirement;
     this.repositoryRestore = options.repositoryRestore;
+    this.deterministicVerification = options.deterministicVerification;
     this.runner = new OperatorRunner(store, orchestration, {
       now: this.now,
       ...(options.notifier ? { notifier: options.notifier } : {}),
@@ -578,6 +584,23 @@ export class OperatorApplicationService implements OperatorApplication {
     return this.repositoryRestore.approveAndExecute(id, approvedBy);
   }
 
+  async getRepositoryRestoreExecutionReceipt(id: string): Promise<RepositoryRestoreExecutionReceipt | null> {
+    if (!this.repositoryRestore) throw new Error('Repository Restore is not configured');
+    return this.repositoryRestore.getExecutionReceipt(id);
+  }
+
+  async reconcileRepositoryRestoreExecutionReceipt(id: string): Promise<RepositoryRestoreExecutionReceipt> {
+    if (!this.repositoryRestore) throw new Error('Repository Restore is not configured');
+    return this.repositoryRestore.reconcileCompletedExecutionReceipt(id);
+  }
+
+  async verifyRepositoryRestoreResult(
+    input: Parameters<DeterministicRepositoryVerificationService['verifyAndComplete']>[0],
+  ): Promise<DurableDeterministicRepositoryVerification> {
+    if (!this.deterministicVerification) throw new Error('Deterministic repository verification is not configured');
+    return this.deterministicVerification.verifyAndComplete(input);
+  }
+
   async getJobDetail(jobId: string): Promise<OperatorJobDetail> {
     const job = await this.store.getJob(required(jobId, 'Job ID'));
     if (!job) throw new Error(`Job not found: ${jobId}`);
@@ -617,6 +640,7 @@ export class OperatorApplicationService implements OperatorApplication {
         ...(value.projectId ? { projectId: value.projectId } : {}),
         createdAt: value.createdAt,
       }));
+    const deterministicVerification = await this.store.getDeterministicRepositoryVerification(job.id);
     const escalationActions = Object.fromEntries(await Promise.all(escalations.map(async escalation => [
       escalation.id,
       await this.actionsForEscalation(escalation, attempts),
@@ -652,6 +676,7 @@ export class OperatorApplicationService implements OperatorApplication {
       ...(previewProfile ? { previewProfile } : {}),
       ...(browserEvidence.length ? { browserEvidence } : {}),
       ...(authenticatedPreviewSession ? { authenticatedPreviewSession } : {}),
+      ...(deterministicVerification ? { deterministicVerification } : {}),
     };
   }
 

@@ -22,6 +22,7 @@ import {
   renderNewProject,
   renderTrustProfiles,
   renderApprovals,
+  renderRepositoryRestoreDetail,
 } from './render.js';
 
 export class OperatorWebApplication {
@@ -168,6 +169,16 @@ export class OperatorWebApplication {
       if (request.method === 'GET' && url.pathname === '/approvals') {
         return html(renderApprovals(this.application.listRepositoryRestoreActions
           ? await this.application.listRepositoryRestoreActions() : []));
+      }
+      const restoreDetail = url.pathname.match(/^\/repository-restores\/([^/]+)$/);
+      if (request.method === 'GET' && restoreDetail) {
+        const id = decodeURIComponent(restoreDetail[1]);
+        const action = (await (this.application.listRepositoryRestoreActions?.() ?? Promise.resolve([])))
+          .find(candidate => candidate.id === id);
+        if (!action) return html(renderError('Repository Restore action not found', 404), 404);
+        const receipt = this.application.getRepositoryRestoreExecutionReceipt
+          ? await this.application.getRepositoryRestoreExecutionReceipt(id) : null;
+        return html(renderRepositoryRestoreDetail(action, receipt));
       }
       if (request.method === 'GET' && url.pathname === '/needs-me') {
         const jobs = await this.application.listJobs('needs-human');

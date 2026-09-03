@@ -41,7 +41,12 @@ import type {
 } from '../preview.js';
 import type { DurableTrustProfile } from '../trust.js';
 import { validateTrustProfile } from '../trust.js';
-import type { DurableJobRetirement, DurableRepositoryRestoreAction } from '../lifecycle.js';
+import type {
+  DurableDeterministicRepositoryVerification,
+  DurableJobRetirement,
+  DurableRepositoryRestoreAction,
+  RepositoryRestoreExecutionReceipt,
+} from '../lifecycle.js';
 
 export type InMemoryStateStoreOperation =
   | 'get-installation'
@@ -64,6 +69,8 @@ export type InMemoryStateStoreOperation =
   | 'write-operator-notification'
   | 'write-job-retirement'
   | 'write-repository-restore'
+  | 'write-repository-restore-receipt'
+  | 'write-deterministic-verification'
   | 'close';
 
 export interface InMemoryAgentOperationsStateStoreOptions {
@@ -194,6 +201,29 @@ function copyRepositoryRestoreAction(value: DurableRepositoryRestoreAction): Dur
   };
 }
 
+function copyRepositoryRestoreReceipt(value: RepositoryRestoreExecutionReceipt): RepositoryRestoreExecutionReceipt {
+  return {
+    ...value,
+    approvedPaths: [...value.approvedPaths],
+    approvedFileHashesBefore: value.approvedFileHashesBefore.map(item => ({ ...item })),
+    restoredFileHashesAfter: value.restoredFileHashesAfter.map(item => ({ ...item })),
+    preservedUntrackedFileHashesBefore: value.preservedUntrackedFileHashesBefore.map(item => ({ ...item })),
+    preservedUntrackedFileHashesAfter: value.preservedUntrackedFileHashesAfter.map(item => ({ ...item })),
+    finalStatus: value.finalStatus.map(item => ({ ...item })),
+  };
+}
+
+function copyDeterministicVerification(
+  value: DurableDeterministicRepositoryVerification,
+): DurableDeterministicRepositoryVerification {
+  return {
+    ...value,
+    statusEntries: value.statusEntries.map(item => ({ ...item })),
+    cleanPaths: [...value.cleanPaths],
+    preservedUntrackedFiles: value.preservedUntrackedFiles.map(item => ({ ...item })),
+  };
+}
+
 function copyAttempt(value: DurableJobAttempt): DurableJobAttempt {
   return { ...value };
 }
@@ -317,6 +347,8 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   private readonly repositoryWorkspaces = new Map<string, DurableRepositoryWorkspace>();
   private readonly jobRetirements = new Map<string, DurableJobRetirement>();
   private readonly repositoryRestoreActions = new Map<string, DurableRepositoryRestoreAction>();
+  private readonly repositoryRestoreReceipts = new Map<string, RepositoryRestoreExecutionReceipt>();
+  private readonly deterministicVerifications = new Map<string, DurableDeterministicRepositoryVerification>();
   private readonly jobs = new Map<string, DurableJob>();
   private readonly attempts = new Map<string, DurableJobAttempt>();
   private readonly executionPlans = new Map<string, DurableExecutionPlan>();
@@ -906,6 +938,58 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
       throw new Error(`Repository Restore cannot transition from ${existing.state} to ${action.state}`);
     }
     this.repositoryRestoreActions.set(action.id, copyRepositoryRestoreAction(action));
+  }
+
+  async createRepositoryRestoreExecutionReceipt(receipt: RepositoryRestoreExecutionReceipt): Promise<void> {
+    this.assertAvailable('write-repository-restore-receipt');
+    const action = this.repositoryRestoreActions.get(receipt.actionId);
+    if (!action || action.projectId !== receipt.projectId || action.repositoryId !== receipt.repositoryId
+      || action.checkoutBindingId !== receipt.checkoutBindingId) {
+      throw new Error(`Invalid Repository Restore receipt associations: ${receipt.actionId}`);
+    }
+    const existing = this.repositoryRestoreReceipts.get(receipt.actionId);
+    if (existing) {
+      if (JSON.stringify(existing) !== JSON.stringify(receipt)) {
+        throw new Error(`Repository Restore receipt is immutable: ${receipt.actionId}`);
+      }
+      return;
+    }
+    this.repositoryRestoreReceipts.set(receipt.actionId, copyRepositoryRestoreReceipt(receipt));
+  }
+
+  async getRepositoryRestoreExecutionReceipt(actionId: string): Promise<RepositoryRestoreExecutionReceipt | null> {
+    this.assertAvailable('read');
+    const value = this.repositoryRestoreReceipts.get(actionId);
+    return value ? copyRepositoryRestoreReceipt(value) : null;
+  }
+
+  async createDeterministicRepositoryVerification(
+    verification: DurableDeterministicRepositoryVerification,
+  ): Promise<void> {
+    this.assertAvailable('write-deterministic-verification');
+    const job = this.jobs.get(verification.jobId);
+    const action = this.repositoryRestoreActions.get(verification.actionId);
+    if (!job || !action || job.projectId !== verification.projectId
+      || job.repositoryId !== verification.repositoryId
+      || action.checkoutBindingId !== verification.checkoutBindingId) {
+      throw new Error(`Invalid deterministic verification associations: ${verification.id}`);
+    }
+    const existing = this.deterministicVerifications.get(verification.jobId);
+    if (existing) {
+      if (JSON.stringify(existing) !== JSON.stringify(verification)) {
+        throw new Error(`Deterministic verification is immutable for Job ${verification.jobId}`);
+      }
+      return;
+    }
+    this.deterministicVerifications.set(verification.jobId, copyDeterministicVerification(verification));
+  }
+
+  async getDeterministicRepositoryVerification(
+    jobId: string,
+  ): Promise<DurableDeterministicRepositoryVerification | null> {
+    this.assertAvailable('read');
+    const value = this.deterministicVerifications.get(jobId);
+    return value ? copyDeterministicVerification(value) : null;
   }
 
   async createJob(job: DurableJob): Promise<void> {
@@ -1598,7 +1682,7 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
 function isValidOperatorRunTransition(from: string, to: string): boolean {
   return from === 'pending' && (to === 'running' || to === 'failed')
     || from === 'running' && ['completed', 'needs_human', 'failed'].includes(to)
-    || from === 'needs_human' && (to === 'pending' || to === 'cancelled');
+    || from === 'needs_human' && (to === 'pending' || to === 'completed' || to === 'cancelled');
 }
 
 function validAuthTransition(from: string, to: string): boolean {

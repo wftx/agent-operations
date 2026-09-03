@@ -16,6 +16,7 @@ import {
 import { GitRepositoryRestoreAdapter } from '../../git-adapter/src/index.js';
 import {
   JobLifecycleService,
+  DeterministicRepositoryVerificationService,
   JobRetirementService,
   RepositoryRestoreService,
   RepositoryWorkspaceService,
@@ -125,12 +126,79 @@ describe('Daily Driver lifecycle cleanup', () => {
     const action = await service.prepare(request);
     const completed = await service.approveAndExecute(action.id, 'operator');
     expect(completed).toMatchObject({ state: 'completed', approvedBy: 'operator' });
+    const receipt = await service.getExecutionReceipt(action.id);
+    expect(receipt).toMatchObject({
+      actionId: action.id,
+      projectId: 'project:roger',
+      branchBefore: 'main',
+      branchAfter: 'main',
+      headBefore: inspected.headRevision,
+      headAfter: inspected.headRevision,
+      approvedPaths: ['main.py', 'synology_client.py'],
+      commitPerformed: false,
+      pushPerformed: false,
+      deployPerformed: false,
+      verificationResult: 'passed',
+    });
+    expect(receipt?.restoredFileHashesAfter).toEqual(action.preconditions.restorePaths.map(item => ({
+      path: item.path, sha256: item.headSha256,
+    })));
+    expect(receipt?.preservedUntrackedFileHashesAfter).toEqual(action.preconditions.preserveUntrackedPaths);
     expect(readFileSync(join(root, 'main.py'), 'utf8')).toBe('original main\n');
     expect(readFileSync(join(root, 'synology_client.py'), 'utf8')).toBe('original client\n');
     for (const path of ['ONE.md', 'TWO.md', 'THREE.md']) {
       expect(readFileSync(join(root, path), 'utf8')).toBe(`${path}\n`);
     }
     await expect(service.approveAndExecute(action.id, 'operator')).resolves.toMatchObject({ state: 'completed' });
+
+    const lifecycle = new JobLifecycleService(store, {
+      now: () => new Date(TIME), jobIdFactory: () => 'job:verify',
+    });
+    const verificationJob = await lifecycle.createJob({
+      projectId: 'project:roger', repositoryId: inspected.repositoryId,
+      title: 'Verify exact restore', acceptanceCriteria: 'Exact branch, HEAD, status, and hashes.',
+      automaticReadOnlyCompletion: true,
+    });
+    await lifecycle.markJobReady(verificationJob.id);
+    const run = {
+      id: 'operator-run:verify', jobId: verificationJob.id, status: 'pending' as const,
+      revision: 0, createdAt: TIME, updatedAt: TIME,
+    };
+    await store.createOperatorRun(run);
+    await store.saveOperatorRunTransition({ ...run, status: 'running', revision: 1, startedAt: TIME }, 0);
+    await store.saveOperatorRunTransition({
+      ...run, status: 'needs_human', revision: 2, startedAt: TIME, finishedAt: TIME,
+      failureMessage: 'Provider runtime offline.',
+    }, 1);
+    await store.createEscalation({
+      id: 'escalation:verify', jobId: verificationJob.id, reason: 'runtime_failure',
+      summary: 'Provider runtime offline.', createdAt: TIME,
+    });
+    const deterministic = new DeterministicRepositoryVerificationService(store, adapter, {
+      now: () => new Date(TIME), idFactory: () => 'deterministic-verification:one',
+    });
+    const verification = await deterministic.verifyAndComplete({
+      jobId: verificationJob.id,
+      actionId: action.id,
+      expectedBranch: 'main',
+      expectedHead: inspected.headRevision,
+      cleanPaths: ['main.py', 'synology_client.py'],
+      preservedUntrackedFiles: action.preconditions.preserveUntrackedPaths,
+      requireExactStatus: true,
+      verifiedBy: 'application:test',
+    });
+    expect(verification).toMatchObject({
+      result: 'passed', providerRuntimeRequired: false, providerSubmissionsCreated: 0,
+      commitPerformed: false, pushPerformed: false, deployPerformed: false,
+    });
+    expect(await store.getJob(verificationJob.id)).toMatchObject({ status: 'completed' });
+    expect(await store.listAttemptsForJob(verificationJob.id)).toEqual([]);
+    expect(await store.getOperatorRunForJob(verificationJob.id)).toMatchObject({
+      status: 'completed', failureMessage: undefined,
+    });
+    expect(await store.getEscalation('escalation:verify')).toMatchObject({
+      resolvedAt: TIME, resolutionSummary: expect.stringContaining('Verified main'),
+    });
   });
 
   it.each(['submitting', 'uncertain', 'accepted'] as const)(
@@ -189,6 +257,50 @@ describe('Daily Driver lifecycle cleanup', () => {
       expect(await store.getJobRetirement(job.id)).toBeNull();
     },
   );
+
+  it('reconciles a pre receipt completed action only from matching current evidence', async () => {
+    const root = repositoryFixture(roots);
+    const adapter = new GitRepositoryRestoreAdapter();
+    const inspected = await adapter.inspect(root);
+    const store = new InMemoryAgentOperationsStateStore({ installation: { id: INSTALLATION, createdAt: TIME } });
+    const bindingId = createRepositoryCheckoutBindingId(INSTALLATION, root);
+    await store.applyProjectConfiguration({
+      project: { id: 'project:legacy', name: 'Legacy', createdAt: TIME, updatedAt: TIME },
+      repositories: [{ id: inspected.repositoryId, identityKind: 'remote', name: 'legacy', canonicalRemote: 'github.com/example/restore', createdAt: TIME, updatedAt: TIME }],
+      checkoutBindings: [{ id: bindingId, repositoryId: inspected.repositoryId, installationId: INSTALLATION, canonicalPath: root, availability: 'available', firstSeenAt: TIME, lastSeenAt: TIME }],
+      runtimeAgentIds: [],
+    });
+    const service = new RepositoryRestoreService(store, adapter, {
+      now: () => new Date(TIME), idFactory: () => 'repository-restore:legacy',
+    });
+    const pending = await service.prepare({
+      projectId: 'project:legacy', repositoryId: inspected.repositoryId, checkoutBindingId: bindingId,
+      restorePaths: ['main.py', 'synology_client.py'],
+      preserveUntrackedPaths: ['ONE.md', 'TWO.md', 'THREE.md'], requestedBy: 'operator',
+    });
+    const approved = { ...pending, state: 'approved' as const, approvedAt: TIME, approvedBy: 'operator', revision: 1 };
+    await store.saveRepositoryRestoreActionTransition(approved, 0);
+    await adapter.restoreTrackedPaths(root, inspected.headRevision, ['main.py', 'synology_client.py']);
+    const after = await adapter.inspect(root);
+    await store.saveRepositoryRestoreActionTransition({
+      ...approved, state: 'completed', revision: 2,
+      result: {
+        beforeEvidenceHash: pending.preconditions.evidenceHash,
+        afterEvidenceHash: after.evidenceHash,
+        restoredPaths: ['main.py', 'synology_client.py'],
+        preservedUntrackedPaths: pending.preconditions.preserveUntrackedPaths,
+        completedAt: TIME,
+      },
+    }, 1);
+
+    await expect(service.reconcileCompletedExecutionReceipt(pending.id)).resolves.toMatchObject({
+      actionId: pending.id, evidenceSource: 'reconciled-from-completed-action', verificationResult: 'passed',
+    });
+    writeFileSync(join(root, 'ONE.md'), 'drift\n');
+    await expect(service.reconcileCompletedExecutionReceipt(pending.id)).resolves.toMatchObject({
+      actionId: pending.id,
+    });
+  });
 
   it('refuses to discard unique dirty workspace changes during retirement', async () => {
     const store = new InMemoryAgentOperationsStateStore({ installation: { id: INSTALLATION, createdAt: TIME } });

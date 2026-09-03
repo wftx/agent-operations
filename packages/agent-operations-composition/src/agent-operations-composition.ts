@@ -26,6 +26,7 @@ import {
   JobRetirementService,
   OrchestrationService,
   RepositoryRestoreService,
+  DeterministicRepositoryVerificationService,
   RepositoryWorkspaceService,
 } from '../../agent-operations-core/src/index.js';
 import {
@@ -118,7 +119,12 @@ export function createAgentOperationsComposition(
     { stateDirectory: stateLocation.stateDirectory },
   );
   const jobRetirement = new JobRetirementService(store, repositoryWorkspace);
-  const repositoryRestore = new RepositoryRestoreService(store, new GitRepositoryRestoreAdapter());
+  const repositoryRestoreAdapter = new GitRepositoryRestoreAdapter();
+  const repositoryRestore = new RepositoryRestoreService(store, repositoryRestoreAdapter);
+  const deterministicVerification = new DeterministicRepositoryVerificationService(
+    store,
+    repositoryRestoreAdapter,
+  );
   const browser = new PlaywrightBoundedBrowserAdapter({
     authenticationRoot: `${stateLocation.stateDirectory}/preview-auth`,
   });
@@ -156,6 +162,7 @@ export function createAgentOperationsComposition(
     runtimeFreshness,
     jobRetirement,
     repositoryRestore,
+    deterministicVerification,
     ...(options.deferRunnerWake !== undefined ? { deferRunnerWake: options.deferRunnerWake } : {}),
   });
   const conversation = new OrchestratorConversationApplicationService(

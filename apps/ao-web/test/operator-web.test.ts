@@ -146,6 +146,24 @@ class StubOperatorApplication implements OperatorApplication {
       approvedAt: TIME, approvedBy: 'human-operator', result: { beforeEvidenceHash: 'e'.repeat(64), afterEvidenceHash: 'f'.repeat(64), restoredPaths: ['main.py'], preservedUntrackedPaths: [{ path: 'PLAN.md', sha256: 'd'.repeat(64) }], completedAt: TIME }, revision: 2 };
   }
 
+  async getRepositoryRestoreExecutionReceipt() {
+    return {
+      actionId: 'repository-restore:one', operation: 'repository.restore_tracked_paths' as const,
+      projectId: PROJECT_ID, repositoryId: REPOSITORY_ID, checkoutBindingId: 'checkout:one',
+      approvedPaths: ['main.py'], approvedBy: 'human-operator', approvedAt: TIME,
+      executedAt: TIME, recordedAt: TIME, evidenceSource: 'captured-during-execution' as const,
+      branchBefore: 'main', branchAfter: 'main', headBefore: 'a'.repeat(40), headAfter: 'a'.repeat(40),
+      approvedFileHashesBefore: [{ path: 'main.py', sha256: 'b'.repeat(64) }],
+      restoredFileHashesAfter: [{ path: 'main.py', sha256: 'c'.repeat(64) }],
+      preservedUntrackedFileHashesBefore: [{ path: 'PLAN.md', sha256: 'd'.repeat(64) }],
+      preservedUntrackedFileHashesAfter: [{ path: 'PLAN.md', sha256: 'd'.repeat(64) }],
+      finalStatus: [{ path: 'PLAN.md', indexStatus: 'unmodified' as const, worktreeStatus: 'untracked' as const }],
+      beforeEvidenceHash: 'e'.repeat(64), afterEvidenceHash: 'f'.repeat(64),
+      commitPerformed: false as const, pushPerformed: false as const, deployPerformed: false as const,
+      verificationResult: 'passed' as const,
+    };
+  }
+
   async getJobDetail(jobId: string): Promise<OperatorJobDetail> {
     if (jobId === SUMMARY_ESCALATED.job.id) return ESCALATED_DETAIL;
     return DETAIL;
@@ -170,6 +188,14 @@ describe('OperatorWebApplication', () => {
     }));
     expect(response.status).toBe(303);
     expect(service.restoreApprovalCalls).toBe(1);
+
+    const detail = await app.handle(new Request('http://127.0.0.1/repository-restores/repository-restore%3Aone'));
+    const detailBody = await detail.text();
+    expect(detailBody).toContain('Immutable execution receipt');
+    expect(detailBody).toContain('main.py');
+    expect(detailBody).toContain('PLAN.md');
+    expect(detailBody).toContain('Commit');
+    expect(detailBody).toContain('no');
   });
 
   it('renders Jobs, Running, Needs Me, Done, and detail from read-only GETs', async () => {

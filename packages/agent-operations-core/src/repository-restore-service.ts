@@ -5,8 +5,10 @@ import type {
   RepositoryRestoreAdapter,
   RepositoryRestoreInspection,
   RepositoryRestorePathPrecondition,
+  RepositoryRestoreExecutionReceipt,
 } from '../../agent-operations-contracts/src/index.js';
 import {
+  REPOSITORY_RESTORE_TRACKED_PATHS_OPERATION,
   createRepositoryRestoreActionId,
   repositoryRestoreEvidenceHash,
 } from '../../agent-operations-contracts/src/index.js';
@@ -134,11 +136,13 @@ export class RepositoryRestoreService {
       revision: action.revision + 1,
     };
     await this.store.saveRepositoryRestoreActionTransition(action, action.revision - 1);
+    let executedAt: string | undefined;
     try {
       const stillCurrent = await this.adapter.inspect(action.preconditions.canonicalPath);
       if (!await matchesPreconditions(action, stillCurrent, this.adapter)) {
         throw new Error('Repository state changed after approval and before execution');
       }
+      executedAt = this.now().toISOString();
       await this.adapter.restoreTrackedPaths(
         action.preconditions.canonicalPath,
         action.preconditions.headRevision,
@@ -146,6 +150,11 @@ export class RepositoryRestoreService {
       );
       const after = await this.adapter.inspect(action.preconditions.canonicalPath);
       await verifyAfter(action, after, this.adapter);
+      const completedAt = this.now().toISOString();
+      const receipt = await buildReceipt(
+        action, after, this.adapter, executedAt, completedAt, 'captured-during-execution', 'passed',
+      );
+      await this.store.createRepositoryRestoreExecutionReceipt(receipt);
       const completed: DurableRepositoryRestoreAction = {
         ...action,
         state: 'completed',
@@ -154,17 +163,30 @@ export class RepositoryRestoreService {
           afterEvidenceHash: after.evidenceHash,
           restoredPaths: action.preconditions.restorePaths.map(item => item.path),
           preservedUntrackedPaths: action.preconditions.preserveUntrackedPaths.map(item => ({ ...item })),
-          completedAt: this.now().toISOString(),
+          completedAt,
         },
         revision: action.revision + 1,
       };
       await this.store.saveRepositoryRestoreActionTransition(completed, action.revision);
       return completed;
     } catch (error) {
+      const failureReason = error instanceof Error ? error.message : String(error);
+      if (executedAt) {
+        try {
+          const after = await this.adapter.inspect(action.preconditions.canonicalPath);
+          const receipt = await buildReceipt(
+            action, after, this.adapter, executedAt, this.now().toISOString(),
+            'captured-during-execution', 'partial', failureReason,
+          );
+          await this.store.createRepositoryRestoreExecutionReceipt(receipt);
+        } catch {
+          // A failed adapter may make bounded after evidence unavailable. The action still records failure truthfully.
+        }
+      }
       const failed: DurableRepositoryRestoreAction = {
         ...action,
         state: 'failed',
-        failureReason: error instanceof Error ? error.message : String(error),
+        failureReason,
         revision: action.revision + 1,
       };
       await this.store.saveRepositoryRestoreActionTransition(failed, action.revision);
@@ -172,11 +194,98 @@ export class RepositoryRestoreService {
     }
   }
 
+  async getExecutionReceipt(id: string): Promise<RepositoryRestoreExecutionReceipt | null> {
+    return this.store.getRepositoryRestoreExecutionReceipt(id.trim());
+  }
+
+  /** Reconstructs an immutable receipt for a completed pre-receipt action from exact current evidence. */
+  async reconcileCompletedExecutionReceipt(id: string): Promise<RepositoryRestoreExecutionReceipt> {
+    const existing = await this.store.getRepositoryRestoreExecutionReceipt(id.trim());
+    if (existing) return existing;
+    const action = await this.requireAction(id);
+    if (action.state !== 'completed' || !action.result || !action.approvedAt || !action.approvedBy) {
+      throw new Error(`Repository Restore ${action.id} is not eligible for receipt reconciliation`);
+    }
+    const after = await this.adapter.inspect(action.preconditions.canonicalPath);
+    await verifyAfter(action, after, this.adapter);
+    if (after.evidenceHash !== action.result.afterEvidenceHash) {
+      throw new Error('Current repository evidence no longer matches the completed restore result');
+    }
+    const receipt = await buildReceipt(
+      action,
+      after,
+      this.adapter,
+      action.result.completedAt,
+      this.now().toISOString(),
+      'reconciled-from-completed-action',
+      'passed',
+    );
+    await this.store.createRepositoryRestoreExecutionReceipt(receipt);
+    return receipt;
+  }
+
   private async requireAction(id: string): Promise<DurableRepositoryRestoreAction> {
     const action = await this.store.getRepositoryRestoreAction(id.trim());
     if (!action) throw new Error(`Repository Restore action not found: ${id}`);
     return action;
   }
+}
+
+async function buildReceipt(
+  action: DurableRepositoryRestoreAction,
+  after: RepositoryRestoreInspection,
+  adapter: RepositoryRestoreAdapter,
+  executedAt: string,
+  recordedAt: string,
+  evidenceSource: RepositoryRestoreExecutionReceipt['evidenceSource'],
+  verificationResult: RepositoryRestoreExecutionReceipt['verificationResult'],
+  failureReason?: string,
+): Promise<RepositoryRestoreExecutionReceipt> {
+  if (!action.approvedAt || !action.approvedBy) throw new Error('Approved restore identity is unavailable');
+  const restoredFileHashesAfter = await Promise.all(action.preconditions.restorePaths.map(async item => {
+    const sha256 = await adapter.sha256ForWorkingTreeFile(action.preconditions.canonicalPath, item.path);
+    if (!sha256) throw new Error(`Restored path hash is unavailable: ${item.path}`);
+    return { path: item.path, sha256 };
+  }));
+  const preservedUntrackedFileHashesAfter = await Promise.all(
+    action.preconditions.preserveUntrackedPaths.map(async item => {
+      const sha256 = await adapter.sha256ForWorkingTreeFile(action.preconditions.canonicalPath, item.path);
+      if (!sha256) throw new Error(`Preserved path hash is unavailable: ${item.path}`);
+      return { path: item.path, sha256 };
+    }),
+  );
+  return {
+    actionId: action.id,
+    operation: REPOSITORY_RESTORE_TRACKED_PATHS_OPERATION,
+    projectId: action.projectId,
+    repositoryId: action.repositoryId,
+    checkoutBindingId: action.checkoutBindingId,
+    approvedPaths: action.preconditions.restorePaths.map(item => item.path),
+    approvedBy: action.approvedBy,
+    approvedAt: action.approvedAt,
+    executedAt,
+    recordedAt,
+    evidenceSource,
+    branchBefore: action.preconditions.branch,
+    branchAfter: after.branch!,
+    headBefore: action.preconditions.headRevision,
+    headAfter: after.headRevision,
+    approvedFileHashesBefore: action.preconditions.restorePaths.map(item => ({
+      path: item.path,
+      sha256: item.workingTreeSha256 ?? item.headSha256,
+    })),
+    restoredFileHashesAfter,
+    preservedUntrackedFileHashesBefore: action.preconditions.preserveUntrackedPaths.map(item => ({ ...item })),
+    preservedUntrackedFileHashesAfter,
+    finalStatus: after.statusEntries.map(item => ({ ...item })),
+    beforeEvidenceHash: action.preconditions.evidenceHash,
+    afterEvidenceHash: after.evidenceHash,
+    commitPerformed: false,
+    pushPerformed: false,
+    deployPerformed: false,
+    verificationResult,
+    ...(failureReason ? { failureReason } : {}),
+  };
 }
 
 function validateInspection(
