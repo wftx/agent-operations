@@ -103,12 +103,24 @@ describe('RootScopedRepositoryReader', () => {
     mkdirSync(join(root, '.git'));
     writeFileSync(join(root, '.git', 'config'), 'secret', 'utf8');
     writeFileSync(join(root, '.env'), 'TOKEN=secret', 'utf8');
+    writeFileSync(join(root, 'service-account.json'), '{"private_key":"secret"}', 'utf8');
+    writeFileSync(join(root, 'src', 'roger-service-account.json'), '{"private_key":"secret"}', 'utf8');
+    writeFileSync(join(root, 'src', 'application_default_credentials.json'), '{"token":"secret"}', 'utf8');
+    writeFileSync(join(root, 'src', 'service-account-guide.md'), 'public documentation', 'utf8');
     const listed = reader.list();
     expect(listed.entries.map(entry => entry.path)).not.toContain('.git');
     expect(listed.entries.map(entry => entry.path)).not.toContain('.env');
-    expect(listed.omittedRestricted).toBe(2);
+    expect(listed.entries.map(entry => entry.path)).not.toContain('service-account.json');
+    expect(listed.omittedRestricted).toBe(3);
+    expect(reader.list('src').entries.map(entry => entry.path)).not.toContain('src/roger-service-account.json');
+    expect(reader.list('src').entries.map(entry => entry.path)).not.toContain('src/application_default_credentials.json');
+    expect(reader.read('src/service-account-guide.md').text).toBe('public documentation');
+    expect(reader.search('secret').matches).toEqual([]);
     expectCode(() => reader.read('.git/config'), 'RESTRICTED_PATH');
     expectCode(() => reader.read('.env'), 'RESTRICTED_PATH');
+    expectCode(() => reader.read('service-account.json'), 'RESTRICTED_PATH');
+    expectCode(() => reader.read('src/roger-service-account.json'), 'RESTRICTED_PATH');
+    expectCode(() => reader.read('src/application_default_credentials.json'), 'RESTRICTED_PATH');
   });
 });
 

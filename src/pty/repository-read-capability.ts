@@ -323,6 +323,9 @@ function isRestrictedRelativePath(path: string): boolean {
       || lower.startsWith('credentials.')
       || lower === 'secrets'
       || lower.startsWith('secrets.')
+      || lower.endsWith('service-account.json')
+      || lower.endsWith('service_account.json')
+      || lower === 'application_default_credentials.json'
       || lower === 'id_rsa'
       || lower === 'id_ed25519'
       || lower.endsWith('.pem')
