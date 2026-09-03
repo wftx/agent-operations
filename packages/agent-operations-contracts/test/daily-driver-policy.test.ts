@@ -20,6 +20,10 @@ describe('Daily Driver Needs Me policy', () => {
       summary: 'Execution preflight blocked before Dispatch: runtime-disabled; runtime-stopped.',
     };
     expect(classifyEscalationResolution(escalation)).toBe('machine-resolvable');
+    expect(classifyEscalationResolution({
+      reason: 'runtime_failure',
+      summary: 'Worker Attempt 2 ended cancelled without a resumable result.',
+    })).toBe('machine-resolvable');
   });
 
   it('gives a direct action for authentication and exhausted revision budgets', () => {

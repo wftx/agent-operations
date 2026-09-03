@@ -846,6 +846,13 @@ export class OperatorApplicationService implements OperatorApplication {
     const job = await this.store.getJob(run.jobId);
     if (!job || run.status !== 'needs_human') return;
     if (!job.preferredRuntimeAgentId) return;
+    if (escalation.reason === 'runtime_failure') {
+      const attempt = escalation.attemptId
+        ? await this.store.getAttempt(escalation.attemptId) : null;
+      const plan = attempt ? await this.store.getExecutionPlanForAttempt(attempt.id) : null;
+      const dispatch = plan ? await this.store.getExecutionDispatchForPlan(plan.id) : null;
+      if (attempt?.status !== 'cancelled' || dispatch) return;
+    }
     const attempts = await this.store.listAttemptsForJob(job.id);
     if (attempts.some(attempt => isActiveAttemptStatus(attempt.status))
       || await this.hasUncertainDispatch(attempts)) return;
@@ -923,8 +930,10 @@ function isRecoverableObservationEscalation(
 function isRecoverableRuntimeCapacityEscalation(
   escalation: { reason: string; summary: string },
 ): boolean {
-  return escalation.reason === 'policy_blocked'
-    && /runtime-disabled|runtime-stopped/i.test(escalation.summary);
+  return (escalation.reason === 'policy_blocked'
+      && /runtime-disabled|runtime-stopped/i.test(escalation.summary))
+    || (escalation.reason === 'runtime_failure'
+      && /^Worker Attempt \d+ ended cancelled without a resumable result\.$/.test(escalation.summary));
 }
 
 function classifyEscalation(

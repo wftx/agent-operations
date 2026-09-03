@@ -327,14 +327,17 @@ export class OrchestrationService {
         continue;
       }
       if (latestWorker.status !== 'completed') {
-        const guidance = await this.policyBlockedGuidanceFor(job.id, latestWorker.id);
-        if (latestWorker.status === 'cancelled' && guidance
-          && !workerBudget.exhausted) {
-          await this.lifecycle.createAttempt(job.id, {
-            runtimeAgentId: workerRuntimeAgentId,
-            executionRole: 'worker',
-          });
-          continue;
+        if (latestWorker.status === 'cancelled' && !workerBudget.exhausted) {
+          const previousPlan = await this.store.getExecutionPlanForAttempt(latestWorker.id);
+          const previousDispatch = previousPlan
+            ? await this.store.getExecutionDispatchForPlan(previousPlan.id) : null;
+          if (!previousDispatch) {
+            await this.lifecycle.createAttempt(job.id, {
+              runtimeAgentId: workerRuntimeAgentId,
+              executionRole: 'worker',
+            });
+            continue;
+          }
         }
         await this.escalate(
           job.id,
@@ -1229,18 +1232,6 @@ export class OrchestrationService {
       const escalation = escalations.find(candidate => candidate.id === extension.escalationId);
       return escalation?.attemptId === attemptId && escalation.reviewId === reviewId;
     });
-  }
-
-  private async policyBlockedGuidanceFor(
-    jobId: string,
-    attemptId: string,
-  ): Promise<string | undefined> {
-    const escalations = await this.store.listEscalations(jobId);
-    const guidance = await this.store.listHumanGuidance(jobId);
-    return [...guidance].reverse().find(item => {
-      const escalation = escalations.find(candidate => candidate.id === item.escalationId);
-      return escalation?.reason === 'policy_blocked' && escalation.attemptId === attemptId;
-    })?.instruction;
   }
 
   private async escalate(

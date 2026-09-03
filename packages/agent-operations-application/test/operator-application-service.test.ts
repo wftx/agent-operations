@@ -980,7 +980,18 @@ describe('OperatorApplicationService', () => {
     expect(await store.getJob(job.id)).toMatchObject({ status: 'completed' });
   });
 
-  it('recovers a disabled Worker escalation once and resumes with one fresh Attempt', async () => {
+  it.each([
+    [
+      'disabled Worker preflight',
+      'policy_blocked' as const,
+      `Execution preflight blocked before Dispatch: runtime-disabled: Runtime ${RUNTIME_ID} is disabled.; runtime-stopped: Runtime ${RUNTIME_ID} is stopped.`,
+    ],
+    [
+      'legacy cancelled preflight continuation',
+      'runtime_failure' as const,
+      'Worker Attempt 1 ended cancelled without a resumable result.',
+    ],
+  ])('recovers %s once and resumes with one fresh Attempt', async (_label, reason, summary) => {
     const store = await configuredStore();
     const lifecycle = new JobLifecycleService(store, {
       now: () => new Date(TIME), jobIdFactory: () => 'job:runtime-recovery',
@@ -999,8 +1010,8 @@ describe('OperatorApplicationService', () => {
     })).id);
     await store.createEscalation({
       id: 'escalation:runtime-recovery', jobId: job.id, attemptId: cancelled.id,
-      reason: 'policy_blocked',
-      summary: `Execution preflight blocked before Dispatch: runtime-disabled: Runtime ${RUNTIME_ID} is disabled.; runtime-stopped: Runtime ${RUNTIME_ID} is stopped.`,
+      reason,
+      summary,
       createdAt: TIME,
     });
     const pending = {

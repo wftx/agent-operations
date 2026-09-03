@@ -1304,13 +1304,11 @@ describe('OrchestrationService', () => {
     expect(await setup.store.getExecutionDispatchForPlan(firstBlockedPlan!.id)).toBeNull();
     expect(setup.execution.requests).toHaveLength(0);
 
-    await setup.store.createHumanGuidanceAndResolveEscalation({
-      id: 'guidance:retry-preflight',
-      jobId: JOB_ID,
-      escalationId: firstEscalation.id,
-      instruction: 'Try a fresh preflight after infrastructure repair.',
-      createdAt: TIME,
-    }, TIME);
+    await setup.store.resolveEscalation(
+      firstEscalation.id,
+      TIME,
+      'Daily Driver completed a bounded machine recovery step.',
+    );
     const blockedAgain = await setup.service.runJob(JOB_ID);
     const secondBlockedAttempt = blockedAgain.workerAttempts[1];
     const secondBlockedPlan = await setup.store.getExecutionPlanForAttempt(secondBlockedAttempt.id);

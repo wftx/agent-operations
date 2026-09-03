@@ -76,6 +76,10 @@ export function classifyEscalationResolution(
     && /stale|preview process|tool catalog|ephemeral|observation failed/i.test(escalation.summary)) {
     return 'machine-resolvable';
   }
+  if (escalation.reason === 'runtime_failure'
+    && /^Worker Attempt \d+ ended cancelled without a resumable result\.$/.test(escalation.summary)) {
+    return 'machine-resolvable';
+  }
   if (escalation.reason === 'policy_blocked'
     && /runtime-disabled|runtime-stopped/i.test(escalation.summary)) {
     return 'machine-resolvable';
