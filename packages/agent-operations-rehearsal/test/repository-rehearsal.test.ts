@@ -29,6 +29,7 @@ function runtimes() {
       'exact-turn-correlation',
       'execution-working-directory',
       'repository-read-tools',
+      'git-inspection-tools',
       'filesystem-read-only',
       'network-denial',
       'environment-empty',

@@ -52,6 +52,7 @@ export const NO_RUNTIME_EXECUTION_CAPABILITIES: RuntimeExecutionCapabilities = {
 export const REPOSITORY_READ_EXECUTION_CAPABILITIES: RuntimeExecutionCapabilities = {
   version: 1,
   repositoryRead: true,
+  gitInspect: true,
 };
 
 export const REPOSITORY_WRITE_EXECUTION_CAPABILITIES: RuntimeExecutionCapabilities = {

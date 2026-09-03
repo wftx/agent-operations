@@ -132,6 +132,48 @@ RuntimeExecutionObservation {
 }
 
 describe('ExecutionObservationService', () => {
+  it('normalizes typed Git status evidence only for the exact repository root', () => {
+    const gitEvidence = {
+      repositoryRoot: '/tmp/ao-repository',
+      headRevision: 'a'.repeat(40),
+      branch: 'main',
+      detachedHead: false,
+      clean: false,
+      statusEntries: [{
+        path: 'main.py', indexStatus: 'unmodified' as const, worktreeStatus: 'modified' as const,
+      }, {
+        path: 'report.md', indexStatus: 'unmodified' as const, worktreeStatus: 'untracked' as const,
+      }],
+    };
+    const normalized = normalizeRuntimeObservation({
+      ...exact(),
+      executionContext: {
+        workingDirectory: '/tmp/ao-repository', repositoryReadRoot: '/tmp/ao-repository',
+      },
+      effectivePolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
+      effectiveCapabilities: { version: 1, repositoryRead: true, gitInspect: true },
+      toolOperations: [{
+        namespace: 'git', operation: 'status', success: true, occurredAt: TIME, gitEvidence,
+      }],
+    });
+
+    expect(normalized.toolOperations?.[0]).toMatchObject({
+      namespace: 'git', operation: 'status', gitEvidence,
+    });
+    expect(() => normalizeRuntimeObservation({
+      ...exact(),
+      executionContext: {
+        workingDirectory: '/tmp/ao-repository', repositoryReadRoot: '/tmp/ao-repository',
+      },
+      effectivePolicy: { version: 1, filesystem: 'read-only', network: 'deny', environment: 'empty' },
+      effectiveCapabilities: { version: 1, repositoryRead: true, gitInspect: true },
+      toolOperations: [{
+        namespace: 'git', operation: 'status', success: true, occurredAt: TIME,
+        gitEvidence: { ...gitEvidence, repositoryRoot: '/tmp/other' },
+      }],
+    })).toThrow('Git identity evidence');
+  });
+
   it('accepts bounded Input list and read evidence for the exact attached allowlist', async () => {
     const setup = await harness([{
       ...exact(),

@@ -7,6 +7,8 @@ import type {
   DurableExecutionPlan,
   DurableJob,
   DurableJobAttempt,
+  RuntimeGitInspectionEvidence,
+  RuntimeGitStatusEntry,
   RuntimeExecutionObservation,
   RuntimeExecutionObservationAdapter,
 } from '../../agent-operations-contracts/src/index.js';
@@ -355,6 +357,12 @@ function normalizeToolOperations(
     const stdout = boundedToolOutput(item.stdout);
     const stderr = boundedToolOutput(item.stderr);
     const ephemeralArtifacts = normalizeEphemeralArtifacts(item.ephemeralArtifacts);
+    const gitEvidence = item.namespace === 'git'
+      ? normalizeGitEvidence(item.gitEvidence, executionContext, effectiveCapabilities, item.success)
+      : undefined;
+    if (item.namespace !== 'git' && item.gitEvidence !== undefined) {
+      throw new Error('Only Git tool operations may carry Git evidence');
+    }
     return {
       namespace: item.namespace as 'repository' | 'test' | 'git',
       operation: boundedRequired(item.operation, 'Tool operation', 100),
@@ -377,9 +385,89 @@ function normalizeToolOperations(
       ...(boundedOptional(item.errorCode, 100)
         ? { errorCode: boundedOptional(item.errorCode, 100) }
         : {}),
+      ...(gitEvidence ? { gitEvidence } : {}),
       ...(ephemeralArtifacts ? { ephemeralArtifacts } : {}),
     };
   });
+}
+
+function normalizeGitEvidence(
+  value: unknown,
+  executionContext: Record<string, unknown> | undefined,
+  effectiveCapabilities: Record<string, unknown> | undefined,
+  success: boolean,
+): RuntimeGitInspectionEvidence | undefined {
+  if (effectiveCapabilities?.gitInspect !== true
+    || !executionContext
+    || typeof executionContext.repositoryReadRoot !== 'string') {
+    throw new Error('Git evidence requires the exact bounded Git inspection capability');
+  }
+  if (value === undefined) {
+    if (success) throw new Error('Successful Git inspection requires typed Git evidence');
+    return undefined;
+  }
+  if (!isRecord(value)
+    || value.repositoryRoot !== executionContext.repositoryReadRoot
+    || typeof value.headRevision !== 'string'
+    || !/^[0-9a-f]{40,64}$/.test(value.headRevision)
+    || typeof value.detachedHead !== 'boolean') {
+    throw new Error('Runtime observer returned invalid Git identity evidence');
+  }
+  const branch = boundedOptional(value.branch, 255);
+  if (value.branch !== undefined && !branch) {
+    throw new Error('Runtime observer returned invalid Git branch evidence');
+  }
+  if (branch && value.detachedHead) {
+    throw new Error('Git evidence cannot be detached while naming a branch');
+  }
+  const statusEntries = value.statusEntries === undefined
+    ? undefined
+    : normalizeGitStatusEntries(value.statusEntries);
+  if (value.clean !== undefined && typeof value.clean !== 'boolean') {
+    throw new Error('Runtime observer returned invalid Git cleanliness evidence');
+  }
+  if (typeof value.clean === 'boolean' && statusEntries && value.clean !== (statusEntries.length === 0)) {
+    throw new Error('Git cleanliness evidence does not match typed status entries');
+  }
+  return {
+    repositoryRoot: value.repositoryRoot,
+    headRevision: value.headRevision,
+    ...(branch ? { branch } : {}),
+    detachedHead: value.detachedHead,
+    ...(typeof value.clean === 'boolean' ? { clean: value.clean } : {}),
+    ...(statusEntries ? { statusEntries } : {}),
+  };
+}
+
+function normalizeGitStatusEntries(value: unknown): readonly RuntimeGitStatusEntry[] {
+  if (!Array.isArray(value) || value.length > 1_000) {
+    throw new Error('Runtime observer returned invalid bounded Git status evidence');
+  }
+  const states = new Set([
+    'unmodified', 'modified', 'added', 'deleted', 'renamed', 'copied',
+    'unmerged', 'type-changed', 'untracked', 'ignored', 'unknown',
+  ]);
+  return value.map(entry => {
+    if (!isRecord(entry)
+      || typeof entry.path !== 'string' || !safeRelativeEvidencePath(entry.path)
+      || !states.has(String(entry.indexStatus))
+      || !states.has(String(entry.worktreeStatus))
+      || (entry.originalPath !== undefined
+        && (typeof entry.originalPath !== 'string' || !safeRelativeEvidencePath(entry.originalPath)))) {
+      throw new Error('Runtime observer returned malformed Git status entry evidence');
+    }
+    return {
+      path: entry.path,
+      ...(typeof entry.originalPath === 'string' ? { originalPath: entry.originalPath } : {}),
+      indexStatus: entry.indexStatus as RuntimeGitStatusEntry['indexStatus'],
+      worktreeStatus: entry.worktreeStatus as RuntimeGitStatusEntry['worktreeStatus'],
+    };
+  });
+}
+
+function safeRelativeEvidencePath(value: string): boolean {
+  if (!value || value.length > 1_024 || value.includes('\0') || value.startsWith('/')) return false;
+  return value.replace(/\\/g, '/').split('/').every(part => part && part !== '.' && part !== '..');
 }
 
 function normalizeInputToolOperation(

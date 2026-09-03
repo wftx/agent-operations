@@ -296,6 +296,33 @@ describe('SQLite execution observation persistence', () => {
     await reopened.close();
   });
 
+  it('round trips typed repository scoped Git status evidence without a schema rewrite', async () => {
+    const databasePath = path();
+    const store = open(databasePath);
+    await seedAcceptedDispatch(store);
+    const gitObservation: DurableExecutionObservation = {
+      ...observation(),
+      toolOperations: [{
+        namespace: 'git', operation: 'status', success: true, occurredAt: TIME,
+        gitEvidence: {
+          repositoryRoot: '/repos/roger', headRevision: 'a'.repeat(40), branch: 'main',
+          detachedHead: false, clean: false,
+          statusEntries: [
+            { path: 'main.py', indexStatus: 'unmodified', worktreeStatus: 'modified' },
+            { path: 'report.md', indexStatus: 'unmodified', worktreeStatus: 'untracked' },
+          ],
+        },
+      }],
+    };
+    expect(await store.appendExecutionObservation(gitObservation)).toBe(true);
+    await store.close();
+
+    const reopened = open(databasePath);
+    expect((await reopened.listExecutionObservationsForDispatch('dispatch:observation'))[0]
+      .toolOperations).toEqual(gitObservation.toolOperations);
+    await reopened.close();
+  });
+
   it('enforces exact correlation and evidence associations structurally', async () => {
     const store = open(path());
     await seedAcceptedDispatch(store);

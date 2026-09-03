@@ -272,7 +272,7 @@ const TEST_DYNAMIC_TOOLS = [{
 const GIT_INSPECTION_DYNAMIC_TOOLS = [{
   type: 'namespace',
   name: 'git',
-  description: 'Read-only Git evidence for the isolated Agent Operations worktree.',
+  description: 'Read-only Git evidence for the exact authorized repository checkout.',
   tools: [{
     type: 'function',
     name: 'inspect',

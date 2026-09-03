@@ -116,9 +116,11 @@ export class ExecutionPlanningService {
       || !['active', 'reviewing', 'ready_for_approval'].includes(workspace.state))) {
       throw new Error(`Repository Workspace is not active for Job ${job.id}`);
     }
-    if ((requestedCapabilities.repositoryPatch || requestedCapabilities.testRun
-      || requestedCapabilities.gitInspect) && !workspace) {
-      throw new Error('Write and Git tool capabilities require an isolated Repository Workspace');
+    if ((requestedCapabilities.repositoryPatch || requestedCapabilities.testRun) && !workspace) {
+      throw new Error('Write tool capabilities require an isolated Repository Workspace');
+    }
+    if (requestedCapabilities.gitInspect && !requestedCapabilities.repositoryRead) {
+      throw new Error('Git inspection requires repository-read capability');
     }
     if (requestedCapabilities.repositoryPatch && requestedPolicy.filesystem !== 'workspace-write') {
       throw new Error('Repository patch capability requires filesystem=workspace-write');

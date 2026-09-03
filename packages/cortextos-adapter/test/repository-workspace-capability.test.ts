@@ -1,5 +1,14 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,9 +24,15 @@ describe('RootScopedRepositoryWorkspaceTools', () => {
     roots.push(root);
     execFileSync('git', ['init', '--initial-branch=main', root]);
     writeFileSync(join(root, 'safe.txt'), 'alpha\nbeta\n');
+    writeFileSync(join(root, 'staged.txt'), 'before\n');
+    writeFileSync(join(root, 'deleted.txt'), 'delete me\n');
+    writeFileSync(join(root, 'rename-source.txt'), 'rename me\n');
+    writeFileSync(join(root, '.gitignore'), 'node_modules\n');
     execFileSync('git', ['-C', root, 'config', 'user.email', 'ao@example.invalid']);
     execFileSync('git', ['-C', root, 'config', 'user.name', 'AO Test']);
-    execFileSync('git', ['-C', root, 'add', 'safe.txt']);
+    execFileSync('git', [
+      '-C', root, 'add', 'safe.txt', 'staged.txt', 'deleted.txt', 'rename-source.txt', '.gitignore',
+    ]);
     execFileSync('git', ['-C', root, 'commit', '-m', 'fixture']);
     const dependencies = realpathSync(join(process.cwd(), 'node_modules'));
     symlinkSync(dependencies, join(root, 'node_modules'), 'dir');
@@ -27,6 +42,10 @@ describe('RootScopedRepositoryWorkspaceTools', () => {
   it('applies one exact replacement and permits only read-only Git inspection', async () => {
     const root = fixture();
     const tools = new RootScopedRepositoryWorkspaceTools(root);
+    await expect(tools.inspectGit('status')).resolves.toMatchObject({
+      success: true,
+      gitEvidence: { branch: 'main', detachedHead: false, clean: true, statusEntries: [] },
+    });
     expect(tools.patch('safe.txt', 'beta', 'gamma')).toEqual({ path: 'safe.txt', replacements: 1 });
     expect(readFileSync(join(root, 'safe.txt'), 'utf8')).toBe('alpha\ngamma\n');
     await expect(tools.inspectGit('diff')).resolves.toMatchObject({ success: true, operation: 'diff' });
@@ -34,6 +53,64 @@ describe('RootScopedRepositoryWorkspaceTools', () => {
       success: true,
       operation: 'head',
       stdout: expect.stringMatching(/^[0-9a-f]{40}\n$/),
+    });
+  });
+
+  it('returns authoritative typed branch, HEAD, staged, unstaged, deleted, renamed, and untracked evidence', async () => {
+    const root = fixture();
+    const expectedHead = execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    writeFileSync(join(root, 'safe.txt'), 'unstaged modification\n');
+    writeFileSync(join(root, 'staged.txt'), 'staged modification\n');
+    writeFileSync(join(root, 'added.txt'), 'staged addition\n');
+    execFileSync('git', ['-C', root, 'add', 'staged.txt', 'added.txt']);
+    unlinkSync(join(root, 'deleted.txt'));
+    execFileSync('git', ['-C', root, 'mv', 'rename-source.txt', 'rename-target.txt']);
+    writeFileSync(join(root, 'untracked.txt'), 'new\n');
+    const before = execFileSync(
+      'git', ['--no-optional-locks', '-C', root, 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
+      { encoding: 'utf8' },
+    );
+
+    const status = await new RootScopedRepositoryWorkspaceTools(root).inspectGit('status');
+
+    expect(status).toMatchObject({
+      success: true,
+      operation: 'status',
+      gitEvidence: {
+        repositoryRoot: root,
+        branch: 'main',
+        headRevision: expectedHead,
+        detachedHead: false,
+        clean: false,
+      },
+    });
+    expect(status.gitEvidence?.statusEntries).toEqual(expect.arrayContaining([
+      { path: 'safe.txt', indexStatus: 'unmodified', worktreeStatus: 'modified' },
+      { path: 'staged.txt', indexStatus: 'modified', worktreeStatus: 'unmodified' },
+      { path: 'added.txt', indexStatus: 'added', worktreeStatus: 'unmodified' },
+      { path: 'deleted.txt', indexStatus: 'unmodified', worktreeStatus: 'deleted' },
+      {
+        path: 'rename-target.txt', originalPath: 'rename-source.txt',
+        indexStatus: 'renamed', worktreeStatus: 'unmodified',
+      },
+      { path: 'untracked.txt', indexStatus: 'unmodified', worktreeStatus: 'untracked' },
+    ]));
+    expect(execFileSync(
+      'git', ['--no-optional-locks', '-C', root, 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
+      { encoding: 'utf8' },
+    )).toBe(before);
+  });
+
+  it('rejects non-allowlisted Git operations and repository roots outside the exact scope', async () => {
+    const root = fixture();
+    const tools = new RootScopedRepositoryWorkspaceTools(root);
+    await expect((tools.inspectGit as (operation: string) => Promise<unknown>)('commit'))
+      .rejects.toThrow('not allowlisted');
+    const nested = join(root, 'nested');
+    mkdirSync(nested);
+    await expect(new RootScopedRepositoryWorkspaceTools(nested).inspectGit('status')).resolves.toMatchObject({
+      success: false,
+      errorCode: 'SCOPE_MISMATCH',
     });
   });
 

@@ -86,8 +86,39 @@ export interface RuntimeToolOperation {
   /** True when AO retained only the bounded prefix of provider tool output. */
   readonly outputTruncated?: boolean;
   readonly errorCode?: string;
+  /** Typed, repository scoped evidence returned only by bounded Git inspection. */
+  readonly gitEvidence?: RuntimeGitInspectionEvidence;
   /** Exact known validation artifacts removed before workspace evidence capture. */
   readonly ephemeralArtifacts?: readonly WorkspaceEphemeralArtifactEvidence[];
+}
+
+export type RuntimeGitFileState =
+  | 'unmodified'
+  | 'modified'
+  | 'added'
+  | 'deleted'
+  | 'renamed'
+  | 'copied'
+  | 'unmerged'
+  | 'type-changed'
+  | 'untracked'
+  | 'ignored'
+  | 'unknown';
+
+export interface RuntimeGitStatusEntry {
+  readonly path: string;
+  readonly originalPath?: string;
+  readonly indexStatus: RuntimeGitFileState;
+  readonly worktreeStatus: RuntimeGitFileState;
+}
+
+export interface RuntimeGitInspectionEvidence {
+  readonly repositoryRoot: string;
+  readonly headRevision: string;
+  readonly branch?: string;
+  readonly detachedHead: boolean;
+  readonly clean?: boolean;
+  readonly statusEntries?: readonly RuntimeGitStatusEntry[];
 }
 
 /** Read-only, explicitly invoked observation capability. */

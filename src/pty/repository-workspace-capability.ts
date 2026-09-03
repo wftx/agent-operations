@@ -19,6 +19,27 @@ import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'no
 
 const MAX_FILE_BYTES = 1_048_576;
 const MAX_TOOL_OUTPUT = 4_000;
+const MAX_GIT_STATUS_ENTRIES = 1_000;
+
+type RuntimeGitFileState =
+  | 'unmodified' | 'modified' | 'added' | 'deleted' | 'renamed' | 'copied'
+  | 'unmerged' | 'type-changed' | 'untracked' | 'ignored' | 'unknown';
+
+interface RuntimeGitStatusEntry {
+  readonly path: string;
+  readonly originalPath?: string;
+  readonly indexStatus: RuntimeGitFileState;
+  readonly worktreeStatus: RuntimeGitFileState;
+}
+
+interface RuntimeGitInspectionEvidence {
+  readonly repositoryRoot: string;
+  readonly headRevision: string;
+  readonly branch?: string;
+  readonly detachedHead: boolean;
+  readonly clean?: boolean;
+  readonly statusEntries?: readonly RuntimeGitStatusEntry[];
+}
 
 export interface WorkspaceToolAuditEvent {
   readonly namespace: 'repository' | 'test' | 'git';
@@ -34,6 +55,7 @@ export interface WorkspaceToolAuditEvent {
   readonly stderr?: string;
   readonly outputTruncated?: boolean;
   readonly errorCode?: string;
+  readonly gitEvidence?: RuntimeGitInspectionEvidence;
   readonly ephemeralArtifacts?: readonly WorkspaceEphemeralArtifactAudit[];
 }
 
@@ -147,23 +169,82 @@ export class RootScopedRepositoryWorkspaceTools {
   }
 
   async inspectGit(operation: 'status' | 'diff' | 'diff-stat' | 'head'): Promise<WorkspaceToolAuditEvent> {
+    if (!['status', 'diff', 'diff-stat', 'head'].includes(operation)) {
+      throw new WorkspaceToolError('INVALID_OPERATION', 'Git inspection operation is not allowlisted');
+    }
     const args = operation === 'status'
-      ? ['status', '--short', '--branch']
+      ? ['status', '--porcelain=v1', '-z', '--untracked-files=all']
       : operation === 'head'
         ? ['rev-parse', '--verify', 'HEAD']
       : operation === 'diff-stat'
-        ? ['diff', '--stat', '--no-ext-diff', '--']
-        : ['diff', '--no-ext-diff', '--no-color', '--'];
+        ? ['diff', '--stat', '--no-ext-diff', '--no-textconv', '--']
+        : ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--'];
     const started = Date.now();
-    const result = await run('git', ['--no-optional-locks', '-C', this.root, ...args], this.root, 30_000);
+    const gitEnvironment = {
+      TMPDIR: tmpdir(),
+      HOME: process.env.HOME ?? tmpdir(),
+      ...(process.env.XDG_CONFIG_HOME ? { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME } : {}),
+      xcrun_nocache: '1',
+    };
+    const gitPrefix = [
+      '--no-optional-locks', '-C', this.root,
+      '-c', 'core.fsmonitor=false',
+      '-c', 'core.untrackedCache=false',
+      '-c', 'core.preloadIndex=false',
+    ];
+    const [result, repositoryRoot, head, branch] = await Promise.all([
+      run('git', [...gitPrefix, ...args], this.root, 30_000, gitEnvironment),
+      run('git', [...gitPrefix, 'rev-parse', '--show-toplevel'], this.root, 30_000, gitEnvironment),
+      run('git', [...gitPrefix, 'rev-parse', '--verify', 'HEAD'], this.root, 30_000, gitEnvironment),
+      run('git', [...gitPrefix, 'symbolic-ref', '--quiet', '--short', 'HEAD'], this.root, 30_000, gitEnvironment),
+    ]);
+    let canonicalRepositoryRoot: string | null = null;
+    if (repositoryRoot.exitCode === 0) {
+      try {
+        canonicalRepositoryRoot = realpathSync(repositoryRoot.stdout.trim());
+      } catch {
+        canonicalRepositoryRoot = null;
+      }
+    }
+    const headRevision = head.stdout.trim().toLowerCase();
+    const identityValid = canonicalRepositoryRoot === this.root
+      && /^[0-9a-f]{40,64}$/.test(headRevision);
+    if (!identityValid) {
+      return {
+        namespace: 'git',
+        operation,
+        success: false,
+        exitCode: result.exitCode || repositoryRoot.exitCode || head.exitCode || 1,
+        durationMs: Date.now() - started,
+        stdout: '',
+        stderr: bounded(repositoryRoot.stderr || head.stderr || 'Git repository identity escaped the authorized root.').text,
+        errorCode: canonicalRepositoryRoot && canonicalRepositoryRoot !== this.root
+          ? 'SCOPE_MISMATCH'
+          : 'IDENTITY_UNAVAILABLE',
+        occurredAt: new Date().toISOString(),
+      };
+    }
+    const statusEntries = operation === 'status' && result.exitCode === 0
+      ? parseGitStatus(result.stdout)
+      : undefined;
+    const gitEvidence: RuntimeGitInspectionEvidence = {
+      repositoryRoot: canonicalRepositoryRoot as string,
+      headRevision,
+      ...(branch.exitCode === 0 && branch.stdout.trim() ? { branch: branch.stdout.trim() } : {}),
+      detachedHead: branch.exitCode !== 0,
+      ...(statusEntries ? { clean: statusEntries.length === 0, statusEntries } : {}),
+    };
     return {
       namespace: 'git',
       operation,
       success: result.exitCode === 0,
       exitCode: result.exitCode,
       durationMs: Date.now() - started,
-      stdout: bounded(result.stdout).text,
+      stdout: bounded(operation === 'status' && statusEntries
+        ? formatGitStatus(gitEvidence, statusEntries)
+        : result.stdout).text,
       stderr: bounded(result.stderr).text,
+      gitEvidence,
       occurredAt: new Date().toISOString(),
     };
   }
@@ -187,6 +268,72 @@ export class RootScopedRepositoryWorkspaceTools {
     }
     return { absolute, relative: clean };
   }
+}
+
+function parseGitStatus(value: string): readonly RuntimeGitStatusEntry[] {
+  const fields = value.split('\0').filter(Boolean);
+  const entries: RuntimeGitStatusEntry[] = [];
+  for (let index = 0; index < fields.length; index += 1) {
+    if (entries.length >= MAX_GIT_STATUS_ENTRIES) {
+      throw new WorkspaceToolError('STATUS_TOO_LARGE', 'Git status exceeds the bounded entry limit');
+    }
+    const field = fields[index];
+    if (field.length < 4 || field[2] !== ' ') {
+      throw new WorkspaceToolError('MALFORMED_STATUS', 'Git returned malformed status evidence');
+    }
+    const rawIndex = field[0];
+    const rawWorktree = field[1];
+    const path = safeGitPath(field.slice(3));
+    const renamedOrCopied = rawIndex === 'R' || rawIndex === 'C'
+      || rawWorktree === 'R' || rawWorktree === 'C';
+    const originalPath = renamedOrCopied
+      ? safeGitPath(fields[index += 1] ?? '')
+      : undefined;
+    entries.push({
+      path,
+      ...(originalPath ? { originalPath } : {}),
+      indexStatus: gitFileState(rawIndex, true),
+      worktreeStatus: gitFileState(rawWorktree, false),
+    });
+  }
+  return entries;
+}
+
+function gitFileState(value: string, index: boolean): RuntimeGitFileState {
+  if (value === ' ') return 'unmodified';
+  if (value === 'M') return 'modified';
+  if (value === 'A') return 'added';
+  if (value === 'D') return 'deleted';
+  if (value === 'R') return 'renamed';
+  if (value === 'C') return 'copied';
+  if (value === 'U') return 'unmerged';
+  if (value === 'T') return 'type-changed';
+  if (value === '?' && !index) return 'untracked';
+  if (value === '!' && !index) return 'ignored';
+  if ((value === '?' || value === '!') && index) return 'unmodified';
+  return 'unknown';
+}
+
+function safeGitPath(value: string): string {
+  if (!value || value.length > 1_024 || value.includes('\0') || isAbsolute(value)) {
+    throw new WorkspaceToolError('MALFORMED_STATUS', 'Git returned an unsafe status path');
+  }
+  const parts = value.replace(/\\/g, '/').split('/');
+  if (parts.some(part => !part || part === '.' || part === '..')) {
+    throw new WorkspaceToolError('MALFORMED_STATUS', 'Git returned an unsafe status path');
+  }
+  return parts.join('/');
+}
+
+function formatGitStatus(
+  evidence: RuntimeGitInspectionEvidence,
+  entries: readonly RuntimeGitStatusEntry[],
+): string {
+  const identity = `## ${evidence.branch ?? `(detached at ${evidence.headRevision.slice(0, 12)})`}`;
+  return [identity, ...entries.map(entry => {
+    const source = entry.originalPath ? `${entry.originalPath} -> ` : '';
+    return `${entry.indexStatus}/${entry.worktreeStatus} ${source}${entry.path}`;
+  })].join('\n');
 }
 
 function packageUsesNextBuild(root: string): boolean {

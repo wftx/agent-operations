@@ -1418,6 +1418,40 @@ describe('CodexAppServerPTY correlation-safe turn creation', () => {
     expect(record).not.toContain('/must/not/appear');
   });
 
+  it('adds only bounded Git inspection to a repository read only turn when explicitly requested', async () => {
+    requestMock.mockImplementation(async (method: string) => {
+      if (method === 'config/read') return { result: { config: { mcp_servers: {} } } };
+      return method === 'thread/start'
+        ? { result: { thread: { id: 'thread-git-reader' } } }
+        : { result: { turn: { id: 'turn-git-reader', status: 'inProgress' } } };
+    });
+    const pty = makeReadyPty();
+    const root = process.cwd();
+    await pty.startCorrelationSafeTurn(
+      'inspect authoritative Git state',
+      'dispatch-plan:git-reader',
+      restrictedPolicy,
+      { workingDirectory: root, repositoryReadRoot: root },
+      { version: 1, repositoryRead: true, gitInspect: true },
+    );
+    const threadStart = requestMock.mock.calls.find(([method]) => method === 'thread/start')?.[1] as {
+      dynamicTools: Array<{ name: string; tools: Array<{ name: string; inputSchema: unknown }> }>;
+      sandbox: string;
+      runtimeWorkspaceRoots: string[];
+    };
+    expect(threadStart.dynamicTools.map(namespace => [
+      namespace.name,
+      namespace.tools.map(tool => tool.name),
+    ])).toEqual([
+      ['repository', ['list', 'read', 'search']],
+      ['git', ['inspect']],
+    ]);
+    expect(threadStart.sandbox).toBe('read-only');
+    expect(threadStart.runtimeWorkspaceRoots).toEqual([]);
+    expect(JSON.stringify(threadStart.dynamicTools)).not.toContain('commit');
+    expect(JSON.stringify(threadStart.dynamicTools)).not.toContain('push');
+  });
+
   it('serves repository dynamic calls only for the exact protected turn and audits metadata without contents', () => {
     const pty = makeReadyPty();
     const list = vi.fn().mockReturnValue({ path: '.', entries: [], truncated: false, omittedRestricted: 0 });

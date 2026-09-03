@@ -38,7 +38,7 @@ const INSTALLATION_ID = 'installation:orchestration-fixture';
 const CHECKOUT = '/fixtures/agent-operations';
 const WORKSPACE = '/ao-state/workspaces/orchestration-fixture';
 const POLICY = { version: 1 as const, filesystem: 'read-only' as const, network: 'deny' as const, environment: 'empty' as const };
-const CAPABILITIES = { version: 1 as const, repositoryRead: true };
+const CAPABILITIES = { version: 1 as const, repositoryRead: true, gitInspect: true };
 const WRONG_RESULT = 'The contract is src/types/index.ts RuntimeExecutionPolicyEnvelope with filesystem, network, and environment.';
 const CORRECT_RESULT = 'The authoritative Agent Operations RuntimeExecutionPolicy is defined in packages/agent-operations-contracts/src/execution.ts. Its dimensions are filesystem, network, and environment.';
 const REVISION = JSON.stringify({
@@ -238,7 +238,8 @@ async function harness(
         'exact-turn-correlation',
         'execution-working-directory',
         'repository-read-tools',
-        ...(writeMode ? ['repository-write-tools', 'test-run-tools', 'git-inspection-tools'] as const : []),
+        'git-inspection-tools',
+        ...(writeMode ? ['repository-write-tools', 'test-run-tools'] as const : []),
         'filesystem-read-only',
         ...(writeMode ? ['filesystem-workspace-write'] as const : []),
         'network-denial',
@@ -1345,6 +1346,7 @@ describe('OrchestrationService', () => {
         'exact-turn-correlation',
         'execution-working-directory',
         'repository-read-tools',
+        'git-inspection-tools',
         'filesystem-read-only',
         'network-denial',
         'environment-empty',
@@ -1421,6 +1423,7 @@ describe('OrchestrationService', () => {
         'exact-turn-correlation',
         'execution-working-directory',
         'repository-read-tools',
+        'git-inspection-tools',
         'filesystem-read-only',
         'network-denial',
         'environment-empty',

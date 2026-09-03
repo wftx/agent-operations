@@ -84,6 +84,36 @@ async function readyAttempt(
 }
 
 describe('ExecutionPlanningService', () => {
+  it('allows bounded Git inspection for a repository read only checkout without an isolated workspace', async () => {
+    const { lifecycle, planning } = await harness();
+    const attempt = await readyAttempt(lifecycle);
+    const plan = await planning.prepareExecutionPlan({
+      projectId: PROJECT_ID,
+      attemptId: attempt.id,
+      instruction: 'Inspect authoritative repository status.',
+      requestedPolicy: POLICY,
+      requestedCapabilities: { version: 1, repositoryRead: true, gitInspect: true },
+    });
+    expect(plan).toMatchObject({
+      repositoryId: REPOSITORY_ID,
+      checkoutBindingId: binding('/repos/ao').id,
+      requestedCapabilities: { repositoryRead: true, gitInspect: true },
+    });
+    expect(plan.repositoryWorkspaceId).toBeUndefined();
+  });
+
+  it('refuses Git inspection without the repository read boundary', async () => {
+    const { lifecycle, planning } = await harness();
+    const attempt = await readyAttempt(lifecycle);
+    await expect(planning.prepareExecutionPlan({
+      projectId: PROJECT_ID,
+      attemptId: attempt.id,
+      instruction: 'Inspect Git without repository authority.',
+      requestedPolicy: POLICY,
+      requestedCapabilities: { version: 1, repositoryRead: false, gitInspect: true },
+    })).rejects.toThrow('requires repository-read capability');
+  });
+
   it('prepares one immutable plan from actual Attempt assignment and captures revisions', async () => {
     const { store, lifecycle, planning } = await harness();
     const attempt = await readyAttempt(lifecycle);
