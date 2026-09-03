@@ -39,6 +39,12 @@ the live dedicated Orchestrator. A canonical restart is allowed only when the
 effective profile permits it and no submitting, accepted, or uncertain provider
 execution is active.
 
+The configured Worker and Reviewer capacity retains the legacy
+`agent-operations/rehearsal` identity. Under Daily Driver, AO may enable and
+start that execution only agent when a Job requires it, provided its Telegram
+polling and schedules are both disabled. This name does not make the runtime a
+test only resource and does not merge it with the persistent Orchestrator role.
+
 Authenticated Preview Sessions store secret browser state only in restrictive
 installation local storage. Durable records contain safe identity, scope,
 status, and expiry metadata. The model, tools, evidence, logs, and Telegram never

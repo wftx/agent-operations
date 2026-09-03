@@ -98,6 +98,16 @@ export class OperatorRunner {
           return 'deferred';
         }
         if (freshness.state !== 'current') throw new Error(freshness.message);
+        const job = await this.store.getJob(running.jobId);
+        if (!job) throw new Error(`Job not found: ${running.jobId}`);
+        if (!job.preferredRuntimeAgentId) {
+          throw new Error(`Job ${job.id} has no preferred Worker runtime.`);
+        }
+        const capacity = await this.runtimeFreshness.ensureExecutionAgentForJob(
+          job.id,
+          job.preferredRuntimeAgentId,
+        );
+        if (capacity.state !== 'ready') throw new Error(capacity.message);
       } catch (error) {
         if (running.status === 'pending') {
           const timestamp = this.now().toISOString();

@@ -22,6 +22,7 @@ import {
   workerMaximumForPolicy,
   classifyEscalationResolution,
   canAutonomouslyPerformRiskTier,
+  riskTierForExecutionMode,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   JobLifecycleService,
@@ -108,6 +109,8 @@ export class OperatorApplicationService implements OperatorApplication {
   private readonly escalationIdFactory: () => string;
   private readonly deferRunnerWake: boolean;
   private readonly trustProfiles: TrustProfileApplication;
+  private readonly runtimeFreshness?: RuntimeFreshnessApplication;
+  private reconciliationPromise: Promise<void> | null = null;
 
   constructor(
     private readonly store: AgentOperationsStateStore,
@@ -125,6 +128,7 @@ export class OperatorApplicationService implements OperatorApplication {
     this.escalationIdFactory = options.escalationIdFactory ?? (() => createEscalationId());
     this.deferRunnerWake = options.deferRunnerWake ?? false;
     this.trustProfiles = options.trustProfiles ?? new TrustProfileApplicationService(store, { now: this.now });
+    this.runtimeFreshness = options.runtimeFreshness;
     this.runner = new OperatorRunner(store, orchestration, {
       now: this.now,
       ...(options.notifier ? { notifier: options.notifier } : {}),
@@ -133,9 +137,13 @@ export class OperatorApplicationService implements OperatorApplication {
   }
 
   startRunner(): void {
-    void this.reconcileMachineResolvableRuns()
-      .catch(() => undefined)
-      .finally(() => this.runner.start());
+    if (this.reconciliationPromise) return;
+    const reconciliation = this.reconcileMachineResolvableRuns().catch(() => undefined);
+    this.reconciliationPromise = reconciliation;
+    void reconciliation.finally(() => {
+      if (this.reconciliationPromise === reconciliation) this.reconciliationPromise = null;
+      this.runner.start();
+    });
   }
 
   async getRuntimeStatus(): Promise<OperatorRuntimeStatus> {
@@ -287,6 +295,7 @@ export class OperatorApplicationService implements OperatorApplication {
   }
 
   async waitForRun(jobId: string): Promise<OperatorRunSession> {
+    if (this.reconciliationPromise) await this.reconciliationPromise;
     return toRunSession(await this.runner.waitForRun(required(jobId, 'Job ID')));
   }
 
@@ -811,14 +820,73 @@ export class OperatorApplicationService implements OperatorApplication {
     for (const run of await this.store.listOperatorRuns()) {
       if (run.status !== 'needs_human') continue;
       const trust = await this.trustProfiles.effectiveForJob(run.jobId);
-      if (!canAutonomouslyPerformRiskTier(trust.policy, 'green')) continue;
+      const job = await this.store.getJob(run.jobId);
+      if (!job || !canAutonomouslyPerformRiskTier(
+        trust.policy,
+        riskTierForExecutionMode(executionModeForJob(job)),
+      )) continue;
       const escalations = await this.store.listEscalations(run.jobId, true);
       for (const escalation of escalations) {
         if (classifyEscalationResolution(escalation) !== 'machine-resolvable') continue;
-        if (!isRecoverableObservationEscalation(escalation)) continue;
-        await this.reconcileTimedOutExecution(escalation.id);
+        if (isRecoverableObservationEscalation(escalation)) {
+          await this.reconcileTimedOutExecution(escalation.id);
+          continue;
+        }
+        if (isRecoverableRuntimeCapacityEscalation(escalation) && this.runtimeFreshness) {
+          await this.reconcileRuntimeCapacityEscalation(run, escalation);
+        }
       }
     }
+  }
+
+  private async reconcileRuntimeCapacityEscalation(
+    run: DurableOperatorRun,
+    escalation: DurableEscalation,
+  ): Promise<void> {
+    const job = await this.store.getJob(run.jobId);
+    if (!job || run.status !== 'needs_human') return;
+    if (!job.preferredRuntimeAgentId) return;
+    const attempts = await this.store.listAttemptsForJob(job.id);
+    if (attempts.some(attempt => isActiveAttemptStatus(attempt.status))
+      || await this.hasUncertainDispatch(attempts)) return;
+    const readiness = await this.runtimeFreshness!.ensureExecutionAgentForJob(
+      job.id,
+      job.preferredRuntimeAgentId,
+    );
+    const timestamp = this.now().toISOString();
+    if (readiness.state !== 'ready') {
+      await this.store.resolveEscalationAndCreateEscalation(
+        escalation.id,
+        timestamp,
+        'Daily Driver attempted bounded Worker runtime recovery and stopped safely.',
+        {
+          id: this.escalationIdFactory(),
+          jobId: job.id,
+          reason: 'runtime_failure',
+          summary: `Worker runtime recovery failed: ${readiness.message}`,
+          createdAt: timestamp,
+        },
+      );
+      return;
+    }
+    const currentRun = await this.store.getOperatorRunForJob(job.id);
+    if (!currentRun || currentRun.status !== 'needs_human') return;
+    const pending: DurableOperatorRun = {
+      ...currentRun,
+      status: 'pending',
+      failureMessage: undefined,
+      revision: currentRun.revision + 1,
+      updatedAt: timestamp,
+      startedAt: undefined,
+      finishedAt: undefined,
+    };
+    await this.store.resolveEscalationAndResumeOperatorRun(
+      escalation.id,
+      timestamp,
+      `Daily Driver recovered and verified runtime ${job.preferredRuntimeAgentId}; no Dispatch was resent.`,
+      pending,
+      currentRun.revision,
+    );
   }
 }
 
@@ -850,6 +918,13 @@ function isRecoverableObservationEscalation(
   return escalation.reason === 'observation_timeout'
     || (escalation.reason === 'runtime_failure'
       && escalation.summary.startsWith('Runtime observation failed:'));
+}
+
+function isRecoverableRuntimeCapacityEscalation(
+  escalation: { reason: string; summary: string },
+): boolean {
+  return escalation.reason === 'policy_blocked'
+    && /runtime-disabled|runtime-stopped/i.test(escalation.summary);
 }
 
 function classifyEscalation(

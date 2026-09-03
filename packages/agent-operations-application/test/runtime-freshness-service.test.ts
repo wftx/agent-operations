@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  CONSERVATIVE_TRUST_POLICY,
   DAILY_DRIVER_TRUST_POLICY,
   InMemoryAgentOperationsStateStore,
   createExecutionDispatchIdempotencyKey,
@@ -16,6 +17,7 @@ import { JobLifecycleService } from '../../agent-operations-core/src/index.js';
 const time = '2026-09-02T12:00:00.000Z';
 const jobId = 'job:freshness';
 const agentId = 'agent-operations/ao-orchestrator';
+const workerId = 'agent-operations/rehearsal';
 
 describe('RuntimeFreshnessService', () => {
   it('detects stale source and tool identity, restarts safely, and verifies current identity', async () => {
@@ -89,13 +91,105 @@ describe('RuntimeFreshnessService', () => {
     await expect(service.ensureCurrentForJob(jobId)).resolves.toMatchObject({ state: 'restart-pending' });
     expect(restarts).toBe(0);
   });
+
+  it('enables and starts a disabled Worker under Daily Driver, then verifies revision and catalog', async () => {
+    const store = await fixtureStore();
+    let detail = executionRuntimeDetail(false, 'stopped');
+    let recoveries = 0;
+    const service = new RuntimeFreshnessService(
+      store,
+      fakeExecutionRuntime(() => detail),
+      {
+        start: async () => startResult(),
+        ensureAgentRunning: async id => {
+          recoveries += 1;
+          detail = executionRuntimeDetail();
+          return { status: 'started', agentId: id, message: 'started', enabled: true, started: true };
+        },
+      },
+      dailyDriverTrust(),
+      { runtimeAgentId: agentId, expectedToolCatalogRevision: 'sha256:new-tools', expectedRevision: 'sha256:new-build' },
+    );
+
+    await expect(service.ensureExecutionAgentForJob(jobId, workerId)).resolves.toMatchObject({
+      state: 'ready', automaticallyEnabled: true, automaticallyStarted: true,
+      runtimeRevisionCurrent: true, toolCatalogCurrent: true,
+    });
+    expect(recoveries).toBe(1);
+  });
+
+  it('keeps disabled Worker recovery explicit under Conservative policy', async () => {
+    const store = await fixtureStore();
+    let recoveries = 0;
+    const service = new RuntimeFreshnessService(
+      store,
+      fakeExecutionRuntime(() => executionRuntimeDetail(false, 'stopped')),
+      {
+        start: async () => startResult(),
+        ensureAgentRunning: async id => {
+          recoveries += 1;
+          return { status: 'started', agentId: id, message: 'started', enabled: true, started: true };
+        },
+      },
+      conservativeTrust(),
+      { runtimeAgentId: agentId, expectedToolCatalogRevision: 'sha256:new-tools', expectedRevision: 'sha256:new-build' },
+    );
+
+    await expect(service.ensureExecutionAgentForJob(jobId, workerId)).resolves.toMatchObject({ state: 'blocked' });
+    expect(recoveries).toBe(0);
+  });
+
+  it('does not recover a Worker while a provider submission is active', async () => {
+    const store = await fixtureStore();
+    await seedAcceptedExecution(store, 'submitting');
+    let recoveries = 0;
+    const service = new RuntimeFreshnessService(
+      store,
+      fakeExecutionRuntime(() => executionRuntimeDetail(false, 'stopped')),
+      {
+        start: async () => startResult(),
+        ensureAgentRunning: async id => {
+          recoveries += 1;
+          return { status: 'started', agentId: id, message: 'started', enabled: true, started: true };
+        },
+      },
+      dailyDriverTrust(),
+      { runtimeAgentId: agentId, expectedToolCatalogRevision: 'sha256:new-tools', expectedRevision: 'sha256:new-build' },
+    );
+
+    await expect(service.ensureExecutionAgentForJob(jobId, workerId)).resolves.toMatchObject({
+      state: 'blocked', activeAcceptedWork: 1,
+    });
+    expect(recoveries).toBe(0);
+  });
+
+  it('returns a truthful failed readiness result when Worker startup fails', async () => {
+    const store = await fixtureStore();
+    const service = new RuntimeFreshnessService(
+      store,
+      fakeExecutionRuntime(() => executionRuntimeDetail(false, 'stopped')),
+      {
+        start: async () => startResult(),
+        ensureAgentRunning: async id => ({
+          status: 'failed', agentId: id, message: 'could not start', enabled: false, started: false,
+          diagnostic: 'daemon rejected start',
+        }),
+      },
+      dailyDriverTrust(),
+      { runtimeAgentId: agentId, expectedToolCatalogRevision: 'sha256:new-tools', expectedRevision: 'sha256:new-build' },
+    );
+
+    await expect(service.ensureExecutionAgentForJob(jobId, workerId)).resolves.toMatchObject({
+      state: 'failed', message: expect.stringContaining('daemon rejected start'),
+    });
+  });
 });
 
 async function fixtureStore() {
   const store = new InMemoryAgentOperationsStateStore();
   await store.applyProjectConfiguration({
     project: { id: 'project:freshness', name: 'Freshness', createdAt: time, updatedAt: time },
-    repositories: [], checkoutBindings: [], runtimeAgentIds: [agentId],
+    repositories: [], checkoutBindings: [], runtimeAgentIds: [agentId, workerId],
   });
   await store.createJob({
     id: jobId, projectId: 'project:freshness', title: 'Fresh runtime', status: 'draft',
@@ -107,7 +201,7 @@ async function fixtureStore() {
 
 async function seedAcceptedExecution(
   store: InMemoryAgentOperationsStateStore,
-  terminalStatus: 'accepted' | 'uncertain' = 'accepted',
+  terminalStatus: 'submitting' | 'accepted' | 'uncertain' = 'accepted',
 ) {
   const attempt = await store.createAttempt({
     id: 'attempt:freshness', jobId, runtimeAgentId: agentId, executionRole: 'worker',
@@ -133,6 +227,7 @@ async function seedAcceptedExecution(
   await store.createExecutionDispatch(prepared);
   const submitting = { ...prepared, status: 'submitting' as const, revision: 1, submittedAt: time };
   await store.saveExecutionDispatchTransition(submitting, 0);
+  if (terminalStatus === 'submitting') return;
   await store.saveExecutionDispatchTransition({
     ...submitting, status: terminalStatus, revision: 2, resolvedAt: time,
     ...(terminalStatus === 'accepted' ? {
@@ -143,11 +238,27 @@ async function seedAcceptedExecution(
   }, 1);
 }
 
-function runtimeDetail(toolCatalogRevision: string, loadedRevision: string): AgentRuntimeDetail {
+function runtimeDetail(
+  toolCatalogRevision: string,
+  loadedRevision: string,
+  enabled = true,
+  state: AgentRuntimeDetail['health']['state'] = 'running',
+): AgentRuntimeDetail {
   return {
     id: agentId, name: 'ao-orchestrator', organization: 'agent-operations', provider: 'codex',
-    enabled: true, configured: true, capabilities: ['exact-turn-correlation'],
-    health: { state: 'running' }, observedAt: time, toolCatalogRevision, loadedRevision,
+    enabled, configured: true, capabilities: ['exact-turn-correlation'],
+    health: { state }, observedAt: time, toolCatalogRevision, loadedRevision,
+  };
+}
+
+function executionRuntimeDetail(
+  enabled = true,
+  state: AgentRuntimeDetail['health']['state'] = 'running',
+): AgentRuntimeDetail {
+  return {
+    id: workerId, name: 'rehearsal', organization: 'agent-operations', provider: 'codex',
+    enabled, configured: true, capabilities: ['exact-turn-correlation'],
+    health: { state }, observedAt: time, loadedRevision: 'sha256:new-build',
   };
 }
 
@@ -159,8 +270,22 @@ function fakeRuntime(read: () => AgentRuntimeDetail): AgentRuntimeAdapter {
   };
 }
 
+function fakeExecutionRuntime(readWorker: () => AgentRuntimeDetail): AgentRuntimeAdapter {
+  const readOrchestrator = () => runtimeDetail('sha256:new-tools', 'sha256:new-build');
+  return {
+    listAgents: async () => [readOrchestrator(), readWorker()],
+    getAgent: async id => id === workerId ? readWorker() : id === agentId ? readOrchestrator() : null,
+    getHealth: async () => ({ state: 'available', observedAt: time, agentCount: 2 }),
+  };
+}
+
 function dailyDriverTrust(): TrustProfileApplication {
   const effective = async () => ({ profile: null, policy: DAILY_DRIVER_TRUST_POLICY, source: 'global' as const });
+  return { list: async () => [], save: async () => { throw new Error('not used'); }, effectiveForProject: effective, effectiveForJob: effective };
+}
+
+function conservativeTrust(): TrustProfileApplication {
+  const effective = async () => ({ profile: null, policy: CONSERVATIVE_TRUST_POLICY, source: 'global' as const });
   return { list: async () => [], save: async () => { throw new Error('not used'); }, effectiveForProject: effective, effectiveForJob: effective };
 }
 

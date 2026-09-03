@@ -106,10 +106,21 @@ export interface RuntimeStartResult {
   readonly diagnostic?: string;
 }
 
+export interface RuntimeAgentStartResult {
+  readonly status: 'ready' | 'started' | 'failed';
+  readonly agentId: string;
+  readonly message: string;
+  readonly enabled: boolean;
+  readonly started: boolean;
+  readonly diagnostic?: string;
+}
+
 /** Explicit mutation port. Runtime inventory and page reads never call it. */
 export interface RuntimeLifecycleAdapter {
   start(): Promise<RuntimeStartResult>;
   restart?(): Promise<RuntimeStartResult>;
+  /** Bounded execution capacity recovery. It must not activate inbound transports or schedules. */
+  ensureAgentRunning?(agentId: string): Promise<RuntimeAgentStartResult>;
 }
 
 export type RuntimeFreshnessState = 'current' | 'restart-pending' | 'restarting' | 'stale-blocked';
@@ -122,6 +133,18 @@ export interface RuntimeFreshnessReport {
   readonly loadedRevision?: string;
   readonly activeAcceptedWork: number;
   readonly message: string;
+}
+
+export interface ExecutionRuntimeReadinessReport {
+  readonly state: 'ready' | 'blocked' | 'failed';
+  readonly agentId: string;
+  readonly activeAcceptedWork: number;
+  readonly automaticallyEnabled: boolean;
+  readonly automaticallyStarted: boolean;
+  readonly runtimeRevisionCurrent: boolean;
+  readonly toolCatalogCurrent: boolean;
+  readonly message: string;
+  readonly loadedRevision?: string;
 }
 
 export function isRuntimeProvider(value: unknown): value is RuntimeProvider {

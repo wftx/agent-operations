@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -22,6 +22,7 @@ afterEach(() => {
 
 class MutableRuntime implements AgentRuntimeAdapter {
   ready = false;
+  enabled = true;
 
   async listAgents(): Promise<readonly AgentRuntimeSummary[]> {
     return [this.agent()];
@@ -45,10 +46,13 @@ class MutableRuntime implements AgentRuntimeAdapter {
       name: 'rehearsal',
       organization: 'agent-operations',
       provider: 'codex',
-      enabled: true,
+      enabled: this.enabled,
       configured: true,
       capabilities: ['exact-turn-correlation'],
-      health: { state: this.ready ? 'running' : 'unknown', ...(this.ready ? { pid: 77 } : {}) },
+      health: {
+        state: this.ready ? 'running' : this.enabled ? 'unknown' : 'stopped',
+        ...(this.ready ? { pid: 77 } : {}),
+      },
     };
   }
 }
@@ -144,6 +148,67 @@ describe('CortextOSRuntimeLifecycleAdapter', () => {
     expect(result.diagnostic).toContain('code 1');
     expect(result.diagnostic).not.toContain(fakeCredential);
     expect(spawnProcess).toHaveBeenCalledTimes(1);
+  });
+
+  it('atomically enables and starts an execution only agent without activating Telegram or schedules', async () => {
+    const fixture = setup();
+    fixture.runtime.enabled = false;
+    const agentRoot = join(fixture.root, 'orgs', 'agent-operations', 'agents', 'rehearsal');
+    mkdirSync(agentRoot, { recursive: true });
+    writeFileSync(join(agentRoot, 'config.json'), JSON.stringify({
+      runtime: 'codex-app-server', telegram_polling: false, crons: [],
+    }));
+    const registryPath = join(fixture.options.ctxRoot, 'config', 'enabled-agents.json');
+    mkdirSync(join(fixture.options.ctxRoot, 'config'), { recursive: true });
+    writeFileSync(registryPath, JSON.stringify({
+      rehearsal: { enabled: false, org: 'agent-operations', status: 'configured' },
+    }));
+    const sendAgentCommand = vi.fn(async () => {
+      fixture.runtime.enabled = true;
+      fixture.runtime.ready = true;
+      return { success: true };
+    });
+    const adapter = new CortextOSRuntimeLifecycleAdapter({
+      ...fixture.options,
+      runtime: fixture.runtime,
+      sendAgentCommand,
+      readinessIntervalMs: 0,
+    });
+
+    const [first, second] = await Promise.all([
+      adapter.ensureAgentRunning('agent-operations/rehearsal'),
+      adapter.ensureAgentRunning('agent-operations/rehearsal'),
+    ]);
+
+    expect(first).toMatchObject({ status: 'started', enabled: true, started: true });
+    expect(second).toEqual(first);
+    await expect(adapter.ensureAgentRunning('agent-operations/rehearsal')).resolves.toMatchObject({
+      status: 'ready', enabled: false, started: false,
+    });
+    expect(sendAgentCommand).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(readFileSync(registryPath, 'utf8')).rehearsal.enabled).toBe(true);
+    expect(JSON.parse(readFileSync(join(agentRoot, 'config.json'), 'utf8'))).toMatchObject({
+      telegram_polling: false, crons: [],
+    });
+  });
+
+  it('refuses to start an agent whose inbound polling or schedules would be activated', async () => {
+    const fixture = setup();
+    fixture.runtime.enabled = false;
+    const agentRoot = join(fixture.root, 'orgs', 'agent-operations', 'agents', 'rehearsal');
+    mkdirSync(agentRoot, { recursive: true });
+    writeFileSync(join(agentRoot, 'config.json'), JSON.stringify({
+      runtime: 'codex-app-server', telegram_polling: true, crons: [],
+    }));
+    const sendAgentCommand = vi.fn();
+    const adapter = new CortextOSRuntimeLifecycleAdapter({
+      ...fixture.options, runtime: fixture.runtime, sendAgentCommand,
+    });
+
+    await expect(adapter.ensureAgentRunning('agent-operations/rehearsal')).resolves.toMatchObject({
+      status: 'failed', diagnostic: expect.stringContaining('Telegram polling'),
+    });
+    expect(sendAgentCommand).not.toHaveBeenCalled();
   });
 });
 

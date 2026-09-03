@@ -31,10 +31,12 @@ import type {
   TrustProfilePreset,
   TrustProfileScope,
   RuntimeFreshnessReport,
+  ExecutionRuntimeReadinessReport,
 } from '../../agent-operations-contracts/src/index.js';
 
 export type {
   DurableTrustProfile,
+  ExecutionRuntimeReadinessReport,
   RuntimeFreshnessReport,
   RuntimeStartResult,
 } from '../../agent-operations-contracts/src/index.js';
@@ -288,6 +290,10 @@ export interface DailyDriverMetricsApplication { read(): Promise<DailyDriverMetr
 export interface RuntimeFreshnessApplication {
   inspect(): Promise<RuntimeFreshnessReport>;
   ensureCurrentForJob(jobId: string): Promise<RuntimeFreshnessReport>;
+  ensureExecutionAgentForJob(
+    jobId: string,
+    runtimeAgentId: string,
+  ): Promise<ExecutionRuntimeReadinessReport>;
 }
 
 export interface PreviewApplication {

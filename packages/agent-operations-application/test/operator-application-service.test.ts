@@ -18,9 +18,11 @@ import {
   OPERATOR_READ_ONLY_DEFAULTS,
   OPERATOR_ISOLATED_WRITE_DEFAULTS,
   OperatorApplicationService,
+  TrustProfileApplicationService,
   type OperatorNotificationEvent,
   type OperatorNotifier,
   type OperatorOrchestrationPort,
+  type RuntimeFreshnessApplication,
   type OperatorTaskInput,
 } from '../src/index.js';
 
@@ -977,7 +979,119 @@ describe('OperatorApplicationService', () => {
     expect(orchestration.runCalls).toBe(1);
     expect(await store.getJob(job.id)).toMatchObject({ status: 'completed' });
   });
+
+  it('recovers a disabled Worker escalation once and resumes with one fresh Attempt', async () => {
+    const store = await configuredStore();
+    const lifecycle = new JobLifecycleService(store, {
+      now: () => new Date(TIME), jobIdFactory: () => 'job:runtime-recovery',
+    });
+    const job = await lifecycle.markJobReady((await lifecycle.createJob({
+      projectId: PROJECT_ID,
+      repositoryId: REPOSITORY_ID,
+      preferredRuntimeAgentId: RUNTIME_ID,
+      title: 'Recover Worker capacity',
+      description: INPUT.task,
+      acceptanceCriteria: INPUT.acceptanceCriteria,
+      automaticReadOnlyCompletion: true,
+    })).id);
+    const cancelled = await lifecycle.cancelAttempt((await lifecycle.createAttempt(job.id, {
+      runtimeAgentId: RUNTIME_ID, executionRole: 'worker',
+    })).id);
+    await store.createEscalation({
+      id: 'escalation:runtime-recovery', jobId: job.id, attemptId: cancelled.id,
+      reason: 'policy_blocked',
+      summary: `Execution preflight blocked before Dispatch: runtime-disabled: Runtime ${RUNTIME_ID} is disabled.; runtime-stopped: Runtime ${RUNTIME_ID} is stopped.`,
+      createdAt: TIME,
+    });
+    const pending = {
+      id: 'operator-run:runtime-recovery', jobId: job.id, status: 'pending' as const,
+      revision: 0, createdAt: TIME, updatedAt: TIME,
+    };
+    await store.createOperatorRun(pending);
+    await store.saveOperatorRunTransition({ ...pending, status: 'running', revision: 1, startedAt: TIME }, 0);
+    await store.saveOperatorRunTransition({
+      ...pending, status: 'needs_human', revision: 2, startedAt: TIME, finishedAt: TIME,
+    }, 1);
+    let recoveries = 0;
+    const runtimeFreshness: RuntimeFreshnessApplication = {
+      inspect: async () => currentFreshness(),
+      ensureCurrentForJob: async () => currentFreshness(),
+      ensureExecutionAgentForJob: async (_jobId, agentId) => {
+        recoveries += 1;
+        return {
+          state: 'ready', agentId, activeAcceptedWork: 0,
+          automaticallyEnabled: true, automaticallyStarted: true,
+          runtimeRevisionCurrent: true, toolCatalogCurrent: true,
+          message: 'Worker recovered', loadedRevision: 'sha256:current',
+        };
+      },
+    };
+    const trustProfiles = new TrustProfileApplicationService(store, { now: () => new Date(TIME) });
+    await trustProfiles.save({ scope: 'global', preset: 'daily-driver' });
+    const orchestration = new FakeOrchestration(store);
+    const application = new OperatorApplicationService(store, orchestration, {
+      now: () => new Date(TIME), runtimeFreshness, trustProfiles,
+    });
+
+    application.startRunner();
+    expect((await application.waitForRun(job.id)).status).toBe('done');
+    application.startRunner();
+    expect((await application.waitForRun(job.id)).status).toBe('done');
+
+    const jobs = await store.listJobs();
+    const workers = (await store.listAttemptsForJob(job.id))
+      .filter(attempt => attempt.executionRole === 'worker');
+    expect(jobs).toHaveLength(1);
+    expect(workers).toHaveLength(2);
+    expect(workers[0]).toMatchObject({ id: cancelled.id, status: 'cancelled' });
+    expect(workers[1]).toMatchObject({ status: 'completed' });
+    expect(await store.getExecutionPlanForAttempt(cancelled.id)).toBeNull();
+    expect((await store.listEscalations(job.id, true))).toEqual([]);
+    expect(orchestration.runCalls).toBe(1);
+    expect(recoveries).toBe(2);
+  });
+
+  it('stops in truthful Needs Me when bounded Worker runtime recovery fails', async () => {
+    const store = await configuredStore();
+    const orchestration = new FakeOrchestration(store);
+    const runtimeFreshness: RuntimeFreshnessApplication = {
+      inspect: async () => currentFreshness(),
+      ensureCurrentForJob: async () => currentFreshness(),
+      ensureExecutionAgentForJob: async (_jobId, agentId) => ({
+        state: 'failed', agentId, activeAcceptedWork: 0,
+        automaticallyEnabled: false, automaticallyStarted: false,
+        runtimeRevisionCurrent: true, toolCatalogCurrent: true,
+        message: 'Worker runtime start was rejected by the daemon.',
+      }),
+    };
+    const application = new OperatorApplicationService(store, orchestration, {
+      now: () => new Date(TIME), runtimeFreshness,
+    });
+
+    const started = await application.runOperatorJob(INPUT);
+    expect((await application.waitForRun(started.jobId)).status).toBe('needs-human');
+    expect(orchestration.runCalls).toBe(0);
+    expect(await store.listAttemptsForJob(started.jobId)).toEqual([]);
+    expect(await store.listEscalations(started.jobId, true)).toEqual([
+      expect.objectContaining({
+        reason: 'runtime_failure',
+        summary: expect.stringContaining('Worker runtime start was rejected by the daemon.'),
+      }),
+    ]);
+  });
 });
+
+function currentFreshness() {
+  return {
+    state: 'current' as const,
+    expectedToolCatalogRevision: 'sha256:tools',
+    loadedToolCatalogRevision: 'sha256:tools',
+    expectedRevision: 'sha256:current',
+    loadedRevision: 'sha256:current',
+    activeAcceptedWork: 0,
+    message: 'Runtime current',
+  };
+}
 
 async function configuredStore(): Promise<InMemoryAgentOperationsStateStore> {
   const store = new InMemoryAgentOperationsStateStore({

@@ -50,6 +50,7 @@ export type {
   RuntimeFreshnessApplication,
   DurableTrustProfile,
   RuntimeFreshnessReport,
+  ExecutionRuntimeReadinessReport,
 } from './types.js';
 export { OrchestratorConversationApplicationService } from './orchestrator-conversation-service.js';
 export { OrchestratorToolApplicationService } from './orchestrator-tool-application-service.js';

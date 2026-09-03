@@ -1,4 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import {
   accessSync,
   chmodSync,
@@ -9,12 +10,17 @@ import {
   openSync,
   readFileSync,
   realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
 } from 'node:fs';
+import { createConnection } from 'node:net';
 import { homedir } from 'node:os';
-import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
+import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type {
   AgentRuntimeAdapter,
   AgentRuntimeSummary,
+  RuntimeAgentStartResult,
   RuntimeLifecycleAdapter,
   RuntimeStartResult,
   RuntimeStartupInventory,
@@ -50,6 +56,9 @@ export interface CortextOSRuntimeLifecycleAdapterOptions {
     options: { readonly cwd: string; readonly env: NodeJS.ProcessEnv; readonly stdoutFd: number; readonly stderrFd: number },
   ) => SpawnedRuntimeProcess;
   readonly isProcessAlive?: (pid: number) => boolean;
+  readonly sendAgentCommand?: (
+    agentName: string,
+  ) => Promise<{ readonly success: boolean; readonly error?: string }>;
 }
 
 /** Explicit local lifecycle mutation. Inventory methods never call this adapter. */
@@ -65,8 +74,10 @@ export class CortextOSRuntimeLifecycleAdapter implements RuntimeLifecycleAdapter
   private readonly codexCandidates: readonly string[];
   private readonly spawnProcess: NonNullable<CortextOSRuntimeLifecycleAdapterOptions['spawnProcess']>;
   private readonly isProcessAlive: (pid: number) => boolean;
+  private readonly sendAgentCommand: NonNullable<CortextOSRuntimeLifecycleAdapterOptions['sendAgentCommand']>;
   private startInFlight: Promise<RuntimeStartResult> | null = null;
   private restartInFlight: Promise<RuntimeStartResult> | null = null;
+  private readonly agentStartsInFlight = new Map<string, Promise<RuntimeAgentStartResult>>();
 
   constructor(options: CortextOSRuntimeLifecycleAdapterOptions = {}) {
     this.instanceId = options.instanceId ?? options.environment?.CTX_INSTANCE_ID
@@ -88,6 +99,8 @@ export class CortextOSRuntimeLifecycleAdapter implements RuntimeLifecycleAdapter
     this.codexCandidates = options.codexCandidates ?? DEFAULT_CODEX_CANDIDATES;
     this.spawnProcess = options.spawnProcess ?? spawnRuntimeProcess;
     this.isProcessAlive = options.isProcessAlive ?? defaultIsProcessAlive;
+    this.sendAgentCommand = options.sendAgentCommand
+      ?? (agentName => sendStartAgent(this.instanceId, this.ctxRoot, agentName));
   }
 
   async start(): Promise<RuntimeStartResult> {
@@ -102,6 +115,104 @@ export class CortextOSRuntimeLifecycleAdapter implements RuntimeLifecycleAdapter
     if (this.restartInFlight) return this.restartInFlight;
     this.restartInFlight = this.restartOnce().finally(() => { this.restartInFlight = null; });
     return this.restartInFlight;
+  }
+
+  async ensureAgentRunning(agentId: string): Promise<RuntimeAgentStartResult> {
+    const cleanId = agentId.trim();
+    const existing = this.agentStartsInFlight.get(cleanId);
+    if (existing) return existing;
+    const operation = this.ensureAgentRunningOnce(cleanId)
+      .finally(() => this.agentStartsInFlight.delete(cleanId));
+    this.agentStartsInFlight.set(cleanId, operation);
+    return operation;
+  }
+
+  private async ensureAgentRunningOnce(agentId: string): Promise<RuntimeAgentStartResult> {
+    const initial = await this.runtime.getAgent(agentId).catch(() => null);
+    if (!initial || !initial.configured || initial.provider === 'unknown') {
+      return agentStartFailure(agentId, 'Worker runtime is not a known configured agent.');
+    }
+    if (initial.enabled !== false && initial.health.state === 'running') {
+      return {
+        status: 'ready', agentId, message: `Runtime ${agentId} is already running.`,
+        enabled: false, started: false,
+      };
+    }
+    const safety = this.inspectExecutionAgentSafety(initial.organization, initial.name);
+    if (!safety.safe) return agentStartFailure(agentId, safety.reason);
+
+    const registryPath = join(this.ctxRoot, 'config', 'enabled-agents.json');
+    let originalRegistry: string | null = null;
+    let enabledByThisCall = false;
+    try {
+      originalRegistry = existsSync(registryPath) ? readFileSync(registryPath, 'utf8') : null;
+      const registry = originalRegistry === null ? {} : parseRegistry(originalRegistry);
+      const registered = registry[initial.name];
+      const current: Record<string, unknown> = isRecord(registered) ? registered : {};
+      if (initial.enabled === false || !isRecord(registered)) {
+        registry[initial.name] = {
+          ...current,
+          enabled: true,
+          status: 'configured',
+          ...(initial.organization ? { org: initial.organization } : {}),
+        };
+        writeAtomicJson(registryPath, registry);
+        enabledByThisCall = true;
+      }
+      const response = await this.sendAgentCommand(initial.name);
+      if (!response.success) throw new Error(response.error ?? 'Daemon rejected the Worker start request.');
+      const startedAt = Date.now();
+      while (Date.now() - startedAt <= this.readinessTimeoutMs) {
+        const observed = await this.runtime.getAgent(agentId).catch(() => null);
+        if (observed?.enabled !== false && observed?.health.state === 'running') {
+          return {
+            status: 'started', agentId, message: `Runtime ${agentId} is running.`,
+            enabled: enabledByThisCall, started: true,
+          };
+        }
+        await this.sleep(this.readinessIntervalMs);
+      }
+      throw new Error(`Runtime ${agentId} did not become running within the bounded readiness window.`);
+    } catch (error) {
+      if (enabledByThisCall) restoreRegistry(registryPath, originalRegistry);
+      return agentStartFailure(agentId, errorMessage(error), enabledByThisCall);
+    }
+  }
+
+  private inspectExecutionAgentSafety(
+    organization: string | null,
+    name: string,
+  ): { readonly safe: true } | { readonly safe: false; readonly reason: string } {
+    if (!organization || !/^[A-Za-z0-9._-]+$/.test(organization) || !/^[A-Za-z0-9._-]+$/.test(name)) {
+      return { safe: false, reason: 'Worker runtime configuration identity is unsafe.' };
+    }
+    const agentsRoot = resolve(this.frameworkRoot, 'orgs', organization, 'agents');
+    const agentRoot = resolve(agentsRoot, name);
+    const fromAgentsRoot = relative(agentsRoot, agentRoot);
+    if (fromAgentsRoot.startsWith(`..${sep}`) || fromAgentsRoot === '..' || isAbsolute(fromAgentsRoot)) {
+      return { safe: false, reason: 'Worker runtime configuration escaped the agents root.' };
+    }
+    try {
+      const config = JSON.parse(readFileSync(join(agentRoot, 'config.json'), 'utf8')) as unknown;
+      if (!isRecord(config)) throw new Error('config root is not an object');
+      if (config.telegram_polling !== false) {
+        return { safe: false, reason: 'Worker runtime recovery would activate Telegram polling.' };
+      }
+      if (!Array.isArray(config.crons) || config.crons.length > 0) {
+        return { safe: false, reason: 'Worker runtime recovery would activate configured schedules.' };
+      }
+      const cronPath = join(this.ctxRoot, '.cortextOS', 'state', 'agents', name, 'crons.json');
+      if (existsSync(cronPath)) {
+        const crons = JSON.parse(readFileSync(cronPath, 'utf8')) as unknown;
+        const values = Array.isArray(crons) ? crons : isRecord(crons) ? crons.crons : null;
+        if (!Array.isArray(values) || values.length > 0) {
+          return { safe: false, reason: 'Worker runtime recovery would activate durable schedules.' };
+        }
+      }
+      return { safe: true };
+    } catch (error) {
+      return { safe: false, reason: `Worker runtime configuration could not be verified: ${errorMessage(error)}` };
+    }
   }
 
   private async restartOnce(): Promise<RuntimeStartResult> {
@@ -379,6 +490,90 @@ function boundedDiagnostic(value: string): string {
 
 function prependPath(directory: string, current: string | undefined): string {
   return [directory, current].filter(Boolean).join(delimiter);
+}
+
+function parseRegistry(raw: string): Record<string, unknown> {
+  const value = JSON.parse(raw) as unknown;
+  if (!isRecord(value)) throw new Error('Enabled agent registry is not an object.');
+  return value;
+}
+
+function writeAtomicJson(path: string, value: Record<string, unknown>): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const temporary = `${path}.ao-${process.pid}-${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    renameSync(temporary, path);
+    chmodSync(path, 0o600);
+  } finally {
+    try { if (existsSync(temporary)) unlinkSync(temporary); } catch { /* best effort */ }
+  }
+}
+
+function restoreRegistry(path: string, raw: string | null): void {
+  try {
+    if (raw === null) {
+      if (existsSync(path)) unlinkSync(path);
+      return;
+    }
+    const temporary = `${path}.ao-restore-${process.pid}-${randomUUID()}.tmp`;
+    writeFileSync(temporary, raw, { encoding: 'utf8', mode: 0o600 });
+    renameSync(temporary, path);
+    chmodSync(path, 0o600);
+  } catch {
+    // The failed recovery result remains truthful even if registry rollback fails.
+  }
+}
+
+function agentStartFailure(
+  agentId: string,
+  diagnostic: string,
+  enabled = false,
+): RuntimeAgentStartResult {
+  return {
+    status: 'failed', agentId, message: `Runtime ${agentId} could not be started safely.`,
+    enabled, started: false, diagnostic: boundedDiagnostic(diagnostic),
+  };
+}
+
+function sendStartAgent(
+  instanceId: string,
+  ctxRoot: string,
+  agentName: string,
+): Promise<{ readonly success: boolean; readonly error?: string }> {
+  const socketPath = process.platform === 'win32'
+    ? `\\\\.\\pipe\\cortextos-${instanceId}`
+    : join(ctxRoot, 'daemon.sock');
+  return new Promise(resolveResponse => {
+    const socket = createConnection(socketPath);
+    let data = '';
+    let settled = false;
+    const finish = (result: { readonly success: boolean; readonly error?: string }) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolveResponse(result);
+    };
+    socket.on('connect', () => {
+      socket.write(JSON.stringify({
+        type: 'start-agent', agent: agentName, source: 'agent-operations daily-driver recovery',
+      }));
+    });
+    socket.on('data', chunk => { data += chunk.toString(); });
+    socket.on('end', () => {
+      try {
+        const result = JSON.parse(data) as unknown;
+        finish(isRecord(result) && result.success === true
+          ? { success: true }
+          : { success: false, error: isRecord(result) && typeof result.error === 'string'
+            ? result.error : 'Daemon returned an invalid start response.' });
+      } catch {
+        finish({ success: false, error: 'Daemon returned an invalid start response.' });
+      }
+    });
+    socket.on('error', error => finish({ success: false, error: error.message }));
+    socket.setTimeout(5_000, () => finish({ success: false, error: 'Daemon start request timed out.' }));
+  });
 }
 
 function boundedDuration(value: number, field: string): number {

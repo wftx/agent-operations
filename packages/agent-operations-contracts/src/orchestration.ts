@@ -76,6 +76,10 @@ export function classifyEscalationResolution(
     && /stale|preview process|tool catalog|ephemeral|observation failed/i.test(escalation.summary)) {
     return 'machine-resolvable';
   }
+  if (escalation.reason === 'policy_blocked'
+    && /runtime-disabled|runtime-stopped/i.test(escalation.summary)) {
+    return 'machine-resolvable';
+  }
   if (escalation.reason === 'human_judgment_required'
     || escalation.reason === 'review_failed_after_budget'
     || escalation.reason === 'reviewer_uncertain') return 'operator-resolvable';

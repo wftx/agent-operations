@@ -14,6 +14,14 @@ describe('Daily Driver Needs Me policy', () => {
     expect(actionableEscalationText(escalation)).toContain('without resending accepted work');
   });
 
+  it('classifies disabled or stopped Worker capacity as machine resolvable', () => {
+    const escalation = {
+      reason: 'policy_blocked' as const,
+      summary: 'Execution preflight blocked before Dispatch: runtime-disabled; runtime-stopped.',
+    };
+    expect(classifyEscalationResolution(escalation)).toBe('machine-resolvable');
+  });
+
   it('gives a direct action for authentication and exhausted revision budgets', () => {
     expect(actionableEscalationText({
       reason: 'policy_blocked',

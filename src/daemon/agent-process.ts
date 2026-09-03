@@ -647,9 +647,9 @@ export class AgentProcess {
       ...(this.config.tool_profile === 'agent-operations-orchestrator'
         ? {
             toolCatalogRevision: AO_ORCHESTRATOR_TOOL_CATALOG_REVISION,
-            ...(LOADED_APPLICATION_REVISION ? { loadedRevision: LOADED_APPLICATION_REVISION } : {}),
           }
         : {}),
+      ...(LOADED_APPLICATION_REVISION ? { loadedRevision: LOADED_APPLICATION_REVISION } : {}),
       awaitingConfirmation:
         this.pty && 'isAwaitingInteractiveConfirmation' in this.pty
           ? this.pty.isAwaitingInteractiveConfirmation()

@@ -1,6 +1,7 @@
 import type {
   AgentOperationsStateStore,
   AgentRuntimeAdapter,
+  ExecutionRuntimeReadinessReport,
   RuntimeFreshnessReport,
   RuntimeLifecycleAdapter,
 } from '../../agent-operations-contracts/src/index.js';
@@ -71,6 +72,95 @@ export class RuntimeFreshnessService implements RuntimeFreshnessApplication {
     return verified.state === 'current'
       ? verified
       : { ...verified, state: 'stale-blocked', message: 'Runtime restarted, but the current tool catalog was not verified' };
+  }
+
+  async ensureExecutionAgentForJob(
+    jobId: string,
+    runtimeAgentId: string,
+  ): Promise<ExecutionRuntimeReadinessReport> {
+    const cleanAgentId = runtimeAgentId.trim();
+    const job = await this.store.getJob(jobId);
+    if (!job) throw new Error(`Job not found: ${jobId}`);
+    const associated = await this.store.listProjectRuntimeAgentIds(job.projectId);
+    if (!associated.includes(cleanAgentId)) {
+      return this.executionReadiness(
+        cleanAgentId, 'blocked', 0, false, false,
+        `Runtime ${cleanAgentId} is not associated with Project ${job.projectId}.`,
+      );
+    }
+    const freshness = await this.ensureCurrentForJob(jobId);
+    if (freshness.state !== 'current') {
+      return this.executionReadiness(
+        cleanAgentId, 'blocked', freshness.activeAcceptedWork, false, false,
+        freshness.message, undefined, false, false,
+      );
+    }
+    let agent = await this.runtime.getAgent(cleanAgentId);
+    const revisionCurrent = !this.options.expectedRevision
+      || agent?.loadedRevision === this.options.expectedRevision;
+    if (agent?.configured && agent.enabled !== false && agent.health.state === 'running' && revisionCurrent) {
+      return this.executionReadiness(
+        cleanAgentId, 'ready', freshness.activeAcceptedWork, false, false,
+        `Execution runtime ${cleanAgentId} is ready.`, agent.loadedRevision,
+      );
+    }
+    const trust = await this.trustProfiles.effectiveForJob(job.id);
+    if (!trust.policy.staleRuntimeAutoRestart || !this.lifecycle.ensureAgentRunning) {
+      return this.executionReadiness(
+        cleanAgentId, 'blocked', freshness.activeAcceptedWork, false, false,
+        `Execution runtime ${cleanAgentId} requires explicit enablement or startup.`, agent?.loadedRevision,
+        revisionCurrent,
+      );
+    }
+    const activeAcceptedWork = await this.countActiveAcceptedWork();
+    if (activeAcceptedWork > 0) {
+      return this.executionReadiness(
+        cleanAgentId, 'blocked', activeAcceptedWork, false, false,
+        'Active submitting, accepted, or uncertain execution prevents Worker runtime recovery.',
+        agent?.loadedRevision, revisionCurrent,
+      );
+    }
+    const recovered = await this.lifecycle.ensureAgentRunning(cleanAgentId);
+    if (recovered.status === 'failed') {
+      return this.executionReadiness(
+        cleanAgentId, 'failed', 0, recovered.enabled, recovered.started,
+        `${recovered.message}${recovered.diagnostic ? ` ${recovered.diagnostic}` : ''}`,
+        agent?.loadedRevision, revisionCurrent,
+      );
+    }
+    agent = await this.runtime.getAgent(cleanAgentId);
+    const verifiedRevision = !this.options.expectedRevision
+      || agent?.loadedRevision === this.options.expectedRevision;
+    const verifiedFreshness = await this.inspect();
+    const ready = Boolean(agent?.configured && agent.enabled !== false
+      && agent.health.state === 'running' && verifiedRevision
+      && verifiedFreshness.state === 'current');
+    return this.executionReadiness(
+      cleanAgentId, ready ? 'ready' : 'failed', 0,
+      recovered.enabled, recovered.started,
+      ready
+        ? `Execution runtime ${cleanAgentId} was recovered and verified.`
+        : `Execution runtime ${cleanAgentId} started, but revision or tool catalog verification failed.`,
+      agent?.loadedRevision, verifiedRevision, verifiedFreshness.state === 'current',
+    );
+  }
+
+  private executionReadiness(
+    agentId: string,
+    state: ExecutionRuntimeReadinessReport['state'],
+    activeAcceptedWork: number,
+    automaticallyEnabled: boolean,
+    automaticallyStarted: boolean,
+    message: string,
+    loadedRevision?: string,
+    runtimeRevisionCurrent = true,
+    toolCatalogCurrent = true,
+  ): ExecutionRuntimeReadinessReport {
+    return {
+      state, agentId, activeAcceptedWork, automaticallyEnabled, automaticallyStarted,
+      runtimeRevisionCurrent, toolCatalogCurrent, message,
+      ...(loadedRevision ? { loadedRevision } : {}),
+    };
   }
 
   private async countActiveAcceptedWork(): Promise<number> {
