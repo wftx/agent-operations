@@ -6,6 +6,9 @@ import type {
   DurableJobAttempt,
   DurableEscalation,
   DurableOperatorRun,
+  DurableJobRetirement,
+  DurableRepositoryRestoreAction,
+  JobRetirementDisposition,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   REPOSITORY_READ_EXECUTION_CAPABILITIES,
@@ -26,6 +29,10 @@ import {
 } from '../../agent-operations-contracts/src/index.js';
 import {
   JobLifecycleService,
+  JobRetirementService,
+  RepositoryRestoreService,
+  DEFAULT_GLOBAL_ACTIVE_REPOSITORY_WORKSPACE_LIMIT,
+  isActiveRepositoryWorkspace,
   MVP_MAX_WORKER_ATTEMPTS,
   readWorkerExecutionBudget,
   parseReviewerResult,
@@ -74,6 +81,8 @@ export interface OperatorApplicationServiceOptions {
   readonly deferRunnerWake?: boolean;
   readonly trustProfiles?: TrustProfileApplication;
   readonly runtimeFreshness?: RuntimeFreshnessApplication;
+  readonly jobRetirement?: JobRetirementService;
+  readonly repositoryRestore?: RepositoryRestoreService;
 }
 
 export const OPERATOR_READ_ONLY_DEFAULTS: OperatorPolicyDefaults = {
@@ -110,6 +119,8 @@ export class OperatorApplicationService implements OperatorApplication {
   private readonly deferRunnerWake: boolean;
   private readonly trustProfiles: TrustProfileApplication;
   private readonly runtimeFreshness?: RuntimeFreshnessApplication;
+  private readonly jobRetirement?: JobRetirementService;
+  private readonly repositoryRestore?: RepositoryRestoreService;
   private reconciliationPromise: Promise<void> | null = null;
 
   constructor(
@@ -129,6 +140,8 @@ export class OperatorApplicationService implements OperatorApplication {
     this.deferRunnerWake = options.deferRunnerWake ?? false;
     this.trustProfiles = options.trustProfiles ?? new TrustProfileApplicationService(store, { now: this.now });
     this.runtimeFreshness = options.runtimeFreshness;
+    this.jobRetirement = options.jobRetirement;
+    this.repositoryRestore = options.repositoryRestore;
     this.runner = new OperatorRunner(store, orchestration, {
       now: this.now,
       ...(options.notifier ? { notifier: options.notifier } : {}),
@@ -259,9 +272,14 @@ export class OperatorApplicationService implements OperatorApplication {
     try {
       const preview = await this.previewTask(input);
       if (preview.executionMode === 'repository-write-isolated') {
-        const occupied = (await this.store.listRepositoryWorkspaces()).find(workspace =>
-          ['preparing', 'active', 'reviewing', 'ready_for_approval'].includes(workspace.state));
-        if (occupied) throw new Error(`Write Job ${occupied.jobId} already owns the isolated workspace slot`);
+        const active = (await this.store.listRepositoryWorkspaces()).filter(isActiveRepositoryWorkspace);
+        const occupied = active.find(workspace => workspace.repositoryId === preview.repository.id);
+        if (occupied) {
+          throw new Error(`Write Job ${occupied.jobId} already owns the isolated workspace for repository ${preview.repository.id}`);
+        }
+        if (active.length >= DEFAULT_GLOBAL_ACTIVE_REPOSITORY_WORKSPACE_LIMIT) {
+          throw new Error(`The global active isolated workspace limit of ${DEFAULT_GLOBAL_ACTIVE_REPOSITORY_WORKSPACE_LIMIT} is reached`);
+        }
       }
       const created = await this.lifecycle.createJob({
         projectId: preview.project.id,
@@ -536,6 +554,30 @@ export class OperatorApplicationService implements OperatorApplication {
       .sort((left, right) => right.job.createdAt.localeCompare(left.job.createdAt));
   }
 
+  async retireJob(jobId: string, input: {
+    readonly disposition: JobRetirementDisposition;
+    readonly reason: string;
+    readonly evidenceReference?: string;
+    readonly actor: string;
+  }): Promise<DurableJobRetirement> {
+    if (!this.jobRetirement) throw new Error('Job retirement is not configured');
+    return this.jobRetirement.retire({ jobId, ...input });
+  }
+
+  async listRepositoryRestoreActions(): Promise<readonly DurableRepositoryRestoreAction[]> {
+    return this.store.listRepositoryRestoreActions();
+  }
+
+  async prepareRepositoryRestore(input: Parameters<RepositoryRestoreService['prepare']>[0]): Promise<DurableRepositoryRestoreAction> {
+    if (!this.repositoryRestore) throw new Error('Repository Restore is not configured');
+    return this.repositoryRestore.prepare(input);
+  }
+
+  async approveAndExecuteRepositoryRestore(id: string, approvedBy: string): Promise<DurableRepositoryRestoreAction> {
+    if (!this.repositoryRestore) throw new Error('Repository Restore is not configured');
+    return this.repositoryRestore.approveAndExecute(id, approvedBy);
+  }
+
   async getJobDetail(jobId: string): Promise<OperatorJobDetail> {
     const job = await this.store.getJob(required(jobId, 'Job ID'));
     if (!job) throw new Error(`Job not found: ${jobId}`);
@@ -583,6 +625,9 @@ export class OperatorApplicationService implements OperatorApplication {
       escalation.id,
       classifyEscalation(escalation, escalationActions[escalation.id] ?? []),
     ]));
+    const retirementAssessment = this.jobRetirement
+      ? await this.jobRetirement.assess(job.id)
+      : { safe: false, reasons: ['Job retirement is not configured'] };
     return {
       summary,
       acceptanceCriteria: job.acceptanceCriteria ?? '',
@@ -596,6 +641,8 @@ export class OperatorApplicationService implements OperatorApplication {
       inputs,
       escalationActions,
       escalationKinds,
+      retirementAllowed: retirementAssessment.safe && summary.retirement === null,
+      retirementReasons: retirementAssessment.reasons,
       ...(finalWorkerResult ? { finalWorkerResult } : {}),
       ...(finalReview ? { finalReview } : {}),
       ...(job.status === 'completed' ? { completedAt: job.updatedAt } : {}),
@@ -624,7 +671,10 @@ export class OperatorApplicationService implements OperatorApplication {
       workerMaximum,
     );
     const currentRole = activeAttempt?.executionRole ?? null;
-    const currentStage = await this.deriveStage(job, attempts, reviews, unresolved, operatorRun);
+    const retirement = await this.store.getJobRetirement(job.id);
+    const currentStage = retirement
+      ? 'Archived' as const
+      : await this.deriveStage(job, attempts, reviews, unresolved, operatorRun);
     const startedAt = operatorRun?.startedAt;
     const finishedAt = operatorRun?.finishedAt;
     return {
@@ -643,6 +693,7 @@ export class OperatorApplicationService implements OperatorApplication {
       needsHuman: unresolved.length > 0,
       operatorRun,
       currentStage,
+      retirement,
       ...(startedAt ? { startedAt } : {}),
       ...(finishedAt ? { finishedAt } : {}),
       ...(startedAt ? { durationMs: Math.max(0, new Date(finishedAt ?? this.now()).getTime() - new Date(startedAt).getTime()) } : {}),
@@ -954,6 +1005,8 @@ function taskTitle(task: string): string {
 }
 
 function matchesFilter(summary: OperatorJobSummary, filter: OperatorJobList): boolean {
+  if (filter === 'retired') return Boolean(summary.retirement);
+  if (summary.retirement) return false;
   if (filter === 'all') return true;
   if (filter === 'needs-human') return summary.needsHuman;
   if (filter === 'done') return summary.job.status === 'completed';

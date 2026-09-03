@@ -21,6 +21,7 @@ import {
   renderProjects,
   renderNewProject,
   renderTrustProfiles,
+  renderApprovals,
 } from './render.js';
 
 export class OperatorWebApplication {
@@ -161,6 +162,13 @@ export class OperatorWebApplication {
         const jobs = await this.application.listJobs('done');
         return html(renderDone(await Promise.all(jobs.map(job => this.application.getJobDetail(job.job.id)))));
       }
+      if (request.method === 'GET' && url.pathname === '/archived') {
+        return this.listPage('Archived', 'Historical Jobs with preserved evidence and no active ownership.', 'retired');
+      }
+      if (request.method === 'GET' && url.pathname === '/approvals') {
+        return html(renderApprovals(this.application.listRepositoryRestoreActions
+          ? await this.application.listRepositoryRestoreActions() : []));
+      }
       if (request.method === 'GET' && url.pathname === '/needs-me') {
         const jobs = await this.application.listJobs('needs-human');
         return html(renderNeedsMe(await Promise.all(jobs.map(job => this.application.getJobDetail(job.job.id)))));
@@ -171,6 +179,37 @@ export class OperatorWebApplication {
       }
       if (request.method === 'POST' && url.pathname === '/jobs') {
         return this.submit(request);
+      }
+      const retireJob = url.pathname.match(/^\/jobs\/([^/]+)\/retire$/);
+      if (request.method === 'POST' && retireJob) {
+        const form = await request.formData();
+        const disposition = textValue(form, 'disposition');
+        if (disposition !== 'retired' && disposition !== 'externally-published') {
+          throw new Error('Invalid Job retirement disposition');
+        }
+        const jobId = decodeURIComponent(retireJob[1]);
+        if (!this.application.retireJob) throw new Error('Job retirement is not configured');
+        await this.application.retireJob(jobId, {
+          disposition,
+          reason: textValue(form, 'reason'),
+          actor: textValue(form, 'actor') || 'human-operator',
+          ...(textValue(form, 'evidenceReference')
+            ? { evidenceReference: textValue(form, 'evidenceReference') }
+            : {}),
+        });
+        return redirect(`/jobs/${encodeURIComponent(jobId)}`);
+      }
+      const approveRestore = url.pathname.match(/^\/repository-restores\/([^/]+)\/approve$/);
+      if (request.method === 'POST' && approveRestore) {
+        const form = await request.formData();
+        if (!this.application.approveAndExecuteRepositoryRestore) {
+          throw new Error('Repository Restore is not configured');
+        }
+        await this.application.approveAndExecuteRepositoryRestore(
+          decodeURIComponent(approveRestore[1]),
+          textValue(form, 'approvedBy') || 'human-operator',
+        );
+        return redirect('/approvals');
       }
       const evidenceRequirement = url.pathname.match(/^\/jobs\/([^/]+)\/preview\/requirement$/);
       if (request.method === 'POST' && evidenceRequirement) {
@@ -312,7 +351,7 @@ export class OperatorWebApplication {
   }
 
   private async listPage(title: string, description: string, filter: OperatorJobList): Promise<Response> {
-    const active = filter === 'needs-human' ? 'needs-me' : filter === 'all' ? 'jobs' : filter;
+    const active = filter === 'needs-human' ? 'needs-me' : filter === 'retired' ? 'archived' : filter === 'all' ? 'jobs' : filter;
     return html(renderJobList(title, description, await this.application.listJobs(filter), active));
   }
 

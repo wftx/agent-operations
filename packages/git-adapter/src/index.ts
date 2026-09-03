@@ -16,3 +16,4 @@ export {
   GitPreviewWorkspaceAdapter,
   type GitPreviewWorkspaceAdapterOptions,
 } from './git-preview-workspace-adapter.js';
+export { GitRepositoryRestoreAdapter } from './git-repository-restore-adapter.js';

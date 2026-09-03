@@ -12,6 +12,7 @@ import type {
   EffectiveTrustProfile,
   DailyDriverMetrics,
   RuntimeFreshnessReport,
+  DurableRepositoryRestoreAction,
 } from '../../../packages/agent-operations-application/src/index.js';
 import { actionableEscalationText } from '../../../packages/agent-operations-application/src/index.js';
 
@@ -196,9 +197,21 @@ export function renderJobList(
   title: string,
   description: string,
   jobs: readonly OperatorJobSummary[],
-  active: 'jobs' | 'running' | 'needs-me' | 'done',
+  active: 'jobs' | 'running' | 'needs-me' | 'done' | 'archived',
 ): string {
   return layout(title, `<header class="page-head"><div><p class="eyebrow">Mission control</p><h1>${escapeHtml(title)}</h1><p>${escapeHtml(description)}</p></div><a class="refresh" href="/${active === 'jobs' ? '' : active}">Refresh</a></header>${renderJobTable(jobs, title)}`, active, active === 'running' ? 10 : undefined);
+}
+
+export function renderApprovals(actions: readonly DurableRepositoryRestoreAction[]): string {
+  const pending = actions.filter(action => action.state === 'pending-approval');
+  const content = pending.length ? pending.map(action => `<article class="card">
+    <div class="card-head"><div><span class="status needs">Red approval</span><h2>Selective tracked file restore</h2></div><time>${formatTime(action.createdAt)}</time></div>
+    <p>${escapeHtml(action.approvalSummary)}</p>
+    <dl class="facts"><div><dt>Repository</dt><dd>${escapeHtml(action.repositoryId)}</dd></div><div><dt>Branch and HEAD</dt><dd>${escapeHtml(action.preconditions.branch)} at ${escapeHtml(action.preconditions.headRevision)}</dd></div><div><dt>Restore exactly</dt><dd>${escapeHtml(action.preconditions.restorePaths.map(item => item.path).join('\n'))}</dd></div><div><dt>Preserve untracked</dt><dd>${escapeHtml(action.preconditions.preserveUntrackedPaths.map(item => item.path).join('\n') || 'No named files')}</dd></div></dl>
+    <div class="alert error"><strong>This discards uncommitted tracked changes.</strong><br>The action fails closed if branch, HEAD, status, or file hashes changed after this request.</div>
+    <form method="post" action="/repository-restores/${encodeURIComponent(action.id)}/approve"><input type="hidden" name="approvedBy" value="human-operator"><div class="actions"><button class="danger">Approve Exact Restore</button></div></form>
+  </article>`).join('') : '<div class="empty"><h2>No pending Red approvals</h2><p>Exact destructive actions requiring you will appear here.</p></div>';
+  return layout('Approvals', `<header class="page-head"><div><p class="eyebrow">Human authority</p><h1>Approvals</h1><p>Destructive operations remain bound to exact repository preconditions.</p></div><a class="refresh" href="/approvals">Refresh</a></header><section class="stack">${content}</section>`, 'approvals');
 }
 
 export function renderNeedsMe(jobs: readonly OperatorJobDetail[]): string {
@@ -257,8 +270,9 @@ export function renderJobDetail(detail: OperatorJobDetail): string {
     <section class="final"><p class="eyebrow">Final state</p><h2>${escapeHtml(summary.orchestrationState)}</h2>
       ${detail.finalWorkerResult ? `<h3>Worker result</h3><div class="result">${escapeHtml(detail.finalWorkerResult)}</div>` : ''}
       ${detail.finalReview ? `<h3>Reviewer ${escapeHtml(detail.finalReview.decision)}</h3><p>${escapeHtml(detail.finalReview.summary)}</p>` : ''}
-    </section>`;
-  return layout(summary.job.title, content, summary.needsHuman ? 'needs-me' : summary.job.status === 'completed' ? 'done' : 'running', summary.operatorRun?.status === 'pending' || summary.operatorRun?.status === 'running' ? 10 : undefined);
+    </section>
+    ${summary.retirement ? `<section class="criteria"><p class="eyebrow">Historical disposition</p><p><strong>${escapeHtml(humanize(summary.retirement.disposition))}</strong> · ${escapeHtml(summary.retirement.reason)}</p><p class="muted">Actor ${escapeHtml(summary.retirement.actor)} · ${formatTime(summary.retirement.retiredAt)}${summary.retirement.evidenceReference ? ` · evidence ${escapeHtml(summary.retirement.evidenceReference)}` : ''}</p></section>` : detail.retirementAllowed ? `<section class="criteria"><p class="eyebrow">Historical cleanup</p><p>Retiring preserves every durable record and releases any clean AO owned workspace.</p><form method="post" action="/jobs/${encodeURIComponent(summary.job.id)}/retire"><input type="hidden" name="disposition" value="retired"><input type="hidden" name="actor" value="human-operator"><label>Reason<input name="reason" value="Historical Job no longer requires active operational ownership." required></label><div class="actions"><button class="secondary">Retire Job</button></div></form></section>` : ''}`;
+  return layout(summary.job.title, content, summary.retirement ? 'archived' : summary.needsHuman ? 'needs-me' : summary.job.status === 'completed' ? 'done' : 'running', summary.operatorRun?.status === 'pending' || summary.operatorRun?.status === 'running' ? 10 : undefined);
 }
 
 function renderBrowserEvidence(detail: OperatorJobDetail): string {
@@ -307,8 +321,8 @@ function renderJobTable(jobs: readonly OperatorJobSummary[], title: string): str
   </a>`).join('')}</div></section>`;
 }
 
-function layout(title: string, content: string, active: 'orchestrator' | 'projects' | 'trust' | 'jobs' | 'running' | 'needs-me' | 'done', refreshSeconds?: number): string {
-  const nav = [['orchestrator', '/orchestrator', 'Orchestrator'], ['projects', '/projects', 'Projects'], ['trust', '/trust', 'Trust'], ['jobs', '/', 'Jobs'], ['running', '/running', 'Running'], ['needs-me', '/needs-me', 'Needs Me'], ['done', '/done', 'Done']]
+function layout(title: string, content: string, active: 'orchestrator' | 'projects' | 'trust' | 'jobs' | 'running' | 'needs-me' | 'done' | 'archived' | 'approvals', refreshSeconds?: number): string {
+  const nav = [['orchestrator', '/orchestrator', 'Orchestrator'], ['projects', '/projects', 'Projects'], ['trust', '/trust', 'Trust'], ['jobs', '/', 'Jobs'], ['running', '/running', 'Running'], ['needs-me', '/needs-me', 'Needs Me'], ['done', '/done', 'Done'], ['archived', '/archived', 'Archived'], ['approvals', '/approvals', 'Approvals']]
     .map(([key, href, label]) => `<a href="${href}" ${active === key ? 'aria-current="page"' : ''}>${label}</a>`).join('');
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refreshSeconds ? `<meta http-equiv="refresh" content="${refreshSeconds}">` : ''}<title>${escapeHtml(title)} · Agent Operations</title><style>${styles}</style></head><body><header class="topbar"><a class="brand" href="/"><span>AO</span><strong>Agent Operations</strong></a><nav>${nav}</nav><span class="local">Local only</span></header><main>${content}</main><footer>Agent Operations mission control · controlled repository work</footer></body></html>`;
 }

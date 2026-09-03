@@ -22,7 +22,12 @@ import {
   type RuntimeFreshnessApplication,
   type DailyDriverMetricsApplication,
 } from '../../agent-operations-application/src/index.js';
-import { OrchestrationService, RepositoryWorkspaceService } from '../../agent-operations-core/src/index.js';
+import {
+  JobRetirementService,
+  OrchestrationService,
+  RepositoryRestoreService,
+  RepositoryWorkspaceService,
+} from '../../agent-operations-core/src/index.js';
 import {
   CortextOSRuntimeAdapter,
   CortextOSRuntimeLifecycleAdapter,
@@ -33,7 +38,12 @@ import {
 } from '../../cortextos-conversation-adapter/src/index.js';
 import { CortextOSExecutionAdapter } from '../../cortextos-execution-adapter/src/index.js';
 import { CortextOSExecutionObserver } from '../../cortextos-execution-observer/src/index.js';
-import { GitPreviewWorkspaceAdapter, GitRepositoryAdapter, GitRepositoryWorkspaceAdapter } from '../../git-adapter/src/index.js';
+import {
+  GitPreviewWorkspaceAdapter,
+  GitRepositoryAdapter,
+  GitRepositoryRestoreAdapter,
+  GitRepositoryWorkspaceAdapter,
+} from '../../git-adapter/src/index.js';
 import { NodePreviewProcessAdapter, PlaywrightBoundedBrowserAdapter } from '../../preview-browser-adapter/src/index.js';
 import {
   FileInputObjectStorage,
@@ -107,6 +117,8 @@ export function createAgentOperationsComposition(
     writeWorkspaceAdapter,
     { stateDirectory: stateLocation.stateDirectory },
   );
+  const jobRetirement = new JobRetirementService(store, repositoryWorkspace);
+  const repositoryRestore = new RepositoryRestoreService(store, new GitRepositoryRestoreAdapter());
   const browser = new PlaywrightBoundedBrowserAdapter({
     authenticationRoot: `${stateLocation.stateDirectory}/preview-auth`,
   });
@@ -142,6 +154,8 @@ export function createAgentOperationsComposition(
     notifier: notification.notifier,
     trustProfiles,
     runtimeFreshness,
+    jobRetirement,
+    repositoryRestore,
     ...(options.deferRunnerWake !== undefined ? { deferRunnerWake: options.deferRunnerWake } : {}),
   });
   const conversation = new OrchestratorConversationApplicationService(

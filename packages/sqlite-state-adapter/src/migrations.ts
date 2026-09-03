@@ -23,7 +23,8 @@ export const WORKER_BUDGET_EXTENSIONS_SCHEMA_VERSION = 14;
 export const PREVIEW_BROWSER_EVIDENCE_SCHEMA_VERSION = 15;
 export const DAILY_DRIVER_TRUST_SCHEMA_VERSION = 16;
 export const AUTHENTICATED_PREVIEW_SCHEMA_VERSION = 17;
-export const CURRENT_SCHEMA_VERSION = AUTHENTICATED_PREVIEW_SCHEMA_VERSION;
+export const JOB_RETIREMENT_AND_RESTORE_SCHEMA_VERSION = 18;
+export const CURRENT_SCHEMA_VERSION = JOB_RETIREMENT_AND_RESTORE_SCHEMA_VERSION;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -841,6 +842,41 @@ const AUTHENTICATED_PREVIEW_SCHEMA_SQL = `
     ON authenticated_preview_sessions(project_id, preview_profile_id, created_at, id);
 `;
 
+const JOB_RETIREMENT_AND_RESTORE_SCHEMA_SQL = `
+  CREATE TABLE job_retirements (
+    job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+    disposition TEXT NOT NULL CHECK (disposition IN ('retired', 'externally-published')),
+    reason TEXT NOT NULL CHECK (length(trim(reason)) > 0),
+    actor TEXT NOT NULL CHECK (length(trim(actor)) > 0),
+    evidence_reference TEXT,
+    retired_at TEXT NOT NULL
+  );
+
+  CREATE INDEX job_retirements_by_time ON job_retirements(retired_at, job_id);
+
+  CREATE TABLE repository_restore_actions (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    repository_id TEXT NOT NULL REFERENCES repositories(id),
+    checkout_binding_id TEXT NOT NULL REFERENCES repository_checkouts(id),
+    state TEXT NOT NULL CHECK (state IN ('pending-approval', 'approved', 'completed', 'rejected', 'failed')),
+    preconditions_json TEXT NOT NULL,
+    approval_summary TEXT NOT NULL CHECK (length(trim(approval_summary)) > 0),
+    requested_by TEXT NOT NULL CHECK (length(trim(requested_by)) > 0),
+    created_at TEXT NOT NULL,
+    approved_at TEXT,
+    approved_by TEXT,
+    result_json TEXT,
+    failure_reason TEXT,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    CHECK ((state = 'completed') = (result_json IS NOT NULL)),
+    CHECK ((state = 'failed') = (failure_reason IS NOT NULL))
+  );
+
+  CREATE INDEX repository_restore_actions_by_state
+    ON repository_restore_actions(state, created_at, id);
+`;
+
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
     version: INITIAL_SCHEMA_VERSION,
@@ -926,6 +962,11 @@ export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
     version: AUTHENTICATED_PREVIEW_SCHEMA_VERSION,
     name: 'authenticated-preview-session-metadata',
     up: database => database.exec(AUTHENTICATED_PREVIEW_SCHEMA_SQL),
+  },
+  {
+    version: JOB_RETIREMENT_AND_RESTORE_SCHEMA_VERSION,
+    name: 'job-retirement-and-selective-restore',
+    up: database => database.exec(JOB_RETIREMENT_AND_RESTORE_SCHEMA_SQL),
   },
 ];
 

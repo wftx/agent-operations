@@ -36,6 +36,7 @@ import type {
   DurableAuthenticatedPreviewSession,
 } from './preview.js';
 import type { DurableTrustProfile } from './trust.js';
+import type { DurableJobRetirement, DurableRepositoryRestoreAction } from './lifecycle.js';
 
 export interface AgentOperationsInstallation {
   readonly id: string;
@@ -161,6 +162,16 @@ export interface AgentOperationsStateStore {
   listRepositoryWorkspaces(): Promise<readonly DurableRepositoryWorkspace[]>;
   saveRepositoryWorkspaceTransition(
     workspace: DurableRepositoryWorkspace,
+    expectedRevision: number,
+  ): Promise<void>;
+  retireJob(retirement: DurableJobRetirement): Promise<void>;
+  getJobRetirement(jobId: string): Promise<DurableJobRetirement | null>;
+  listJobRetirements(): Promise<readonly DurableJobRetirement[]>;
+  createRepositoryRestoreAction(action: DurableRepositoryRestoreAction): Promise<void>;
+  getRepositoryRestoreAction(id: string): Promise<DurableRepositoryRestoreAction | null>;
+  listRepositoryRestoreActions(): Promise<readonly DurableRepositoryRestoreAction[]>;
+  saveRepositoryRestoreActionTransition(
+    action: DurableRepositoryRestoreAction,
     expectedRevision: number,
   ): Promise<void>;
   createJob(job: DurableJob): Promise<void>;

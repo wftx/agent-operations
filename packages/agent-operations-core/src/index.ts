@@ -61,6 +61,11 @@ export {
   type WorkerExecutionBudget,
 } from './worker-execution-budget.js';
 export {
+  ACTIVE_REPOSITORY_WORKSPACE_STATES,
+  DEFAULT_GLOBAL_ACTIVE_REPOSITORY_WORKSPACE_LIMIT,
+  isActiveRepositoryWorkspace,
   RepositoryWorkspaceService,
   type RepositoryWorkspaceServiceOptions,
 } from './repository-workspace-service.js';
+export { JobRetirementService, type JobRetirementAssessment } from './job-retirement-service.js';
+export { RepositoryRestoreService } from './repository-restore-service.js';

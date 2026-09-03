@@ -12,12 +12,27 @@ import { createRepositoryWorkspaceId, executionModeForJob } from '../../agent-op
 export interface RepositoryWorkspaceServiceOptions {
   readonly stateDirectory: string;
   readonly now?: () => Date;
+  readonly globalActiveWorkspaceLimit?: number;
+}
+
+export const DEFAULT_GLOBAL_ACTIVE_REPOSITORY_WORKSPACE_LIMIT = 4;
+export const ACTIVE_REPOSITORY_WORKSPACE_STATES = [
+  'preparing', 'active', 'reviewing', 'ready_for_approval',
+] as const;
+
+export function isActiveRepositoryWorkspace(
+  workspace: Pick<DurableRepositoryWorkspace, 'state'>,
+): boolean {
+  return ACTIVE_REPOSITORY_WORKSPACE_STATES.includes(
+    workspace.state as (typeof ACTIVE_REPOSITORY_WORKSPACE_STATES)[number],
+  );
 }
 
 /** Owns durable preparation and recovery of one isolated worktree per write Job. */
 export class RepositoryWorkspaceService {
   private readonly workspaceRoot: string;
   private readonly now: () => Date;
+  private readonly globalActiveWorkspaceLimit: number;
 
   constructor(
     private readonly store: AgentOperationsStateStore,
@@ -27,17 +42,25 @@ export class RepositoryWorkspaceService {
   ) {
     this.workspaceRoot = resolve(options.stateDirectory, 'workspaces');
     this.now = options.now ?? (() => new Date());
+    this.globalActiveWorkspaceLimit = options.globalActiveWorkspaceLimit
+      ?? DEFAULT_GLOBAL_ACTIVE_REPOSITORY_WORKSPACE_LIMIT;
+    if (!Number.isInteger(this.globalActiveWorkspaceLimit) || this.globalActiveWorkspaceLimit < 1) {
+      throw new Error('Global active Repository Workspace limit must be a positive integer');
+    }
   }
 
   async prepareForJob(jobId: string): Promise<DurableRepositoryWorkspace> {
     const job = await this.requireWriteJob(jobId);
     const existing = await this.store.getRepositoryWorkspaceForJob(job.id);
     if (existing) return this.recover(existing);
-    const occupied = (await this.store.listRepositoryWorkspaces()).find(candidate =>
-      candidate.jobId !== job.id
-      && ['preparing', 'active', 'reviewing', 'ready_for_approval'].includes(candidate.state));
+    const active = (await this.store.listRepositoryWorkspaces()).filter(isActiveRepositoryWorkspace);
+    const occupied = active.find(candidate => candidate.jobId !== job.id
+      && candidate.repositoryId === job.repositoryId);
     if (occupied) {
-      throw new Error(`Write Job ${occupied.jobId} already owns the active isolated workspace slot`);
+      throw new Error(`Write Job ${occupied.jobId} already owns the active isolated workspace for repository ${job.repositoryId}`);
+    }
+    if (active.length >= this.globalActiveWorkspaceLimit) {
+      throw new Error(`The global active isolated workspace limit of ${this.globalActiveWorkspaceLimit} is reached`);
     }
     const installation = await this.store.getInstallation();
     const bindings = (await this.store.listCheckoutBindings(job.repositoryId))
@@ -105,7 +128,7 @@ export class RepositoryWorkspaceService {
 
   async requestCleanup(workspaceId: string): Promise<DurableRepositoryWorkspace> {
     const workspace = await this.requireWorkspace(workspaceId);
-    if (!['reviewing', 'ready_for_approval', 'failed', 'cancelled'].includes(workspace.state)) {
+    if (!['reviewing', 'ready_for_approval', 'failed', 'cancelled', 'cleanup_pending'].includes(workspace.state)) {
       throw new Error(`Repository Workspace ${workspace.id} cannot request cleanup from ${workspace.state}`);
     }
     return this.transition(workspace, { state: 'cleanup_pending' });
@@ -157,8 +180,39 @@ export class RepositoryWorkspaceService {
     return this.transition(workspace, { state: 'cleaned' });
   }
 
+  /** Release a clean AO owned workspace while retaining its durable evidence and branch. */
+  async cleanupForRetirement(workspaceId: string): Promise<DurableRepositoryWorkspace> {
+    const workspace = await this.requireWorkspace(workspaceId);
+    if (workspace.state === 'cleaned') return workspace;
+    if (!['reviewing', 'ready_for_approval', 'failed', 'cancelled'].includes(workspace.state)) {
+      throw new Error(`Repository Workspace ${workspace.id} cannot retire from ${workspace.state}`);
+    }
+    const current = await this.workspaces.captureEvidence(workspace.canonicalPath);
+    if (current.changedFiles.length > 0) {
+      throw new Error(`Repository Workspace ${workspace.id} contains unique dirty changes and cannot be retired`);
+    }
+    const pending = workspace.state === 'cleanup_pending'
+      ? workspace
+      : await this.transition(workspace, { state: 'cleanup_pending' });
+    return this.cleanup(pending.id);
+  }
+
+  async inspectForRetirement(workspaceId: string) {
+    const workspace = await this.requireWorkspace(workspaceId);
+    if (workspace.state === 'cleaned') {
+      return { exists: false, registered: false, reason: 'Workspace is already cleaned.' };
+    }
+    return this.workspaces.inspectWorkspace({
+      sourceCheckoutPath: await this.bindingPath(workspace.sourceCheckoutBindingId),
+      destinationPath: workspace.canonicalPath,
+      repositoryId: workspace.repositoryId,
+      baseRevision: workspace.baseRevision,
+      branchName: workspace.branchName,
+    });
+  }
+
   private async recover(workspace: DurableRepositoryWorkspace): Promise<DurableRepositoryWorkspace> {
-    if (!['preparing', 'active', 'reviewing', 'ready_for_approval'].includes(workspace.state)) {
+    if (!isActiveRepositoryWorkspace(workspace)) {
       return workspace;
     }
     const input = {

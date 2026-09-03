@@ -32,6 +32,9 @@ import type {
   TrustProfileScope,
   RuntimeFreshnessReport,
   ExecutionRuntimeReadinessReport,
+  DurableJobRetirement,
+  DurableRepositoryRestoreAction,
+  JobRetirementDisposition,
 } from '../../agent-operations-contracts/src/index.js';
 
 export type {
@@ -39,6 +42,9 @@ export type {
   ExecutionRuntimeReadinessReport,
   RuntimeFreshnessReport,
   RuntimeStartResult,
+  DurableJobRetirement,
+  DurableRepositoryRestoreAction,
+  JobRetirementDisposition,
 } from '../../agent-operations-contracts/src/index.js';
 
 export interface OperatorTaskInput {
@@ -169,6 +175,7 @@ export interface OperatorJobSummary {
   readonly startedAt?: string;
   readonly finishedAt?: string;
   readonly durationMs?: number;
+  readonly retirement?: DurableJobRetirement | null;
 }
 
 export type OperatorExecutionStage =
@@ -184,7 +191,8 @@ export type OperatorExecutionStage =
   | 'Ready for Approval'
   | 'Completed'
   | 'Cancelled'
-  | 'Failed';
+  | 'Failed'
+  | 'Archived';
 
 export interface OperatorRuntimeStatus {
   readonly state: 'ready' | 'offline' | 'degraded';
@@ -236,6 +244,8 @@ export interface OperatorJobDetail {
   readonly previewSession?: DurablePreviewSession;
   readonly browserEvidence?: readonly DurableBrowserEvidence[];
   readonly authenticatedPreviewSession?: DurableAuthenticatedPreviewSession;
+  readonly retirementAllowed?: boolean;
+  readonly retirementReasons?: readonly string[];
 }
 
 export interface EffectiveTrustProfile {
@@ -314,7 +324,7 @@ export interface PreviewApplication {
   }>;
 }
 
-export type OperatorJobList = 'all' | 'running' | 'needs-human' | 'done';
+export type OperatorJobList = 'all' | 'running' | 'needs-human' | 'done' | 'retired';
 
 export interface OperatorApplication {
   startRunner(): void;
@@ -328,6 +338,24 @@ export interface OperatorApplication {
   authorizeOneMoreWorkerAttempt(escalationId: string, instruction?: string): Promise<OperatorRunSession>;
   reconcileTimedOutExecution(escalationId: string): Promise<OperatorRunSession>;
   cancelEscalatedJob(escalationId: string): Promise<OperatorRunSession>;
+  retireJob?(jobId: string, input: {
+    readonly disposition: JobRetirementDisposition;
+    readonly reason: string;
+    readonly evidenceReference?: string;
+    readonly actor: string;
+  }): Promise<DurableJobRetirement>;
+  listRepositoryRestoreActions?(): Promise<readonly DurableRepositoryRestoreAction[]>;
+  prepareRepositoryRestore?(input: {
+    readonly projectId: string;
+    readonly repositoryId: string;
+    readonly checkoutBindingId: string;
+    readonly restorePaths: readonly string[];
+    readonly preserveUntrackedPaths?: readonly string[];
+    readonly requestedBy: string;
+    readonly expectedBranch?: string;
+    readonly expectedHead?: string;
+  }): Promise<DurableRepositoryRestoreAction>;
+  approveAndExecuteRepositoryRestore?(id: string, approvedBy: string): Promise<DurableRepositoryRestoreAction>;
   listJobs(filter?: OperatorJobList): Promise<readonly OperatorJobSummary[]>;
   getJobDetail(jobId: string): Promise<OperatorJobDetail>;
 }

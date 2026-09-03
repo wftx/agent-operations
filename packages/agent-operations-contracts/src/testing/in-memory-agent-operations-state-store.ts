@@ -41,6 +41,7 @@ import type {
 } from '../preview.js';
 import type { DurableTrustProfile } from '../trust.js';
 import { validateTrustProfile } from '../trust.js';
+import type { DurableJobRetirement, DurableRepositoryRestoreAction } from '../lifecycle.js';
 
 export type InMemoryStateStoreOperation =
   | 'get-installation'
@@ -61,6 +62,8 @@ export type InMemoryStateStoreOperation =
   | 'write-human-guidance'
   | 'write-worker-budget-extension'
   | 'write-operator-notification'
+  | 'write-job-retirement'
+  | 'write-repository-restore'
   | 'close';
 
 export interface InMemoryAgentOperationsStateStoreOptions {
@@ -164,6 +167,31 @@ function copyRepositoryWorkspace(value: DurableRepositoryWorkspace): DurableRepo
 
 function copyJob(value: DurableJob): DurableJob {
   return { ...value };
+}
+
+function copyJobRetirement(value: DurableJobRetirement): DurableJobRetirement {
+  return { ...value };
+}
+
+function copyRepositoryRestoreAction(value: DurableRepositoryRestoreAction): DurableRepositoryRestoreAction {
+  return {
+    ...value,
+    preconditions: {
+      ...value.preconditions,
+      restorePaths: value.preconditions.restorePaths.map(item => ({ ...item })),
+      preserveUntrackedPaths: value.preconditions.preserveUntrackedPaths.map(item => ({ ...item })),
+      statusEntries: value.preconditions.statusEntries.map(item => ({ ...item })),
+    },
+    ...(value.result
+      ? {
+          result: {
+            ...value.result,
+            restoredPaths: [...value.result.restoredPaths],
+            preservedUntrackedPaths: value.result.preservedUntrackedPaths.map(item => ({ ...item })),
+          },
+        }
+      : {}),
+  };
 }
 
 function copyAttempt(value: DurableJobAttempt): DurableJobAttempt {
@@ -287,6 +315,8 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   private readonly repositoryObservations = new Map<string, DurableRepositoryObservation[]>();
   private readonly runtimeObservations = new Map<string, DurableRuntimeObservation[]>();
   private readonly repositoryWorkspaces = new Map<string, DurableRepositoryWorkspace>();
+  private readonly jobRetirements = new Map<string, DurableJobRetirement>();
+  private readonly repositoryRestoreActions = new Map<string, DurableRepositoryRestoreAction>();
   private readonly jobs = new Map<string, DurableJob>();
   private readonly attempts = new Map<string, DurableJobAttempt>();
   private readonly executionPlans = new Map<string, DurableExecutionPlan>();
@@ -794,6 +824,88 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
       throw new Error(`Repository Workspace cannot transition from ${existing.state} to ${workspace.state}`);
     }
     this.repositoryWorkspaces.set(workspace.id, copyRepositoryWorkspace(workspace));
+  }
+
+  async retireJob(retirement: DurableJobRetirement): Promise<void> {
+    this.assertAvailable('write-job-retirement');
+    if (!this.jobs.has(retirement.jobId)) throw new Error(`Job not found: ${retirement.jobId}`);
+    const existing = this.jobRetirements.get(retirement.jobId);
+    if (existing) {
+      if (JSON.stringify(existing) !== JSON.stringify(retirement)) {
+        throw new Error(`Job ${retirement.jobId} already has another retirement disposition`);
+      }
+      return;
+    }
+    this.jobRetirements.set(retirement.jobId, copyJobRetirement(retirement));
+    for (const [id, escalation] of this.escalations) {
+      if (escalation.jobId === retirement.jobId && !escalation.resolvedAt) {
+        this.escalations.set(id, {
+          ...escalation,
+          resolvedAt: retirement.retiredAt,
+          resolutionSummary: `Job retired: ${retirement.reason}`,
+        });
+      }
+    }
+  }
+
+  async getJobRetirement(jobId: string): Promise<DurableJobRetirement | null> {
+    this.assertAvailable('read');
+    const value = this.jobRetirements.get(jobId);
+    return value ? copyJobRetirement(value) : null;
+  }
+
+  async listJobRetirements(): Promise<readonly DurableJobRetirement[]> {
+    this.assertAvailable('read');
+    return [...this.jobRetirements.values()].sort((a, b) =>
+      a.retiredAt.localeCompare(b.retiredAt) || a.jobId.localeCompare(b.jobId)).map(copyJobRetirement);
+  }
+
+  async createRepositoryRestoreAction(action: DurableRepositoryRestoreAction): Promise<void> {
+    this.assertAvailable('write-repository-restore');
+    if (!action.id.startsWith('repository-restore:') || action.state !== 'pending-approval'
+      || action.revision !== 0 || this.repositoryRestoreActions.has(action.id)) {
+      throw new Error(`Invalid new Repository Restore action: ${action.id}`);
+    }
+    const binding = this.bindings.get(action.checkoutBindingId);
+    if (!this.projects.has(action.projectId) || binding?.repositoryId !== action.repositoryId
+      || binding.canonicalPath !== action.preconditions.canonicalPath) {
+      throw new Error(`Invalid Repository Restore associations: ${action.id}`);
+    }
+    this.repositoryRestoreActions.set(action.id, copyRepositoryRestoreAction(action));
+  }
+
+  async getRepositoryRestoreAction(id: string): Promise<DurableRepositoryRestoreAction | null> {
+    this.assertAvailable('read');
+    const value = this.repositoryRestoreActions.get(id);
+    return value ? copyRepositoryRestoreAction(value) : null;
+  }
+
+  async listRepositoryRestoreActions(): Promise<readonly DurableRepositoryRestoreAction[]> {
+    this.assertAvailable('read');
+    return [...this.repositoryRestoreActions.values()].sort((a, b) =>
+      a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)).map(copyRepositoryRestoreAction);
+  }
+
+  async saveRepositoryRestoreActionTransition(
+    action: DurableRepositoryRestoreAction,
+    expectedRevision: number,
+  ): Promise<void> {
+    this.assertAvailable('write-repository-restore');
+    const existing = this.repositoryRestoreActions.get(action.id);
+    if (!existing || existing.revision !== expectedRevision || action.revision !== expectedRevision + 1
+      || existing.projectId !== action.projectId || existing.repositoryId !== action.repositoryId
+      || existing.checkoutBindingId !== action.checkoutBindingId
+      || existing.createdAt !== action.createdAt
+      || JSON.stringify(existing.preconditions) !== JSON.stringify(action.preconditions)) {
+      throw new Error(`Invalid Repository Restore transition: ${action.id}`);
+    }
+    const allowed = existing.state === 'pending-approval'
+      ? ['approved', 'rejected']
+      : existing.state === 'approved' ? ['completed', 'failed'] : [];
+    if (!allowed.includes(action.state)) {
+      throw new Error(`Repository Restore cannot transition from ${existing.state} to ${action.state}`);
+    }
+    this.repositoryRestoreActions.set(action.id, copyRepositoryRestoreAction(action));
   }
 
   async createJob(job: DurableJob): Promise<void> {

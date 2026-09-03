@@ -68,6 +68,10 @@ import type {
   TrustProfilePolicy,
   TrustProfilePreset,
   TrustProfileScope,
+  DurableJobRetirement,
+  JobRetirementDisposition,
+  DurableRepositoryRestoreAction,
+  RepositoryRestoreState,
 } from '../../agent-operations-contracts/src/index.js';
 import {
   createRepositoryCheckoutBindingId,
@@ -416,6 +420,32 @@ interface RepositoryWorkspaceRow {
   revision: number;
   created_at: string;
   updated_at: string;
+}
+
+interface JobRetirementRow {
+  job_id: string;
+  disposition: JobRetirementDisposition;
+  reason: string;
+  actor: string;
+  evidence_reference: string | null;
+  retired_at: string;
+}
+
+interface RepositoryRestoreActionRow {
+  id: string;
+  project_id: string;
+  repository_id: string;
+  checkout_binding_id: string;
+  state: RepositoryRestoreState;
+  preconditions_json: string;
+  approval_summary: string;
+  requested_by: string;
+  created_at: string;
+  approved_at: string | null;
+  approved_by: string | null;
+  result_json: string | null;
+  failure_reason: string | null;
+  revision: number;
 }
 
 interface AttemptReviewRow {
@@ -940,6 +970,38 @@ function toRepositoryWorkspace(row: RepositoryWorkspaceRow): DurableRepositoryWo
   };
 }
 
+function toJobRetirement(row: JobRetirementRow): DurableJobRetirement {
+  return {
+    jobId: row.job_id,
+    disposition: row.disposition,
+    reason: row.reason,
+    actor: row.actor,
+    ...(row.evidence_reference ? { evidenceReference: row.evidence_reference } : {}),
+    retiredAt: row.retired_at,
+  };
+}
+
+function toRepositoryRestoreAction(row: RepositoryRestoreActionRow): DurableRepositoryRestoreAction {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    repositoryId: row.repository_id,
+    checkoutBindingId: row.checkout_binding_id,
+    state: row.state,
+    preconditions: JSON.parse(row.preconditions_json) as DurableRepositoryRestoreAction['preconditions'],
+    approvalSummary: row.approval_summary,
+    requestedBy: row.requested_by,
+    createdAt: row.created_at,
+    ...(row.approved_at ? { approvedAt: row.approved_at } : {}),
+    ...(row.approved_by ? { approvedBy: row.approved_by } : {}),
+    ...(row.result_json
+      ? { result: JSON.parse(row.result_json) as NonNullable<DurableRepositoryRestoreAction['result']> }
+      : {}),
+    ...(row.failure_reason ? { failureReason: row.failure_reason } : {}),
+    revision: row.revision,
+  };
+}
+
 function toAttemptReview(row: AttemptReviewRow): DurableAttemptReview {
   return {
     id: row.id,
@@ -1102,6 +1164,7 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
   private readonly supportsPreviewBrowserEvidence: boolean;
   private readonly supportsDailyDriverTrust: boolean;
   private readonly supportsAuthenticatedPreview: boolean;
+  private readonly supportsJobRetirementAndRestore: boolean;
 
   private constructor(databasePath: string, database: Database.Database) {
     this.databasePath = databasePath;
@@ -1141,6 +1204,9 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     ).get() as unknown) !== undefined;
     this.supportsAuthenticatedPreview = (database.prepare(
       "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'authenticated_preview_sessions'",
+    ).get() as unknown) !== undefined;
+    this.supportsJobRetirementAndRestore = (database.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'job_retirements'",
     ).get() as unknown) !== undefined;
   }
 
@@ -1975,6 +2041,136 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     if (result.changes !== 1) {
       throw new Error(`Repository Workspace transition conflict: ${workspace.id}`);
     }
+  }
+
+  async retireJob(retirement: DurableJobRetirement): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsJobRetirementAndRestore) {
+      throw new Error('Job retirement requires Agent Operations schema v18');
+    }
+    const retire = this.database.transaction(() => {
+      const existing = this.database.prepare('SELECT * FROM job_retirements WHERE job_id = ?')
+        .get(retirement.jobId) as JobRetirementRow | undefined;
+      if (existing) {
+        if (JSON.stringify(toJobRetirement(existing)) !== JSON.stringify(retirement)) {
+          throw new Error(`Job ${retirement.jobId} already has another retirement disposition`);
+        }
+        return;
+      }
+      const job = this.database.prepare('SELECT id FROM jobs WHERE id = ?')
+        .get(retirement.jobId) as { id: string } | undefined;
+      if (!job) throw new Error(`Job not found: ${retirement.jobId}`);
+      this.database.prepare(`
+        INSERT INTO job_retirements
+          (job_id, disposition, reason, actor, evidence_reference, retired_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        retirement.jobId, retirement.disposition, retirement.reason, retirement.actor,
+        retirement.evidenceReference ?? null, retirement.retiredAt,
+      );
+      if (this.supportsLateExecutionReconciliation) {
+        this.database.prepare(`
+          UPDATE escalations SET resolved_at = ?, resolution_summary = ?
+          WHERE job_id = ? AND resolved_at IS NULL
+        `).run(retirement.retiredAt, `Job retired: ${retirement.reason}`, retirement.jobId);
+      } else {
+        this.database.prepare('UPDATE escalations SET resolved_at = ? WHERE job_id = ? AND resolved_at IS NULL')
+          .run(retirement.retiredAt, retirement.jobId);
+      }
+    });
+    retire();
+  }
+
+  async getJobRetirement(jobId: string): Promise<DurableJobRetirement | null> {
+    this.assertOpen();
+    if (!this.supportsJobRetirementAndRestore) return null;
+    const row = this.database.prepare('SELECT * FROM job_retirements WHERE job_id = ?')
+      .get(jobId) as JobRetirementRow | undefined;
+    return row ? toJobRetirement(row) : null;
+  }
+
+  async listJobRetirements(): Promise<readonly DurableJobRetirement[]> {
+    this.assertOpen();
+    if (!this.supportsJobRetirementAndRestore) return [];
+    return (this.database.prepare('SELECT * FROM job_retirements ORDER BY retired_at, job_id')
+      .all() as JobRetirementRow[]).map(toJobRetirement);
+  }
+
+  async createRepositoryRestoreAction(action: DurableRepositoryRestoreAction): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsJobRetirementAndRestore) {
+      throw new Error('Repository Restore actions require Agent Operations schema v18');
+    }
+    if (!action.id.startsWith('repository-restore:') || action.state !== 'pending-approval'
+      || action.revision !== 0 || action.result || action.failureReason) {
+      throw new Error(`Invalid new Repository Restore action: ${action.id}`);
+    }
+    const binding = this.database.prepare(`
+      SELECT repository_id, canonical_path FROM repository_checkouts WHERE id = ?
+    `).get(action.checkoutBindingId) as { repository_id: string; canonical_path: string } | undefined;
+    if (!binding || binding.repository_id !== action.repositoryId
+      || binding.canonical_path !== action.preconditions.canonicalPath) {
+      throw new Error(`Invalid Repository Restore associations: ${action.id}`);
+    }
+    this.database.prepare(`
+      INSERT INTO repository_restore_actions
+        (id, project_id, repository_id, checkout_binding_id, state, preconditions_json,
+         approval_summary, requested_by, created_at, approved_at, approved_by,
+         result_json, failure_reason, revision)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      action.id, action.projectId, action.repositoryId, action.checkoutBindingId, action.state,
+      JSON.stringify(action.preconditions), action.approvalSummary, action.requestedBy,
+      action.createdAt, null, null, null, null, action.revision,
+    );
+  }
+
+  async getRepositoryRestoreAction(id: string): Promise<DurableRepositoryRestoreAction | null> {
+    this.assertOpen();
+    if (!this.supportsJobRetirementAndRestore) return null;
+    const row = this.database.prepare('SELECT * FROM repository_restore_actions WHERE id = ?')
+      .get(id) as RepositoryRestoreActionRow | undefined;
+    return row ? toRepositoryRestoreAction(row) : null;
+  }
+
+  async listRepositoryRestoreActions(): Promise<readonly DurableRepositoryRestoreAction[]> {
+    this.assertOpen();
+    if (!this.supportsJobRetirementAndRestore) return [];
+    return (this.database.prepare('SELECT * FROM repository_restore_actions ORDER BY created_at, id')
+      .all() as RepositoryRestoreActionRow[]).map(toRepositoryRestoreAction);
+  }
+
+  async saveRepositoryRestoreActionTransition(
+    action: DurableRepositoryRestoreAction,
+    expectedRevision: number,
+  ): Promise<void> {
+    this.assertOpen();
+    if (!this.supportsJobRetirementAndRestore) {
+      throw new Error('Repository Restore actions require Agent Operations schema v18');
+    }
+    const existing = await this.getRepositoryRestoreAction(action.id);
+    const allowed = existing?.state === 'pending-approval'
+      ? ['approved', 'rejected']
+      : existing?.state === 'approved' ? ['completed', 'failed'] : [];
+    if (!existing || existing.revision !== expectedRevision || action.revision !== expectedRevision + 1
+      || existing.projectId !== action.projectId || existing.repositoryId !== action.repositoryId
+      || existing.checkoutBindingId !== action.checkoutBindingId || existing.createdAt !== action.createdAt
+      || JSON.stringify(existing.preconditions) !== JSON.stringify(action.preconditions)
+      || !allowed.includes(action.state)
+      || ((action.state === 'completed') !== Boolean(action.result))
+      || ((action.state === 'failed') !== Boolean(action.failureReason))) {
+      throw new Error(`Invalid Repository Restore transition: ${action.id}`);
+    }
+    const result = this.database.prepare(`
+      UPDATE repository_restore_actions SET
+        state = ?, approved_at = ?, approved_by = ?, result_json = ?, failure_reason = ?, revision = ?
+      WHERE id = ? AND revision = ?
+    `).run(
+      action.state, action.approvedAt ?? null, action.approvedBy ?? null,
+      action.result ? JSON.stringify(action.result) : null, action.failureReason ?? null,
+      action.revision, action.id, expectedRevision,
+    );
+    if (result.changes !== 1) throw new Error(`Repository Restore transition conflict: ${action.id}`);
   }
 
   async createJob(job: DurableJob): Promise<void> {

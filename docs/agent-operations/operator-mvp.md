@@ -319,14 +319,24 @@ diff, and test evidence.
 Reviewer `PASS` means Ready for Approval. It does not complete the Job, commit,
 merge, or push. A revision uses the same worktree but a fresh Worker Attempt,
 Plan, Dispatch, and exact provider turn. One active write workspace is permitted
-at a time. Cleanup is explicit, refuses a dirty or mismatched worktree, removes
-only a proven AO owned worktree, and preserves the dedicated branch and durable
-evidence.
+per logical repository, with a separate machine ceiling of four active
+workspaces. Unrelated repositories do not block one another. Cleanup is
+explicit, refuses a dirty or mismatched worktree, removes only a proven AO owned
+worktree, and preserves the dedicated branch and durable evidence.
 
-There is no automatic merge, general queue, scheduler, concurrent write Job
-execution, interactive Telegram approval, production authentication, or remote
-deployment in this MVP. Starting the AO web surface still does not start
-CortextOS.
+Retiring a completed proof Job preserves its full audit history while releasing
+a clean AO owned workspace. Active or uncertain executions and workspaces with
+unique dirty changes cannot be retired. Archived Jobs remain available in the
+historical operator view.
+
+Restoring exact tracked files in a primary checkout is a separate Red action.
+AO records branch, HEAD, Git status, file hashes, and the exact path list before
+requesting human approval. The operation fails closed if any bound precondition
+changes and never deletes untracked files or exposes broad Git cleanup commands.
+
+There is no automatic merge, same repository concurrent write execution,
+interactive Telegram approval, production authentication, or remote deployment
+in this MVP. Starting the AO web surface still does not start CortextOS.
 
 ## Conversational Orchestrator
 

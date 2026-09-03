@@ -33,6 +33,8 @@ class StubOperatorApplication implements OperatorApplication {
   cancelCalls = 0;
   reconcileCalls = 0;
   startRuntimeCalls = 0;
+  retireCalls = 0;
+  restoreApprovalCalls = 0;
 
   constructor(private readonly runtimeReady = true) {}
 
@@ -115,6 +117,35 @@ class StubOperatorApplication implements OperatorApplication {
     return [SUMMARY_NEW, SUMMARY_RUNNING, SUMMARY_ESCALATED, SUMMARY_DONE];
   }
 
+  async retireJob() {
+    this.retireCalls += 1;
+    return { jobId: JOB_ID, disposition: 'retired' as const, reason: 'Historical proof', actor: 'operator', retiredAt: TIME };
+  }
+
+  async listRepositoryRestoreActions() {
+    return [{
+      id: 'repository-restore:one', projectId: PROJECT_ID, repositoryId: REPOSITORY_ID,
+      checkoutBindingId: 'checkout:one', state: 'pending-approval' as const,
+      preconditions: {
+        repositoryId: REPOSITORY_ID, checkoutBindingId: 'checkout:one', canonicalPath: '/repo',
+        branch: 'main', headRevision: 'a'.repeat(40),
+        restorePaths: [{ path: 'main.py', indexStatus: 'unmodified' as const, worktreeStatus: 'modified' as const, workingTreeSha256: 'b'.repeat(64), headSha256: 'c'.repeat(64) }],
+        preserveUntrackedPaths: [{ path: 'PLAN.md', sha256: 'd'.repeat(64) }],
+        statusEntries: [], evidenceHash: 'e'.repeat(64),
+      },
+      approvalSummary: 'Discard main.py and preserve PLAN.md.', requestedBy: 'operator',
+      createdAt: TIME, revision: 0,
+    }];
+  }
+
+  async prepareRepositoryRestore() { return (await this.listRepositoryRestoreActions())[0]; }
+
+  async approveAndExecuteRepositoryRestore() {
+    this.restoreApprovalCalls += 1;
+    return { ...(await this.listRepositoryRestoreActions())[0], state: 'completed' as const,
+      approvedAt: TIME, approvedBy: 'human-operator', result: { beforeEvidenceHash: 'e'.repeat(64), afterEvidenceHash: 'f'.repeat(64), restoredPaths: ['main.py'], preservedUntrackedPaths: [{ path: 'PLAN.md', sha256: 'd'.repeat(64) }], completedAt: TIME }, revision: 2 };
+  }
+
   async getJobDetail(jobId: string): Promise<OperatorJobDetail> {
     if (jobId === SUMMARY_ESCALATED.job.id) return ESCALATED_DETAIL;
     return DETAIL;
@@ -122,6 +153,25 @@ class StubOperatorApplication implements OperatorApplication {
 }
 
 describe('OperatorWebApplication', () => {
+  it('renders exact Red approvals and binds execution to the selected action', async () => {
+    const service = new StubOperatorApplication();
+    const app = new OperatorWebApplication(service);
+    const page = await app.handle(new Request('http://127.0.0.1/approvals'));
+    const body = await page.text();
+    expect(body).toContain('Selective tracked file restore');
+    expect(body).toContain('main.py');
+    expect(body).toContain('PLAN.md');
+    expect(body).toContain('Approve Exact Restore');
+    expect(service.restoreApprovalCalls).toBe(0);
+
+    const response = await app.handle(new Request('http://127.0.0.1/repository-restores/repository-restore%3Aone/approve', {
+      method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ approvedBy: 'human-operator' }),
+    }));
+    expect(response.status).toBe(303);
+    expect(service.restoreApprovalCalls).toBe(1);
+  });
+
   it('renders Jobs, Running, Needs Me, Done, and detail from read-only GETs', async () => {
     const service = new StubOperatorApplication();
     const app = new OperatorWebApplication(service);

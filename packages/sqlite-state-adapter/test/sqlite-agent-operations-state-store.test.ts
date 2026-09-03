@@ -94,6 +94,7 @@ describe('SQLite Agent Operations state store', () => {
       { version: 15, name: 'preview-profiles-and-browser-evidence' },
       { version: 16, name: 'daily-driver-trust-profiles' },
       { version: 17, name: 'authenticated-preview-session-metadata' },
+      { version: 18, name: 'job-retirement-and-selective-restore' },
     ]);
     database.close();
 
@@ -152,6 +153,51 @@ describe('SQLite Agent Operations state store', () => {
     expect(await reopened.listCheckoutBindings(REPOSITORY_ID)).toEqual(configured.checkoutBindings);
     expect(await reopened.listProjectRepositoryIds('ao')).toEqual([REPOSITORY_ID]);
     expect(await reopened.listProjectRuntimeAgentIds('ao')).toEqual(['operations/agent']);
+    await reopened.close();
+  });
+
+  it('preserves Job retirement and exact Repository Restore approval records across reopen', async () => {
+    const databasePath = temporaryPath('lifecycle.db');
+    const store = open(databasePath);
+    const configured = configuration();
+    await store.applyProjectConfiguration(configured);
+    await store.createJob({
+      id: 'job:historical', projectId: 'ao', repositoryId: REPOSITORY_ID,
+      title: 'Historical proof', status: 'draft', revision: 0, createdAt: TIME, updatedAt: TIME,
+    });
+    await store.retireJob({
+      jobId: 'job:historical', disposition: 'retired', reason: 'Proof complete',
+      actor: 'operator', evidenceReference: 'evidence:one', retiredAt: TIME,
+    });
+    const bindingId = configured.checkoutBindings[0].id;
+    await store.createRepositoryRestoreAction({
+      id: 'repository-restore:one', projectId: 'ao', repositoryId: REPOSITORY_ID,
+      checkoutBindingId: bindingId, state: 'pending-approval',
+      preconditions: {
+        repositoryId: REPOSITORY_ID, checkoutBindingId: bindingId,
+        canonicalPath: configured.checkoutBindings[0].canonicalPath, branch: 'main',
+        headRevision: 'a'.repeat(40),
+        restorePaths: [{ path: 'main.py', indexStatus: 'unmodified', worktreeStatus: 'modified', workingTreeSha256: 'b'.repeat(64), headSha256: 'c'.repeat(64) }],
+        preserveUntrackedPaths: [{ path: 'PLAN.md', sha256: 'd'.repeat(64) }],
+        statusEntries: [
+          { path: 'main.py', indexStatus: 'unmodified', worktreeStatus: 'modified' },
+          { path: 'PLAN.md', indexStatus: 'unmodified', worktreeStatus: 'untracked' },
+        ],
+        evidenceHash: 'e'.repeat(64),
+      },
+      approvalSummary: 'Restore main.py and preserve PLAN.md.', requestedBy: 'operator',
+      createdAt: TIME, revision: 0,
+    });
+    await store.close();
+
+    const reopened = open(databasePath);
+    expect(await reopened.getJobRetirement('job:historical')).toEqual({
+      jobId: 'job:historical', disposition: 'retired', reason: 'Proof complete',
+      actor: 'operator', evidenceReference: 'evidence:one', retiredAt: TIME,
+    });
+    expect(await reopened.getRepositoryRestoreAction('repository-restore:one')).toMatchObject({
+      state: 'pending-approval', preconditions: { branch: 'main', restorePaths: [{ path: 'main.py' }] },
+    });
     await reopened.close();
   });
 
@@ -356,7 +402,7 @@ describe('SQLite Agent Operations state store', () => {
       installationIdFactory: () => INSTALLATION_ID,
       now: () => new Date(TIME),
       additionalMigrations: [{
-        version: 18,
+        version: 19,
         name: 'deliberate-test-failure',
         up: database => {
           database.exec('CREATE TABLE should_rollback (id TEXT)');
@@ -370,7 +416,7 @@ describe('SQLite Agent Operations state store', () => {
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'should_rollback'",
     ).get()).toBeUndefined();
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }]);
     database.close();
 
     const corruptPath = temporaryPath('corrupt.db');
