@@ -18,3 +18,4 @@ export * from './testing/fake-repository-inventory-adapter.js';
 export * from './testing/in-memory-agent-operations-state-store.js';
 export * from './testing/fake-runtime-execution-adapter.js';
 export * from './testing/fake-runtime-execution-observation-adapter.js';
+export * from './external-action.js';

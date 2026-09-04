@@ -1,5 +1,6 @@
 import type {
   OperatorApplication,
+  ExternalActionService,
   OrchestratorConversationService,
   ProjectApplication,
   InputApplication,
@@ -12,6 +13,7 @@ import { OperatorWebApplication } from './app.js';
 import { createOperatorHttpServer } from './http-server.js';
 
 export interface OperatorWebServerDependencies {
+  readonly externalActions?: ExternalActionService;
   readonly operator: OperatorApplication;
   readonly conversation: OrchestratorConversationService;
   readonly telegramConfigured: boolean;
@@ -38,6 +40,7 @@ export function startOperatorWebServer(dependencies: OperatorWebServerDependenci
     dependencies.trustProfiles,
     dependencies.metrics,
     dependencies.runtimeFreshness,
+    dependencies.externalActions,
   );
   const server = createOperatorHttpServer(app, { host, port });
   server.listen(port, host, () => {

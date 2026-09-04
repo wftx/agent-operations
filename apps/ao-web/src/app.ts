@@ -1,5 +1,6 @@
 import type {
   OperatorApplication,
+  ExternalActionService,
   OperatorJobList,
   OperatorTaskInput,
   OrchestratorConversationService,
@@ -39,6 +40,7 @@ export class OperatorWebApplication {
     private readonly trustProfiles?: TrustProfileApplication,
     private readonly metrics?: DailyDriverMetricsApplication,
     private readonly runtimeFreshness?: RuntimeFreshnessApplication,
+    private readonly externalActions?: ExternalActionService,
   ) {
     if ('sendTurn' in conversationOrOptions) {
       this.conversation = conversationOrOptions;
@@ -198,6 +200,19 @@ export class OperatorWebApplication {
       }
       if (request.method === 'POST' && url.pathname === '/jobs') {
         return this.submit(request);
+      }
+      const externalAction = url.pathname.match(/^\/jobs\/([^/]+)\/external-action$/);
+      if (request.method === 'POST' && externalAction) {
+        if (!this.externalActions) throw new Error('External actions are not configured');
+        const jobId = decodeURIComponent(externalAction[1]);
+        const form = await request.formData();
+        const {plan} = await this.externalActions.inspect(jobId);
+        if (!plan || textValue(form,'scopeHash') !== plan.scopeHash) throw new Error('Exact action scope changed');
+        if (textValue(form,'confirm') !== 'execute-once') throw new Error('Explicit action confirmation is required');
+        if (!plan.approval) await this.externalActions.approve(jobId, {actor:'local-human-operator',reference:`ao-web:${plan.id}`,approvedAt:new Date().toISOString(),scopeHash:plan.scopeHash});
+        if (this.runtimeFreshness && (await this.runtimeFreshness.inspect()).state !== 'current') throw new Error('Runtime revision is not current. Approval is retained; action was not invoked.');
+        await this.externalActions.execute(jobId);
+        return redirect(`/jobs/${encodeURIComponent(jobId)}`);
       }
       const retireJob = url.pathname.match(/^\/jobs\/([^/]+)\/retire$/);
       if (request.method === 'POST' && retireJob) {

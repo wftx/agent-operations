@@ -2,8 +2,10 @@ import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import type { ExternalActionExecutor } from '../../agent-operations-contracts/src/index.js';
 import {
   NoopOperatorNotifier,
+  ExternalActionService,
   OperatorApplicationService,
   ProjectApplicationService,
   InputApplicationService,
@@ -62,6 +64,8 @@ import {
 } from '../../telegram-notification-adapter/src/index.js';
 
 export interface AgentOperationsCompositionOptions {
+  /** Host supplied exact bindings only. Never populated by model tool arguments. */
+  readonly externalActionExecutors?: readonly ExternalActionExecutor[];
   readonly startRunner?: boolean;
   readonly runnerPollIntervalMs?: number;
   readonly deferRunnerWake?: boolean;
@@ -69,6 +73,7 @@ export interface AgentOperationsCompositionOptions {
 }
 
 export interface AgentOperationsComposition {
+  readonly externalActions: ExternalActionService;
   readonly operator: OperatorApplication;
   readonly conversation: OrchestratorConversationService;
   readonly tools: OrchestratorToolApplicationService;
@@ -172,10 +177,12 @@ export function createAgentOperationsComposition(
     new CortextOSOrchestratorConversationAdapter(),
     store,
   );
-  const tools = new OrchestratorToolApplicationService(operator, inputs, preview);
+  const externalActions = new ExternalActionService(store, options.externalActionExecutors);
+  const tools = new OrchestratorToolApplicationService(operator, inputs, preview, externalActions);
   let runnerTimer: ReturnType<typeof setInterval> | null = null;
   let tickPromise: Promise<void> | null = null;
   return {
+    externalActions,
     operator,
     conversation,
     tools,
@@ -208,10 +215,12 @@ export function createAgentOperationsComposition(
   };
 }
 
-function expectedRuntimeRevision(frameworkRoot: string): { readonly expectedRevision?: string } {
+export function expectedRuntimeRevision(frameworkRoot: string): { readonly expectedRevision?: string } {
   const configured = process.env['AO_EXPECTED_RUNTIME_REVISION']?.trim();
   if (configured) return { expectedRevision: configured };
-  const entry = resolve(frameworkRoot, 'dist', 'cli.js');
+  // The CLI launches daemon.js as a separate process. Compare the executable
+  // actually loaded by that writer, not its CLI supervisor.
+  const entry = resolve(frameworkRoot, 'dist', 'daemon.js');
   if (!existsSync(entry)) return {};
   return { expectedRevision: `sha256:${createHash('sha256').update(readFileSync(entry)).digest('hex')}` };
 }

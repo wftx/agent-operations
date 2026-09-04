@@ -22,6 +22,8 @@ export class JobRetirementService {
     const job = await this.store.getJob(jobId.trim());
     if (!job) throw new Error(`Job not found: ${jobId}`);
     const reasons: string[] = [];
+    const external = await this.store.getExternalActionPlan(job.id);
+    if (external && ['executing','uncertain'].includes(external.state)) reasons.push('External action may have crossed its side effect boundary; reconcile before retirement');
     for (const attempt of await this.store.listAttemptsForJob(job.id)) {
       const plan = await this.store.getExecutionPlanForAttempt(attempt.id);
       const dispatch = plan ? await this.store.getExecutionDispatchForPlan(plan.id) : null;

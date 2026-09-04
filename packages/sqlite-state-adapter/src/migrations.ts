@@ -894,6 +894,23 @@ const RED_ACTION_RECEIPT_AND_DETERMINISTIC_VERIFICATION_SCHEMA_SQL = `
 
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
+    version: 21,
+    name: 'bounded-external-actions',
+    up: database => database.exec(`
+      ALTER TABLE jobs ADD COLUMN execution_mode_v2 TEXT NOT NULL DEFAULT 'repository-read-only'
+        CHECK (execution_mode_v2 IN ('repository-read-only', 'repository-write-isolated', 'external-action'));
+      UPDATE jobs SET execution_mode_v2 = execution_mode;
+      ALTER TABLE jobs DROP COLUMN execution_mode;
+      ALTER TABLE jobs RENAME COLUMN execution_mode_v2 TO execution_mode;
+      CREATE TABLE project_actions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), definition_json TEXT NOT NULL);
+      CREATE TABLE external_action_plans (
+        job_id TEXT PRIMARY KEY REFERENCES jobs(id), id TEXT NOT NULL UNIQUE,
+        request_key TEXT NOT NULL UNIQUE, predecessor_job_id TEXT UNIQUE REFERENCES jobs(id),
+        state TEXT NOT NULL, plan_json TEXT NOT NULL);
+      CREATE TABLE external_action_receipts (job_id TEXT PRIMARY KEY REFERENCES jobs(id), receipt_json TEXT NOT NULL);
+    `),
+  },
+  {
     version: 20,
     name: 'operator-runner-control',
     up(database) {

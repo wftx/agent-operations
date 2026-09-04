@@ -316,13 +316,19 @@ export const AO_ORCHESTRATOR_DYNAMIC_TOOLS = [{
       },
     },
     {
-      type: 'function', name: 'jobs_create', description: 'Create one durable Agent Operations Job.',
+      type: 'function', name: 'actions_list', description: 'List configured external actions for a Project. For sync, CRM, and workflow requests inspect these first. Select one exact action, clarify ambiguity, and report a missing capability rather than substituting repository work.',
+      inputSchema: { type: 'object', properties: { projectId: { type: 'string' } }, required: ['projectId'], additionalProperties: false },
+    },
+    {
+      type: 'function', name: 'jobs_create', description: 'Create one durable Agent Operations Job. External operations must select a known Project action in external-action mode. This records a request only and does not grant approval or execute it.',
       inputSchema: {
         type: 'object',
         properties: {
           projectId: { type: 'string' }, repositoryId: { type: 'string' }, title: { type: 'string' },
           task: { type: 'string' }, acceptanceCriteria: { type: 'string' },
-          executionMode: { type: 'string', enum: ['repository-read-only', 'repository-write-isolated'] },
+          executionMode: { type: 'string', enum: ['repository-read-only', 'repository-write-isolated', 'external-action'] },
+          actionId: { type: 'string' }, actionParameters: { type: 'object', additionalProperties: { type: 'string' } },
+          requestKey: { type: 'string', description: 'Stable unique intent key. Reuse for duplicate submissions of the same external action request.' },
           reviewerRequired: { type: 'boolean', const: true },
           inputIds: { type: 'array', items: { type: 'string' }, maxItems: 20, uniqueItems: true },
           evidenceRequirements: {
@@ -404,6 +410,7 @@ export const AO_ORCHESTRATOR_TOOL_CATALOG_REVISION = `sha256:${createHash('sha25
   .digest('hex')}`;
 
 const AO_TOOL_NAMES = {
+  actions_list: 'ao.actions.list',
   projects_list: 'ao.projects.list',
   projects_get: 'ao.projects.get',
   inputs_list: 'ao.inputs.list',

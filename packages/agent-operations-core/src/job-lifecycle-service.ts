@@ -71,6 +71,7 @@ export class JobLifecycleService {
   }
 
   async createJob(input: CreateJobInput): Promise<DurableJob> {
+    if (input.executionMode === 'external-action') throw new Error('External action Jobs require the bounded action application');
     const projectId = required(input.projectId, 'Project ID');
     const project = await this.store.getProject(projectId);
     if (!project) throw new Error(`Project not found: ${projectId}`);
@@ -136,6 +137,8 @@ export class JobLifecycleService {
 
   async cancelJob(jobId: string): Promise<DurableJob> {
     const job = await this.requireJob(jobId);
+    const external = await this.store.getExternalActionPlan(jobId);
+    if (external && ['executing','uncertain'].includes(external.state)) throw new Error('External action requires exact outcome reconciliation before cancellation');
     if (job.status !== 'draft' && job.status !== 'ready') {
       throw new Error(`Job ${job.id} cannot transition from ${job.status} to cancelled`);
     }

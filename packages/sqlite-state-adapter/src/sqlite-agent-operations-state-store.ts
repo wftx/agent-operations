@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { ExternalActionPersistence } from './external-action-persistence.js';
+import type { ProjectAction, ExternalActionPlan, ExternalActionApproval, ExternalActionReceipt } from '../../agent-operations-contracts/src/index.js';
 import { chmodSync, mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import Database from 'better-sqlite3';
@@ -776,7 +778,7 @@ function toJob(row: JobRow): DurableJob {
     ...(row.automatic_read_only_completion === 1
       ? { automaticReadOnlyCompletion: true }
       : {}),
-    ...(row.execution_mode === 'repository-write-isolated'
+    ...(row.execution_mode === 'repository-write-isolated' || row.execution_mode === 'external-action'
       ? { executionMode: row.execution_mode }
       : {}),
     status: row.status,
@@ -2088,6 +2090,8 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
       throw new Error('Job retirement requires Agent Operations schema v18');
     }
     const retire = this.database.transaction(() => {
+      const hasExternal = this.database.prepare("SELECT 1 FROM sqlite_master WHERE name = 'external_action_plans'").get();
+      if (hasExternal && this.database.prepare("SELECT 1 FROM external_action_plans WHERE job_id = ? AND state IN ('executing','uncertain')").get(retirement.jobId)) throw new Error('External action requires reconciliation before retirement');
       const existing = this.database.prepare('SELECT * FROM job_retirements WHERE job_id = ?')
         .get(retirement.jobId) as JobRetirementRow | undefined;
       if (existing) {
@@ -2297,6 +2301,7 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
 
   async createJob(job: DurableJob): Promise<void> {
     this.assertOpen();
+    if (job.executionMode === 'external-action') throw new Error('External action Jobs require an atomic action plan');
     requireNonEmpty(job.title, 'Job title');
     if (!job.id.startsWith('job:')) throw new Error(`Invalid Agent Operations job ID: ${job.id}`);
     if (job.status !== 'draft' || job.revision !== 0) throw new Error('New jobs must be draft at revision 0');
@@ -2382,6 +2387,22 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     }
   }
 
+  async registerProjectAction(action: ProjectAction) { new ExternalActionPersistence(this.database).register(action); }
+  async listProjectActions(projectId: string) { return new ExternalActionPersistence(this.database).list(projectId); }
+  async createExternalActionJob(job: DurableJob, plan: ExternalActionPlan) { new ExternalActionPersistence(this.database).create(job, plan); }
+  async getExternalActionPlan(jobId: string) {
+    if (!this.database.prepare("SELECT 1 FROM sqlite_master WHERE name = 'external_action_plans'").get()) return null;
+    return new ExternalActionPersistence(this.database).plan(jobId);
+  }
+  async findExternalActionRequest(key: string) { return new ExternalActionPersistence(this.database).request(key); }
+  async approveExternalAction(jobId: string, approval: ExternalActionApproval) { new ExternalActionPersistence(this.database).approve(jobId, approval); }
+  async claimExternalAction(jobId: string, timestamp: string) { return new ExternalActionPersistence(this.database).claim(jobId, timestamp); }
+  async finishExternalAction(receipt: ExternalActionReceipt) { new ExternalActionPersistence(this.database).finish(receipt); }
+  async getExternalActionReceipt(jobId: string) {
+    if (!this.database.prepare("SELECT 1 FROM sqlite_master WHERE name = 'external_action_receipts'").get()) return null;
+    return new ExternalActionPersistence(this.database).receipt(jobId);
+  }
+
   async getJob(id: string): Promise<DurableJob | null> {
     this.assertOpen();
     const row = this.database.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as JobRow | undefined;
@@ -2431,6 +2452,8 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
 
   async createAttempt(attempt: NewDurableJobAttempt): Promise<DurableJobAttempt> {
     this.assertOpen();
+    const externalJob = this.database.prepare('SELECT * FROM jobs WHERE id = ?').get(attempt.jobId) as {execution_mode?:string} | undefined;
+    if (externalJob?.execution_mode === 'external-action') throw new Error('External actions cannot create provider Attempts');
     if (!attempt.id.startsWith('attempt:')) throw new Error(`Invalid Agent Operations attempt ID: ${attempt.id}`);
     if (attempt.status !== 'created' || attempt.revision !== 0) {
       throw new Error('New attempts must be created at revision 0');

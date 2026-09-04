@@ -75,3 +75,4 @@ export type {
   CreateUrlInputRequest,
   InputApplication,
 } from './types.js';
+export * from './external-action-service.js';

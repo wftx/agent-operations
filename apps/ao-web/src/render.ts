@@ -255,6 +255,20 @@ export function renderDone(jobs: readonly OperatorJobDetail[]): string {
 
 export function renderJobDetail(detail: OperatorJobDetail): string {
   const { summary } = detail;
+  if (detail.externalActionPlan) {
+    const p = detail.externalActionPlan;
+    const r = detail.externalActionReceipt;
+    return layout(summary.job.title, `<a class="back" href="/">All Jobs</a><h1>${escapeHtml(summary.job.title)}</h1>
+      <section class="criteria"><p class="eyebrow">External action · ${escapeHtml(p.action.risk)}</p><h2>${escapeHtml(p.action.name)}</h2>
+      <p>${escapeHtml(summary.currentStage)} · ${escapeHtml(p.state)}</p><p>${escapeHtml(p.action.mutationScope)}</p>
+      <dl class="facts"><dt>Reads</dt><dd>${escapeHtml(p.action.systemsRead.join(', '))}</dd><dt>Writes</dt><dd>${escapeHtml(p.action.systemsWritten.join(', '))}</dd>
+      <dt>Parameters</dt><dd>${escapeHtml(JSON.stringify(p.parameters))}</dd><dt>Retries</dt><dd>0</dd><dt>Provider Worker</dt><dd>Not used</dd>
+      <dt>Approval</dt><dd>${escapeHtml(p.approval?.reference ?? 'Required before execution')}</dd><dt>Exact scope</dt><dd>${escapeHtml(p.scopeHash)}</dd></dl>
+      ${p.predecessorJobId ? `<p>Corrects <a href="/jobs/${encodeURIComponent(p.predecessorJobId)}">${escapeHtml(p.predecessorJobId)}</a>. Original evidence remains preserved.</p>` : ''}</section>
+      ${detail.escalations.filter(e => !e.resolvedAt).map(e => `<section class="criteria"><p>${escapeHtml(e.summary)}</p></section>`).join('')}
+      ${r ? `<section class="criteria"><h2>Immutable execution receipt</h2><pre>${escapeHtml(JSON.stringify(r,null,2))}</pre></section>` : '<p>No execution receipt is recorded. Queue acceptance is not external execution.</p>'}
+      ${['awaiting-approval','approved'].includes(p.state) && !summary.retirement && summary.job.status === 'ready' ? `<form method="post" action="/jobs/${encodeURIComponent(p.jobId)}/external-action"><input type="hidden" name="scopeHash" value="${escapeAttr(p.scopeHash)}"><label><input type="checkbox" name="confirm" value="execute-once" required> Execute this exact action once with no retries${p.approval ? ' using its existing approval' : ' under my approval'}.</label><button>${p.approval ? 'Execute Previously Approved Action Once' : 'Approve and Execute Once'}</button></form>` : ''}`, 'needs-me');
+  }
   const story = detail.workerAttempts.map((worker, index) => {
     const review = worker.review;
     return `<article class="story-step">

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type { ExternalActionStateStore } from './external-action.js';
 import type {
   RepositoryAvailability,
   RepositoryIdentityKind,
@@ -115,7 +116,7 @@ export interface DurableRuntimeObservation {
 }
 
 /** AO-owned durable-state boundary. It deliberately exposes no SQL concepts. */
-export interface AgentOperationsStateStore {
+export interface AgentOperationsStateStore extends ExternalActionStateStore {
   holdUnexecutedOperatorRun(escalation: DurableEscalation, expectedRevision: number): Promise<void>;
   getOperatorRunnerState(): Promise<DurableOperatorRunnerState | null>;
   saveOperatorRunnerState(state: DurableOperatorRunnerState, expectedRevision: number | null): Promise<void>;

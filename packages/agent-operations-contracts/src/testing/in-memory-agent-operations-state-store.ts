@@ -8,6 +8,8 @@ import type {
   DurableRuntimeObservation,
   RepositoryCheckoutBinding,
 } from '../persistence.js';
+import type { ProjectAction, ExternalActionPlan, ExternalActionApproval, ExternalActionReceipt } from '../external-action.js';
+import { validateProjectAction, validateExternalActionPlan, validateExternalApproval, validateExternalReceipt } from '../external-action.js';
 import { createRepositoryCheckoutBindingId } from '../persistence.js';
 import {
   isRuntimeExecutionCapabilitiesNoBroaderThan,
@@ -345,6 +347,9 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   private readonly installation: AgentOperationsInstallation;
   private readonly failOperations: ReadonlySet<InMemoryStateStoreOperation>;
   private readonly projects = new Map<string, DurableProject>();
+  private readonly projectActions = new Map<string, ProjectAction>();
+  private readonly externalPlans = new Map<string, ExternalActionPlan>();
+  private readonly externalReceipts = new Map<string, ExternalActionReceipt>();
   private readonly repositories = new Map<string, DurableRepository>();
   private readonly bindings = new Map<string, RepositoryCheckoutBinding>();
   private readonly projectRepositories = new Map<string, Set<string>>();
@@ -877,6 +882,8 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   }
 
   async retireJob(retirement: DurableJobRetirement): Promise<void> {
+    const external = this.externalPlans.get(retirement.jobId);
+    if (external && ['executing','uncertain'].includes(external.state)) throw new Error('External action requires reconciliation before retirement');
     this.assertAvailable('write-job-retirement');
     if (!this.jobs.has(retirement.jobId)) throw new Error(`Job not found: ${retirement.jobId}`);
     const existing = this.jobRetirements.get(retirement.jobId);
@@ -1027,6 +1034,7 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   }
 
   async createJob(job: DurableJob): Promise<void> {
+    if (job.executionMode === 'external-action') throw new Error('External action Jobs require an atomic action plan');
     this.assertAvailable('write-job');
     requireNonEmpty(job.id, 'Job ID');
     requireNonEmpty(job.title, 'Job title');
@@ -1045,6 +1053,73 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     }
     if (this.jobs.has(job.id)) throw new Error(`Duplicate job ID: ${job.id}`);
     this.jobs.set(job.id, copyJob(job));
+  }
+
+  async registerProjectAction(action: ProjectAction) {
+    validateProjectAction(action);
+    if (!this.projects.has(action.projectId)) throw new Error('Project not found');
+    const prior = this.projectActions.get(action.id);
+    if (prior && JSON.stringify(prior) !== JSON.stringify(action)) throw new Error('Action definitions are immutable');
+    this.projectActions.set(action.id, structuredClone(action));
+  }
+  async listProjectActions(projectId: string) { return structuredClone([...this.projectActions.values()].filter(a => a.projectId === projectId)); }
+  async getExternalActionPlan(jobId: string) { return structuredClone(this.externalPlans.get(jobId) ?? null); }
+  async findExternalActionRequest(key: string) { return structuredClone([...this.externalPlans.values()].find(p => p.requestKey === key) ?? null); }
+  async createExternalActionJob(job: DurableJob, plan: ExternalActionPlan) {
+    validateExternalActionPlan(job, plan);
+    if (!this.projects.has(job.projectId) || JSON.stringify(this.projectActions.get(plan.action.id)) !== JSON.stringify(plan.action)) throw new Error('Configured Project action does not match plan');
+    if (this.jobs.has(job.id) || [...this.externalPlans.values()].some(p => p.requestKey === plan.requestKey || (plan.predecessorJobId && p.predecessorJobId === plan.predecessorJobId))) throw new Error('Duplicate external request');
+    if ([...this.operatorRuns.values()].some(r => ['pending','running'].includes(r.status))) throw new Error('Operator orchestration is already running');
+    if (plan.predecessorJobId) {
+      const old = this.jobs.get(plan.predecessorJobId);
+      if (!old || old.projectId !== job.projectId || !['draft','ready'].includes(old.status) || old.executionMode === 'external-action'
+        || [...this.attempts.values()].some(a => a.jobId === old.id) || [...this.repositoryWorkspaces.values()].some(w => w.jobId === old.id)
+        || this.jobRetirements.has(old.id)) throw new Error('Predecessor is not an unexecuted misclassified Job');
+      this.jobs.set(old.id, { ...old, status:'cancelled', revision:old.revision+1, updatedAt:plan.createdAt });
+      for (const [id,r] of this.operatorRuns) if (r.jobId === old.id) this.operatorRuns.set(id, { ...r, status:'cancelled', startedAt:r.startedAt ?? plan.createdAt, finishedAt:plan.createdAt, updatedAt:plan.createdAt, revision:r.revision+1 });
+      for (const [id,e] of this.escalations) if (e.jobId === old.id && !e.resolvedAt) this.escalations.set(id, {...e, resolvedAt:plan.createdAt});
+      this.jobRetirements.set(old.id, {jobId:old.id, disposition:'retired', reason:'Superseded due to execution mode misclassification', actor:'AO application', evidenceReference:job.id, retiredAt:plan.createdAt});
+    }
+    this.jobs.set(job.id, {...job,status:'ready',revision:1});
+    this.externalPlans.set(job.id, structuredClone(plan));
+    const id = `operator-run:${plan.id}`;
+    this.operatorRuns.set(id, {id,jobId:job.id,status:'needs_human',revision:0,createdAt:plan.createdAt,updatedAt:plan.createdAt,startedAt:plan.createdAt,finishedAt:plan.createdAt});
+    this.externalEscalate(job.id, plan.createdAt, 'External action requires exact human approval.');
+  }
+  async approveExternalAction(jobId: string, approval: ExternalActionApproval) {
+    const p = this.externalPlans.get(jobId);
+    if (!p) throw new Error('External action plan not found');
+    validateExternalApproval(p, approval);
+    if (p.approval) { if (JSON.stringify(p.approval) !== JSON.stringify(approval)) throw new Error('External approval already recorded'); return; }
+    if (p.state !== 'awaiting-approval' || this.jobRetirements.has(jobId)) throw new Error('Not awaiting approval');
+    this.externalPlans.set(jobId, {...p,approval:structuredClone(approval),state:'approved',revision:p.revision+1});
+  }
+  async claimExternalAction(jobId: string, timestamp: string) {
+    const p = this.externalPlans.get(jobId);
+    if (!p?.approval || p.state !== 'approved' || this.jobRetirements.has(jobId) || this.jobs.get(jobId)?.status !== 'ready') return false;
+    this.externalPlans.set(jobId, {...p,state:'executing',claimedAt:timestamp,revision:p.revision+1});
+    for (const [id,r] of this.operatorRuns) if (r.jobId === jobId) this.operatorRuns.set(id, {...r,status:'running',startedAt:timestamp,finishedAt:undefined,updatedAt:timestamp,revision:r.revision+1});
+    for (const [id,e] of this.escalations) if (e.jobId === jobId && !e.resolvedAt) this.escalations.set(id,{...e,resolvedAt:timestamp});
+    return true;
+  }
+  async finishExternalAction(receipt: ExternalActionReceipt) {
+    const prior = this.externalReceipts.get(receipt.jobId);
+    if (prior) { if (JSON.stringify(prior) !== JSON.stringify(receipt)) throw new Error('External receipt is immutable'); return; }
+    const p = this.externalPlans.get(receipt.jobId);
+    if (!p) throw new Error('External action plan not found');
+    validateExternalReceipt(p, receipt);
+    this.externalReceipts.set(receipt.jobId,structuredClone(receipt));
+    this.externalPlans.set(receipt.jobId,{...p,state:receipt.status,revision:p.revision+1});
+    const success = receipt.status === 'completed';
+    const job = this.jobs.get(receipt.jobId)!;
+    if (success) this.jobs.set(job.id,{...job,status:'completed',revision:job.revision+1,updatedAt:receipt.recordedAt});
+    for (const [id,r] of this.operatorRuns) if (r.jobId === job.id) this.operatorRuns.set(id,{...r,status:success?'completed':'needs_human',finishedAt:receipt.recordedAt,updatedAt:receipt.recordedAt,revision:r.revision+1});
+    if (!success) this.externalEscalate(job.id,receipt.recordedAt,`External action ${receipt.status}. No automatic retry.`);
+  }
+  async getExternalActionReceipt(jobId: string) { return structuredClone(this.externalReceipts.get(jobId) ?? null); }
+  private externalEscalate(jobId:string, time:string, summary:string) {
+    const id = `escalation:external:${jobId}:${time}`;
+    this.escalations.set(id,{id,jobId,reason:'human_judgment_required',summary,createdAt:time});
   }
 
   async getJob(id: string): Promise<DurableJob | null> {
@@ -1081,6 +1156,7 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   }
 
   async createAttempt(attempt: NewDurableJobAttempt): Promise<DurableJobAttempt> {
+    if (this.jobs.get(attempt.jobId)?.executionMode === 'external-action') throw new Error('External actions cannot create provider Attempts');
     this.assertAvailable('write-attempt');
     if (!attempt.id.startsWith('attempt:')) throw new Error(`Invalid Agent Operations attempt ID: ${attempt.id}`);
     if (attempt.status !== 'created' || attempt.revision !== 0) {

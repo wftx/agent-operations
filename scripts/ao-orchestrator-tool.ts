@@ -5,6 +5,7 @@ import { createAgentOperationsComposition } from '../packages/agent-operations-c
 import { CortextOSConversationStateRepository } from '../packages/cortextos-conversation-adapter/src/index.js';
 
 const TOOL_NAMES = new Set<OrchestratorToolName>([
+  'ao.actions.list',
   'ao.projects.list',
   'ao.projects.get',
   'ao.inputs.list',

@@ -633,6 +633,8 @@ export class OperatorApplicationService implements OperatorApplication {
     const job = await this.store.getJob(required(jobId, 'Job ID'));
     if (!job) throw new Error(`Job not found: ${jobId}`);
     const summary = await this.buildSummary(job);
+    const externalActionPlan = await this.store.getExternalActionPlan(job.id);
+    const externalActionReceipt = await this.store.getExternalActionReceipt(job.id);
     const attempts = await this.store.listAttemptsForJob(job.id);
     const reviews = await this.store.listAttemptReviewsForJob(job.id);
     const escalations = await this.store.listEscalations(job.id);
@@ -682,6 +684,8 @@ export class OperatorApplicationService implements OperatorApplication {
       : { safe: false, reasons: ['Job retirement is not configured'] };
     return {
       summary,
+      ...(externalActionPlan ? {externalActionPlan} : {}),
+      ...(externalActionReceipt ? {externalActionReceipt} : {}),
       acceptanceCriteria: job.acceptanceCriteria ?? '',
       workerAttempts,
       reviewerAttempts,
@@ -838,7 +842,7 @@ export class OperatorApplicationService implements OperatorApplication {
       : undefined;
     if (latestReview?.decision === 'REVISION_REQUIRED') return 'Preparing Revision';
     if (latestWorker?.status === 'completed' && !latestReview) return 'Preparing Reviewer';
-    return run?.status === 'running' ? 'Preparing Worker' : 'Queued';
+    return run?.status === 'running' ? job.executionMode === 'external-action' ? 'External action running' : 'Preparing Worker' : 'Queued';
   }
 
   private async actionsForEscalation(
@@ -846,6 +850,8 @@ export class OperatorApplicationService implements OperatorApplication {
     attempts: readonly DurableJobAttempt[],
   ): Promise<readonly OperatorEscalationAction[]> {
     if (escalation.resolvedAt) return [];
+    const external = await this.store.getExternalActionPlan(escalation.jobId);
+    if (external) return ['executing','uncertain'].includes(external.state) ? [] : ['cancel-job'];
     if (isRecoverableObservationEscalation(escalation) && escalation.attemptId) {
       const attempt = attempts.find(candidate => candidate.id === escalation.attemptId);
       const plan = attempt ? await this.store.getExecutionPlanForAttempt(attempt.id) : null;

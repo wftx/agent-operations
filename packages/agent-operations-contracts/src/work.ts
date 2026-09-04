@@ -6,6 +6,7 @@ export type JobStatus = (typeof JOB_STATUSES)[number];
 export const JOB_EXECUTION_MODES = [
   'repository-read-only',
   'repository-write-isolated',
+  'external-action',
 ] as const;
 export type JobExecutionMode = (typeof JOB_EXECUTION_MODES)[number];
 

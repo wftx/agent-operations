@@ -4,6 +4,8 @@ Available tools:
 
 * `ao.projects_list`: no input fields.
 * `ao.projects_get`: `projectId`.
+* `ao.actions_list`: `projectId`. Inspect configured actions for operational sync, CRM, or workflow requests. If no matching action exists, report the missing Project capability. Never substitute a repository write Job. Clarify if multiple actions match.
+* For an external action, `ao.jobs_create` takes `executionMode: external-action`, exact `actionId`, closed `actionParameters`, and a stable `requestKey`, plus Project, title, task and acceptance criteria. No repository is required. This requests an action; it never authorizes or executes it. Human approval remains an application gate. Never put credential values in arguments.
 * `ao.inputs_list`: optional `projectId`.
 * `ao.inputs_get`: `inputId`.
 * `ao.jobs_create`: `projectId`, optional `repositoryId`, `title`, `task`, `acceptanceCriteria`, `executionMode`, `reviewerRequired: true`, optional `inputIds`, and optional one item `evidenceRequirements` with `kind: browser-render`, repository relative `route`, and bounded `viewport`. The effective Trust Profile owns execution budgets.

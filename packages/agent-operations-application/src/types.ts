@@ -1,4 +1,6 @@
 import type {
+  ExternalActionPlan,
+  ExternalActionReceipt,
   AttemptReviewDecision,
   DurableAttemptReview,
   DurableEscalation,
@@ -186,6 +188,7 @@ export interface OperatorJobSummary {
 }
 
 export type OperatorExecutionStage =
+  | 'External action running'
   | 'Queued'
   | 'Waiting for runner'
   | 'Execution paused'
@@ -234,6 +237,8 @@ export interface OperatorAttemptStory {
 }
 
 export interface OperatorJobDetail {
+  readonly externalActionPlan?: ExternalActionPlan;
+  readonly externalActionReceipt?: ExternalActionReceipt;
   readonly summary: OperatorJobSummary;
   readonly acceptanceCriteria: string;
   readonly workerAttempts: readonly OperatorAttemptStory[];
@@ -388,6 +393,7 @@ export interface OperatorApplication {
 }
 
 export type OrchestratorToolName =
+  | 'ao.actions.list'
   | 'ao.projects.list'
   | 'ao.projects.get'
   | 'ao.inputs.list'

@@ -32,7 +32,7 @@ type RequestSender = (request: Record<string, unknown>) => Promise<unknown>;
 
 /** Catalog required by the current AO Web conversation contract. */
 export const EXPECTED_AO_ORCHESTRATOR_TOOL_CATALOG_REVISION =
-  'sha256:1824d43cb9bb45153f129a459a1968622d7705aa0eee59418996c4088de08497';
+  'sha256:869c426ab59c14e2cd26d825ef5c8865c0af9747d0d8e26a6713582f7a4a9401';
 
 export interface CortextOSOrchestratorConversationAdapterOptions {
   readonly instanceId?: string;

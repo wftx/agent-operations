@@ -10,6 +10,7 @@ import {
   createOperatorNotificationDeliveryId,
   createOperatorNotificationEventKey,
   actionableEscalationText,
+  EXTERNAL_ACTION_MAX_DURATION_MS,
 } from '../../agent-operations-contracts/src/index.js';
 import type { OrchestrationReadModel } from '../../agent-operations-core/src/index.js';
 import type { OperatorNotifier } from './notification.js';
@@ -79,7 +80,19 @@ export class OperatorRunner {
     for (;;) {
       if (this.requireRunnerControl && (await readRunnerStatus(this.store, this.now())).state !== 'running') break;
       const runs = await this.store.listOperatorRuns();
-      const next = runs.find(run => run.status === 'pending' || run.status === 'running');
+      // External action claims belong to their deterministic executor, never a Worker.
+      const externalIds = new Set((await this.store.listJobs()).filter(j => j.executionMode === 'external-action').map(j => j.id));
+      for(const run of runs.filter(r=>externalIds.has(r.jobId) && r.status==='running')) {
+        const p=await this.store.getExternalActionPlan(run.jobId);
+        const timestamp=this.now().toISOString();
+        if(p?.state==='executing' && p.claimedAt && p.approval && this.now().getTime()-Date.parse(p.claimedAt)>=EXTERNAL_ACTION_MAX_DURATION_MS) {
+          await this.store.finishExternalAction({id:`external-receipt:expired:${p.id}`,planId:p.id,jobId:p.jobId,projectId:p.action.projectId,
+            actionId:p.action.id,executorId:p.action.executorId,approval:p.approval,scopeHash:p.scopeHash,
+            systemsRead:p.action.systemsRead,systemsWritten:p.action.systemsWritten,mutationScope:p.action.mutationScope,
+            executedAt:p.claimedAt,recordedAt:timestamp,automaticRetries:0,status:'uncertain',verification:'unavailable',sideEffect:'possible',counts:{},errorCode:'outcome-uncertain'});
+        }
+      }
+      const next = runs.find(run => (run.status === 'pending' || run.status === 'running') && !externalIds.has(run.jobId));
       if (!next) break;
       if (await this.process(next) === 'deferred') break;
     }
@@ -230,14 +243,15 @@ export class OperatorRunner {
       const result = workerAttempts.length
         ? await this.resultForAttempt(workerAttempts.at(-1)!.id)
         : undefined;
+      const external = await this.store.getExternalActionReceipt(job.id);
       await this.deliver('job_completed', job.id, undefined, {
         kind: 'job_completed',
         jobId: job.id,
         title: job.title,
         projectName,
         aoPath,
-        result: result ?? 'No bounded final result is available.',
-        reviewerSummary: reviews.at(-1)?.summary ?? 'Reviewer PASS was recorded.',
+        result: external ? `External action ${external.status}. ${JSON.stringify(external.counts)}. Receipt ${external.id}.` : result ?? 'No bounded final result is available.',
+        reviewerSummary: external ? `Deterministic verification ${external.verification}. No provider Reviewer was used.` : reviews.at(-1)?.summary ?? 'Reviewer PASS was recorded.',
         workerAttemptCount: workerAttempts.length,
       });
       return;

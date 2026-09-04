@@ -200,6 +200,8 @@ export class OrchestrationService {
 
   async preview(jobId: string): Promise<OrchestrationPreview> {
     const job = await this.requireJob(jobId);
+    const executionMode = executionModeForJob(job);
+    if (executionMode === 'external-action') throw new Error('External actions cannot use repository Worker orchestration');
     const workerRuntimeAgentId = this.workerRuntimeAgentId ?? job.preferredRuntimeAgentId ?? null;
     const reviewerRuntimeAgentId = this.reviewerRuntimeAgentId ?? job.preferredRuntimeAgentId ?? null;
     const findings = await this.eligibilityFindings(job, workerRuntimeAgentId, reviewerRuntimeAgentId);
@@ -217,7 +219,7 @@ export class OrchestrationService {
       capabilities: writeMode
         ? { ...REPOSITORY_WRITE_EXECUTION_CAPABILITIES, ...(hasInputs ? { inputRead: true } : {}) }
         : { ...REPOSITORY_READ_EXECUTION_CAPABILITIES, ...(hasInputs ? { inputRead: true } : {}) },
-      executionMode: executionModeForJob(job),
+      executionMode,
       repositoryRead: true,
       maxWorkerAttempts: workerMaximumForPolicy(trustPolicy, executionModeForJob(job)),
       maxReviewerPassesPerAttempt: MVP_MAX_REVIEWER_PASSES_PER_ATTEMPT,
@@ -231,6 +233,7 @@ export class OrchestrationService {
 
   async runJob(jobId: string): Promise<OrchestrationReadModel> {
     const initialJob = await this.requireJob(jobId);
+    if (initialJob.executionMode === 'external-action') throw new Error('External actions cannot use repository Worker orchestration');
     if (initialJob.status === 'completed') return this.readModel(initialJob.id, 'PASS');
     if ((await this.store.listEscalations(initialJob.id, true)).length > 0) {
       return this.readModel(initialJob.id, 'ESCALATED');

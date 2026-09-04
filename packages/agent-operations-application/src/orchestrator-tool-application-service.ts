@@ -7,6 +7,7 @@ import type {
   OrchestratorToolRequest,
   OrchestratorToolResult,
 } from './types.js';
+import type { ExternalActionService } from './external-action-service.js';
 
 /** The complete mutable authority exposed to the conversational Orchestrator. */
 export class OrchestratorToolApplicationService {
@@ -14,17 +15,23 @@ export class OrchestratorToolApplicationService {
     private readonly operator: OperatorApplication,
     private readonly inputs?: InputApplication,
     private readonly preview?: PreviewApplication,
+    private readonly externalActions?: ExternalActionService,
   ) {}
 
   async execute(request: OrchestratorToolRequest): Promise<OrchestratorToolResult> {
     try {
       switch (request.name) {
         case 'ao.projects.list':
-          return success((await this.operator.listProjects()).slice(0, 100).map(projectView));
+          return success(await Promise.all((await this.operator.listProjects()).slice(0, 100).map(async project => {
+            const actions = await this.externalActions?.list(project.project.id) ?? [];
+            return {...projectView(project),actions,externalActionsAvailable:actions.length>0};
+          })));
         case 'ao.projects.get': {
           const project = await this.requireProject(text(request.arguments, 'projectId'));
-          return success(projectView(project));
+          return success({...projectView(project), actions: await this.externalActions?.list(project.project.id) ?? []});
         }
+        case 'ao.actions.list':
+          return success(await this.externalActions?.list(text(request.arguments, 'projectId')) ?? []);
         case 'ao.inputs.list': {
           if (!this.inputs) throw new Error('Input tools are not configured');
           return success(await this.inputs.listInputs(optionalText(request.arguments, 'projectId')));
@@ -65,7 +72,7 @@ export class OrchestratorToolApplicationService {
             latestReviewDecision: detail.summary.latestReviewDecision,
             runner: detail.summary.runnerStatus,
             providerSubmissions: detail.summary.providerSubmissionCount,
-            externalExecution: 'Not established by queue or provider acceptance. Exact tool receipts are required.',
+            externalExecution: detail.externalActionReceipt ?? 'Not established by queue or provider acceptance. Exact tool receipts are required.',
           }, [detail.summary.job.id]);
         }
         case 'ao.jobs.guide': {
@@ -103,6 +110,20 @@ export class OrchestratorToolApplicationService {
 
   private async createJob(argumentsValue: Readonly<Record<string, unknown>>): Promise<OrchestratorToolResult> {
     const project = await this.requireProject(text(argumentsValue, 'projectId'));
+    if (argumentsValue['executionMode'] === 'external-action') {
+      if (!this.externalActions) throw new Error('External actions are not configured');
+      for (const field of ['repositoryId','inputIds','evidenceRequirements','maxWorkerAttempts']) {
+        if (argumentsValue[field] !== undefined) throw new Error('External actions do not accept repository or Worker authority');
+      }
+      const parameters = argumentsValue['actionParameters'];
+      if (!parameters || typeof parameters !== 'object' || Array.isArray(parameters)
+        || Object.values(parameters).some(v => typeof v !== 'string')) throw new Error('Exact actionParameters are required');
+      const plan = await this.externalActions.create({projectId:project.project.id,actionId:text(argumentsValue,'actionId'),
+        parameters:parameters as Record<string,string>,title:text(argumentsValue,'title'),task:text(argumentsValue,'task'),
+        acceptanceCriteria:text(argumentsValue,'acceptanceCriteria'),requestKey:text(argumentsValue,'requestKey')});
+      return success({jobId:plan.jobId,status:'Needs Me',executionMode:'external-action',approvalRequired:true,link:`/jobs/${encodeURIComponent(plan.jobId)}`},[plan.jobId]);
+    }
+    if (argumentsValue['actionId'] !== undefined) throw new Error('Configured external actions require external-action mode, not repository execution');
     const repositoryId = optionalText(argumentsValue, 'repositoryId')
       ?? (project.repositories.length === 1 ? project.repositories[0]!.id : undefined);
     if (!repositoryId) throw new Error('repositoryId is required when a Project has multiple repositories');
@@ -184,6 +205,9 @@ function jobView(detail: OperatorJobDetail) {
     description: detail.summary.job.description,
     acceptanceCriteria: detail.acceptanceCriteria,
     executionMode: detail.summary.job.executionMode,
+    externalAction: detail.externalActionPlan,
+    externalReceipt: detail.externalActionReceipt,
+    retirement: detail.summary.retirement,
     state: detail.summary.orchestrationState,
     stage: detail.summary.currentStage,
     needsHuman: detail.summary.needsHuman,

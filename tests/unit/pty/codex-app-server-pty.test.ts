@@ -184,6 +184,7 @@ describe('CodexAppServerPTY Agent Operations Orchestrator tools', () => {
       'projects_get',
       'inputs_list',
       'inputs_get',
+      'actions_list',
       'jobs_create',
       'jobs_get',
       'jobs_list',
