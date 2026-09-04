@@ -55,6 +55,8 @@ for (const kind of ['memory','sqlite'] as const) describe(`external action ${kin
     expect((await f.service.create(f.input)).jobId).toBe(f.plan.jobId);
     await f.service.approve(f.plan.jobId,f.approval);
     await f.service.approve(f.plan.jobId,f.approval);
+    expect(await f.store.listEscalations(f.plan.jobId,true)).toHaveLength(0);
+    expect(await f.store.listEscalations(f.plan.jobId)).toHaveLength(1);
     await Promise.all([f.service.execute(f.plan.jobId),f.service.execute(f.plan.jobId)]);
     const receipt=await f.service.execute(f.plan.jobId);
     expect(receipt?.status).toBe('completed');expect(f.execute).toHaveBeenCalledTimes(1);

@@ -8,6 +8,7 @@ import type {
   DurableRuntimeObservation,
   RepositoryCheckoutBinding,
 } from '../persistence.js';
+import { randomUUID } from 'node:crypto';
 import type { ProjectAction, ExternalActionPlan, ExternalActionApproval, ExternalActionReceipt } from '../external-action.js';
 import { validateProjectAction, validateExternalActionPlan, validateExternalApproval, validateExternalReceipt } from '../external-action.js';
 import { createRepositoryCheckoutBindingId } from '../persistence.js';
@@ -1093,6 +1094,7 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
     if (p.approval) { if (JSON.stringify(p.approval) !== JSON.stringify(approval)) throw new Error('External approval already recorded'); return; }
     if (p.state !== 'awaiting-approval' || this.jobRetirements.has(jobId)) throw new Error('Not awaiting approval');
     this.externalPlans.set(jobId, {...p,approval:structuredClone(approval),state:'approved',revision:p.revision+1});
+    for(const [id,e] of this.escalations) if(e.jobId===jobId && !e.resolvedAt && e.summary==='External action requires exact human approval.') this.escalations.set(id,{...e,resolvedAt:approval.approvedAt});
   }
   async claimExternalAction(jobId: string, timestamp: string) {
     const p = this.externalPlans.get(jobId);
@@ -1118,7 +1120,7 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
   }
   async getExternalActionReceipt(jobId: string) { return structuredClone(this.externalReceipts.get(jobId) ?? null); }
   private externalEscalate(jobId:string, time:string, summary:string) {
-    const id = `escalation:external:${jobId}:${time}`;
+    const id = `escalation:${randomUUID()}`;
     this.escalations.set(id,{id,jobId,reason:'human_judgment_required',summary,createdAt:time});
   }
 

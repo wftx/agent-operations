@@ -63,6 +63,8 @@ export class ExternalActionPersistence {
       }
       if (plan.state !== 'awaiting-approval' || this.db.prepare('SELECT 1 FROM job_retirements WHERE job_id = ?').get(jobId)) throw new Error('External action is not awaiting approval');
       this.save({ ...plan, approval, state: 'approved', revision: plan.revision + 1 });
+      this.db.prepare('UPDATE escalations SET resolved_at = ? WHERE job_id = ? AND resolved_at IS NULL AND summary = ?')
+        .run(approval.approvedAt, jobId, 'External action requires exact human approval.');
       // Approval does not itself schedule or execute a side effect.
     })();
   }
