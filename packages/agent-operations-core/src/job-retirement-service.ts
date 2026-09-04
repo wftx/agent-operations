@@ -21,14 +21,13 @@ export class JobRetirementService {
   async assess(jobId: string): Promise<JobRetirementAssessment> {
     const job = await this.store.getJob(jobId.trim());
     if (!job) throw new Error(`Job not found: ${jobId}`);
-    if (await this.store.getJobRetirement(job.id)) return { safe: true, reasons: [] };
     const reasons: string[] = [];
     for (const attempt of await this.store.listAttemptsForJob(job.id)) {
       const plan = await this.store.getExecutionPlanForAttempt(attempt.id);
       const dispatch = plan ? await this.store.getExecutionDispatchForPlan(plan.id) : null;
       if (dispatch?.status === 'submitting' || dispatch?.status === 'uncertain'
         || (dispatch?.status === 'accepted' && (attempt.status === 'created' || attempt.status === 'running'))
-        || ((attempt.status === 'created' || attempt.status === 'running') && !dispatch)) {
+        || ((attempt.status === 'created' || attempt.status === 'running') && (!dispatch || dispatch.status === 'prepared'))) {
         reasons.push(`Attempt ${attempt.id} may still cross or occupy the provider boundary`);
       }
     }
@@ -48,9 +47,12 @@ export class JobRetirementService {
   }): Promise<DurableJobRetirement> {
     const jobId = input.jobId.trim();
     const existing = await this.store.getJobRetirement(jobId);
-    if (existing) return existing;
     const assessment = await this.assess(jobId);
     if (!assessment.safe) throw new Error(`Job ${jobId} cannot retire: ${assessment.reasons.join('; ')}`);
+    if (existing) {
+      await this.store.retireJob(existing);
+      return existing;
+    }
     if (input.disposition === 'externally-published' && !input.evidenceReference?.trim()) {
       throw new Error('Externally published retirement requires an evidence reference');
     }

@@ -117,6 +117,7 @@ export function renderDashboard(
     readonly input?: Partial<OperatorTaskInput>;
     readonly telegramConfigured?: boolean;
     readonly runtimeStart?: RuntimeStartResult;
+    readonly runnerStatus?: { readonly state: string; readonly reason: string; readonly resumeAt?: string };
   } = {},
   metrics?: DailyDriverMetrics,
   freshness?: RuntimeFreshnessReport,
@@ -132,6 +133,7 @@ export function renderDashboard(
   const today = new Date().toISOString().slice(0, 10);
   const doneToday = jobs.filter(job => job.job.status === 'completed' && job.job.updatedAt.startsWith(today)).length;
   const form = `
+    ${options.runnerStatus ? `<section class="criteria"><p class="eyebrow">Background runner</p><strong>${escapeHtml(humanize(options.runnerStatus.state))}</strong><p>${escapeHtml(options.runnerStatus.reason)}</p>${options.runnerStatus.resumeAt ? `<p>Maintenance deadline: ${escapeHtml(options.runnerStatus.resumeAt)}</p>` : ''}<form method="post" action="/runner"><input type="hidden" name="action" value="${options.runnerStatus.state === 'running' ? 'pause' : 'resume'}"><button>${options.runnerStatus.state === 'running' ? 'Pause Execution' : 'Resume Execution'}</button></form><p>Pausing prevents new work. It does not interrupt an accepted provider turn. Resuming may execute queued Jobs.</p></section>` : ''}
     <section class="mission-summary">
       <div class="runtime ${runtime.state}"><span class="runtime-dot"></span><div><p class="eyebrow">Runtime</p><strong>${escapeHtml(runtime.label)}</strong>${runtime.reason ? `<small>${escapeHtml(runtime.reason)}</small>` : ''}${runtime.state !== 'ready' ? '<form method="post" action="/runtime/start"><button>Start Runtime</button></form>' : ''}</div></div>
       <div><p class="eyebrow">Notifications</p><strong>Telegram: ${options.telegramConfigured ? 'Configured' : 'Not configured'}</strong></div>
@@ -281,7 +283,8 @@ export function renderJobDetail(detail: OperatorJobDetail): string {
     ${detail.inputs?.length ? `<section class="criteria"><p class="eyebrow">Attached Inputs</p>${detail.inputs.map(input => `<p><strong>${escapeHtml(input.displayName)}</strong> · ${escapeHtml(input.mimeType)} · ${input.byteSize} bytes · SHA256 ${escapeHtml(input.sha256)}</p>`).join('')}</section>` : ''}
     ${detail.deterministicVerification ? `<section class="criteria"><p class="eyebrow">Deterministic repository verification</p><p><strong>${escapeHtml(detail.deterministicVerification.result)}</strong> · no provider runtime or Dispatch required</p><div class="result">${escapeHtml(detail.deterministicVerification.summary)}</div><details><summary>Exact evidence</summary><pre>Branch: ${escapeHtml(detail.deterministicVerification.branch)}\nHEAD: ${escapeHtml(detail.deterministicVerification.headRevision)}\nStatus: ${escapeHtml(detail.deterministicVerification.statusEntries.map(item => `${item.path}: ${item.indexStatus}/${item.worktreeStatus}`).join('\n') || 'clean')}\n${escapeHtml(detail.deterministicVerification.preservedUntrackedFiles.map(item => `${item.path}: ${item.sha256}`).join('\n'))}</pre></details></section>` : ''}
     ${extensionReview ? `<section class="criteria review revision_required"><p class="eyebrow">Reviewer feedback requiring another attempt</p><h2>${escapeHtml(extensionReview.decision)}</h2><p>${escapeHtml(extensionReview.feedback ?? extensionReview.summary)}</p></section>` : ''}
-    ${escalations}<section class="story">${story || '<div class="empty"><h2>Accepted</h2><p>Agent Operations will prepare the first Worker Attempt.</p></div>'}${guidance}${budgetExtensions}</section>
+    <section class="criteria"><p class="eyebrow">Execution boundary</p><p>Provider submissions: ${summary.providerSubmissionCount ?? 'unknown'}. Queue acceptance is not provider acceptance. A provider submission is not proof of a production sync or external mutation.</p>${summary.runnerStatus ? `<p>Runner: ${escapeHtml(humanize(summary.runnerStatus.state))}. ${escapeHtml(summary.runnerStatus.reason)}</p>` : ''}</section>
+    ${escalations}<section class="story">${story || `<div class="empty"><h2>${escapeHtml(summary.orchestrationState)}</h2><p>No Worker Attempt has been created.</p></div>`}${guidance}${budgetExtensions}</section>
     <section class="final"><p class="eyebrow">Final state</p><h2>${escapeHtml(summary.orchestrationState)}</h2>
       ${detail.finalWorkerResult ? `<h3>Worker result</h3><div class="result">${escapeHtml(detail.finalWorkerResult)}</div>` : ''}
       ${detail.finalReview ? `<h3>Reviewer ${escapeHtml(detail.finalReview.decision)}</h3><p>${escapeHtml(detail.finalReview.summary)}</p>` : ''}

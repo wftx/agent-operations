@@ -63,6 +63,9 @@ export class OrchestratorToolApplicationService {
             stage: detail.summary.currentStage,
             needsHuman: detail.summary.needsHuman,
             latestReviewDecision: detail.summary.latestReviewDecision,
+            runner: detail.summary.runnerStatus,
+            providerSubmissions: detail.summary.providerSubmissionCount,
+            externalExecution: 'Not established by queue or provider acceptance. Exact tool receipts are required.',
           }, [detail.summary.job.id]);
         }
         case 'ao.jobs.guide': {
@@ -185,6 +188,9 @@ function jobView(detail: OperatorJobDetail) {
     stage: detail.summary.currentStage,
     needsHuman: detail.summary.needsHuman,
     latestReviewDecision: detail.summary.latestReviewDecision,
+    runner: detail.summary.runnerStatus,
+    providerSubmissions: detail.summary.providerSubmissionCount,
+    externalExecution: 'Not established by queue or provider acceptance. Exact tool receipts are required.',
     inputs: detail.inputs ?? [],
     unresolvedEscalations: detail.escalations.filter(escalation => !escalation.resolvedAt).map(escalation => ({
       escalationId: escalation.id,

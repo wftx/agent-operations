@@ -65,6 +65,7 @@ export interface AgentOperationsCompositionOptions {
   readonly startRunner?: boolean;
   readonly runnerPollIntervalMs?: number;
   readonly deferRunnerWake?: boolean;
+  readonly runnerPauseKind?: 'maintenance' | 'administrative';
 }
 
 export interface AgentOperationsComposition {
@@ -78,6 +79,7 @@ export interface AgentOperationsComposition {
   readonly runtimeFreshness: RuntimeFreshnessApplication;
   readonly metrics: DailyDriverMetricsApplication;
   readonly telegramConfigured: boolean;
+  startWebRunner(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -163,6 +165,7 @@ export function createAgentOperationsComposition(
     jobRetirement,
     repositoryRestore,
     deterministicVerification,
+    requireRunnerControl: true,
     ...(options.deferRunnerWake !== undefined ? { deferRunnerWake: options.deferRunnerWake } : {}),
   });
   const conversation = new OrchestratorConversationApplicationService(
@@ -171,14 +174,7 @@ export function createAgentOperationsComposition(
   );
   const tools = new OrchestratorToolApplicationService(operator, inputs, preview);
   let runnerTimer: ReturnType<typeof setInterval> | null = null;
-  if (options.startRunner) {
-    operator.startRunner();
-    runnerTimer = setInterval(
-      () => operator.startRunner(),
-      options.runnerPollIntervalMs ?? 1_000,
-    );
-    runnerTimer.unref();
-  }
+  let tickPromise: Promise<void> | null = null;
   return {
     operator,
     conversation,
@@ -190,8 +186,23 @@ export function createAgentOperationsComposition(
     runtimeFreshness,
     metrics,
     telegramConfigured: notification.configured,
+    async startWebRunner() {
+      if (runnerTimer) return;
+      await operator.attachWebRunner(options.startRunner ?? true, options.runnerPauseKind);
+      const tick = () => {
+        if (tickPromise) return;
+        tickPromise = operator.tickWebRunner().catch(error => {
+          console.error('AO runner control failed:', error instanceof Error ? error.message : String(error));
+        }).finally(() => { tickPromise = null; });
+      };
+      runnerTimer = setInterval(tick, options.runnerPollIntervalMs ?? 1_000);
+      runnerTimer.unref();
+      tick();
+    },
     async close() {
       if (runnerTimer) clearInterval(runnerTimer);
+      if (tickPromise) await tickPromise;
+      if (runnerTimer) await operator.closeWebRunner();
       await store.close();
     },
   };

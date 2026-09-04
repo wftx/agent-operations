@@ -45,6 +45,7 @@ import {
 } from '../../agent-operations-core/src/index.js';
 import type { OperatorNotifier } from './notification.js';
 import { OperatorRunner } from './operator-runner.js';
+import { OperatorRunnerControl, readRunnerStatus } from './operator-runner-control.js';
 import { TrustProfileApplicationService } from './trust-profile-application-service.js';
 import type {
   OperatorApplication,
@@ -87,6 +88,7 @@ export interface OperatorApplicationServiceOptions {
   readonly jobRetirement?: JobRetirementService;
   readonly repositoryRestore?: RepositoryRestoreService;
   readonly deterministicVerification?: DeterministicRepositoryVerificationService;
+  readonly requireRunnerControl?: boolean;
 }
 
 export const OPERATOR_READ_ONLY_DEFAULTS: OperatorPolicyDefaults = {
@@ -127,6 +129,8 @@ export class OperatorApplicationService implements OperatorApplication {
   private readonly repositoryRestore?: RepositoryRestoreService;
   private readonly deterministicVerification?: DeterministicRepositoryVerificationService;
   private reconciliationPromise: Promise<void> | null = null;
+  private readonly runnerControl: OperatorRunnerControl;
+  private readonly requireRunnerControl: boolean;
 
   constructor(
     private readonly store: AgentOperationsStateStore,
@@ -134,6 +138,8 @@ export class OperatorApplicationService implements OperatorApplication {
     options: OperatorApplicationServiceOptions = {},
   ) {
     this.now = options.now ?? (() => new Date());
+    this.runnerControl = new OperatorRunnerControl(store, this.now);
+    this.requireRunnerControl = options.requireRunnerControl ?? false;
     this.lifecycle = new JobLifecycleService(store, { now: this.now });
     this.runtime = options.runtime;
     this.runtimeLifecycle = options.runtimeLifecycle;
@@ -150,6 +156,7 @@ export class OperatorApplicationService implements OperatorApplication {
     this.deterministicVerification = options.deterministicVerification;
     this.runner = new OperatorRunner(store, orchestration, {
       now: this.now,
+      requireRunnerControl: this.requireRunnerControl,
       ...(options.notifier ? { notifier: options.notifier } : {}),
       ...(options.runtimeFreshness ? { runtimeFreshness: options.runtimeFreshness } : {}),
     });
@@ -157,13 +164,33 @@ export class OperatorApplicationService implements OperatorApplication {
 
   startRunner(): void {
     if (this.reconciliationPromise) return;
-    const reconciliation = this.reconcileMachineResolvableRuns().catch(() => undefined);
+    const reconciliation = (async () => {
+      if (this.requireRunnerControl && (await this.getRunnerStatus()).state !== 'running') return;
+      await this.reconcileMachineResolvableRuns();
+    })().catch(() => undefined);
     this.reconciliationPromise = reconciliation;
     void reconciliation.finally(() => {
       if (this.reconciliationPromise === reconciliation) this.reconciliationPromise = null;
       this.runner.start();
     });
   }
+
+  async getRunnerStatus() { return readRunnerStatus(this.store, this.now()); }
+  /** Explicit application preflight hold. Never creates an Attempt or contacts a provider. */
+  async holdUnexecutedJob(jobId: string, reason: string): Promise<DurableOperatorRun> {
+    const run = await this.requireOperatorRun(jobId);
+    if (run.status === 'needs_human') return run;
+    if (run.status !== 'pending' || (await this.store.listAttemptsForJob(jobId)).length
+      || await this.store.getJobRetirement(jobId)) throw new Error('Only an unexecuted queued Job can be held');
+    const timestamp = this.now().toISOString();
+    await this.store.holdUnexecutedOperatorRun({ id: this.escalationIdFactory(), jobId,
+      reason: 'human_judgment_required', summary: required(reason, 'Preflight hold reason'), createdAt: timestamp }, run.revision);
+    return this.requireOperatorRun(jobId);
+  }
+  async attachWebRunner(enabled: boolean, pauseKind?: 'maintenance' | 'administrative') { await this.runnerControl.attach(enabled, pauseKind); }
+  async tickWebRunner() { if (await this.runnerControl.tick()) this.startRunner(); }
+  async closeWebRunner() { await this.runnerControl.close(); }
+  async setRunnerPaused(paused: boolean, reason: string) { await this.runnerControl.setPaused(paused, reason); }
 
   async getRuntimeStatus(): Promise<OperatorRuntimeStatus> {
     if (!this.runtime) {
@@ -267,6 +294,7 @@ export class OperatorApplicationService implements OperatorApplication {
   }
 
   async runOperatorJob(input: OperatorTaskInput): Promise<OperatorRunSession> {
+    for (const retirement of await this.store.listJobRetirements()) await this.store.retireJob(retirement);
     const active = (await this.store.listOperatorRuns())
       .find(run => run.status === 'pending' || run.status === 'running');
     if (this.runReserved || active) {
@@ -697,6 +725,12 @@ export class OperatorApplicationService implements OperatorApplication {
     );
     const currentRole = activeAttempt?.executionRole ?? null;
     const retirement = await this.store.getJobRetirement(job.id);
+    let providerSubmissionCount = 0;
+    for (const attempt of attempts) {
+      const plan = await this.store.getExecutionPlanForAttempt(attempt.id);
+      const dispatch = plan ? await this.store.getExecutionDispatchForPlan(plan.id) : null;
+      if (dispatch?.submittedAt) providerSubmissionCount += 1;
+    }
     const currentStage = retirement
       ? 'Archived' as const
       : await this.deriveStage(job, attempts, reviews, unresolved, operatorRun);
@@ -719,6 +753,8 @@ export class OperatorApplicationService implements OperatorApplication {
       operatorRun,
       currentStage,
       retirement,
+      runnerStatus: await this.getRunnerStatus(),
+      providerSubmissionCount,
       ...(startedAt ? { startedAt } : {}),
       ...(finishedAt ? { finishedAt } : {}),
       ...(startedAt ? { durationMs: Math.max(0, new Date(finishedAt ?? this.now()).getTime() - new Date(startedAt).getTime()) } : {}),
@@ -759,7 +795,10 @@ export class OperatorApplicationService implements OperatorApplication {
     if (job.status === 'completed' || run?.status === 'completed') return 'Completed';
     if (job.status === 'cancelled' || run?.status === 'cancelled') return 'Cancelled';
     if (run?.status === 'failed') return 'Failed';
-    if (run?.status === 'pending') return 'Accepted';
+    if (run?.status === 'pending') {
+      const runner = await this.getRunnerStatus();
+      return runner.state === 'paused' ? 'Execution paused' : runner.state === 'stopped' ? 'Waiting for runner' : 'Queued';
+    }
     const active = [...attempts].reverse().find(attempt => isActiveAttemptStatus(attempt.status));
     if (active) {
       const workerBudget = await readWorkerExecutionBudget(
@@ -774,6 +813,8 @@ export class OperatorApplicationService implements OperatorApplication {
           : workerBudget.consumed > 0 ? 'Preparing Revision' : 'Preparing Worker';
       }
       const dispatch = await this.store.getExecutionDispatchForPlan(plan.id);
+      if (dispatch?.status === 'submitting') return 'Dispatching';
+      if (dispatch?.status === 'uncertain' || dispatch?.status === 'rejected') return 'Needs Me';
       if (!dispatch || dispatch.status === 'prepared') {
         return active.executionRole === 'reviewer'
           ? 'Preparing Reviewer'
@@ -781,6 +822,7 @@ export class OperatorApplicationService implements OperatorApplication {
       }
       if (dispatch.status === 'accepted') {
         const observations = await this.store.listExecutionObservationsForDispatch(dispatch.id);
+        if (!observations.length) return 'Provider Accepted';
         const providerRunning = observations.some(observation => observation.kind === 'runtime-running')
           && !observations.some(isExactCompletionObservation);
         if (active.executionRole === 'reviewer') {
@@ -796,7 +838,7 @@ export class OperatorApplicationService implements OperatorApplication {
       : undefined;
     if (latestReview?.decision === 'REVISION_REQUIRED') return 'Preparing Revision';
     if (latestWorker?.status === 'completed' && !latestReview) return 'Preparing Reviewer';
-    return run ? 'Accepted' : job.status === 'draft' ? 'Accepted' : 'Preparing Worker';
+    return run?.status === 'running' ? 'Preparing Worker' : 'Queued';
   }
 
   private async actionsForEscalation(
@@ -894,6 +936,7 @@ export class OperatorApplicationService implements OperatorApplication {
 
   private async reconcileMachineResolvableRuns(): Promise<void> {
     for (const run of await this.store.listOperatorRuns()) {
+      if (await this.store.getJobRetirement(run.jobId)) continue;
       if (run.status !== 'needs_human') continue;
       const trust = await this.trustProfiles.effectiveForJob(run.jobId);
       const job = await this.store.getJob(run.jobId);

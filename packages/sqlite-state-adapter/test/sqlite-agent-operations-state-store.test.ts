@@ -96,6 +96,7 @@ describe('SQLite Agent Operations state store', () => {
       { version: 17, name: 'authenticated-preview-session-metadata' },
       { version: 18, name: 'job-retirement-and-selective-restore' },
       { version: 19, name: 'red-action-receipts-and-deterministic-verification' },
+      { version: 20, name: 'operator-runner-control' },
     ]);
     database.close();
 
@@ -166,6 +167,7 @@ describe('SQLite Agent Operations state store', () => {
       id: 'job:historical', projectId: 'ao', repositoryId: REPOSITORY_ID,
       title: 'Historical proof', status: 'draft', revision: 0, createdAt: TIME, updatedAt: TIME,
     });
+    await store.createOperatorRun({ id: 'operator-run:historical', jobId: 'job:historical', status: 'pending', revision: 0, createdAt: TIME, updatedAt: TIME });
     await store.retireJob({
       jobId: 'job:historical', disposition: 'retired', reason: 'Proof complete',
       actor: 'operator', evidenceReference: 'evidence:one', retiredAt: TIME,
@@ -192,6 +194,11 @@ describe('SQLite Agent Operations state store', () => {
     await store.close();
 
     const reopened = open(databasePath);
+    const closedRun = await reopened.getOperatorRunForJob('job:historical');
+    expect(closedRun).toMatchObject({ status: 'cancelled', revision: 1 });
+    expect((await reopened.getJob('job:historical'))?.status).toBe('cancelled');
+    await reopened.retireJob((await reopened.getJobRetirement('job:historical'))!);
+    expect(await reopened.getOperatorRunForJob('job:historical')).toEqual(closedRun);
     expect(await reopened.getJobRetirement('job:historical')).toEqual({
       jobId: 'job:historical', disposition: 'retired', reason: 'Proof complete',
       actor: 'operator', evidenceReference: 'evidence:one', retiredAt: TIME,
@@ -200,6 +207,33 @@ describe('SQLite Agent Operations state store', () => {
       state: 'pending-approval', preconditions: { branch: 'main', restorePaths: [{ path: 'main.py' }] },
     });
     await reopened.close();
+  });
+
+  it('persists administrative runner pause across reopen with optimistic ownership', async () => {
+    const path = temporaryPath('runner.db');
+    const store = open(path);
+    const state = { ownerId: 'runner:one', state: 'paused' as const, pauseKind: 'administrative' as const, reason: 'Human pause', updatedAt: TIME, revision: 0 };
+    await store.saveOperatorRunnerState(state, null);
+    await store.close();
+    const reopened = open(path);
+    expect(await reopened.getOperatorRunnerState()).toEqual(state);
+    await expect(reopened.saveOperatorRunnerState(state, null)).rejects.toThrow('conflict');
+    await reopened.close();
+  });
+
+  it('atomically holds an unexecuted Job and rejects a stale repeated hold', async () => {
+    const store = open(temporaryPath('hold.db'));
+    await store.applyProjectConfiguration(configuration());
+    await store.createJob({ id: 'job:hold', projectId: 'ao', title: 'External operation', status: 'draft', revision: 0, createdAt: TIME, updatedAt: TIME });
+    await store.saveJobTransition({ ...(await store.getJob('job:hold'))!, status: 'ready', revision: 1 }, 0);
+    await store.createOperatorRun({ id: 'operator-run:hold', jobId: 'job:hold', status: 'pending', revision: 0, createdAt: TIME, updatedAt: TIME });
+    const escalation = { id: 'escalation:hold', jobId: 'job:hold', reason: 'human_judgment_required' as const, summary: 'External capability missing', createdAt: TIME };
+    await store.holdUnexecutedOperatorRun(escalation, 0);
+    await expect(store.holdUnexecutedOperatorRun({ ...escalation, id: 'escalation:duplicate' }, 0)).rejects.toThrow('preconditions');
+    expect((await store.getOperatorRunForJob('job:hold'))?.status).toBe('needs_human');
+    expect(await store.listEscalations('job:hold')).toHaveLength(1);
+    expect(await store.listAttemptsForJob('job:hold')).toEqual([]);
+    await store.close();
   });
 
   it('persists Preview Profiles, exact sessions, requirements, and bounded Browser Evidence', async () => {
@@ -403,7 +437,7 @@ describe('SQLite Agent Operations state store', () => {
       installationIdFactory: () => INSTALLATION_ID,
       now: () => new Date(TIME),
       additionalMigrations: [{
-        version: 20,
+        version: 21,
         name: 'deliberate-test-failure',
         up: database => {
           database.exec('CREATE TABLE should_rollback (id TEXT)');
@@ -417,7 +451,7 @@ describe('SQLite Agent Operations state store', () => {
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'should_rollback'",
     ).get()).toBeUndefined();
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }]);
+      .toEqual([{ version: 1 }, { version: 2 }, { version: 3 }, { version: 4 }, { version: 5 }, { version: 6 }, { version: 7 }, { version: 8 }, { version: 9 }, { version: 10 }, { version: 11 }, { version: 12 }, { version: 13 }, { version: 14 }, { version: 15 }, { version: 16 }, { version: 17 }, { version: 18 }, { version: 19 }, { version: 20 }]);
     database.close();
 
     const corruptPath = temporaryPath('corrupt.db');

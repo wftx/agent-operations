@@ -57,7 +57,7 @@ export class OperatorWebApplication {
           await this.application.listProjects(),
           await this.application.listJobs('all'),
           await this.application.getRuntimeStatus(),
-          { telegramConfigured: this.options.telegramConfigured ?? false },
+          { telegramConfigured: this.options.telegramConfigured ?? false, runnerStatus: await this.application.getRunnerStatus?.() },
           this.metrics ? await this.metrics.read() : undefined,
           this.runtimeFreshness ? await this.runtimeFreshness.inspect() : undefined,
         ));
@@ -89,6 +89,14 @@ export class OperatorWebApplication {
           preset,
         });
         return redirect('/trust');
+      }
+      if (request.method === 'POST' && url.pathname === '/runner') {
+        if (!this.application.setRunnerPaused) throw new Error('Runner control is unavailable');
+        const form = await request.formData();
+        const action = textValue(form, 'action');
+        if (action !== 'pause' && action !== 'resume') throw new Error('Invalid runner action');
+        await this.application.setRunnerPaused(action === 'pause', 'Explicit human administrative pause from AO Web.');
+        return redirect('/');
       }
       if (request.method === 'GET' && url.pathname === '/orchestrator') {
         return this.orchestratorPage();

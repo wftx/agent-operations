@@ -25,7 +25,7 @@ export const DAILY_DRIVER_TRUST_SCHEMA_VERSION = 16;
 export const AUTHENTICATED_PREVIEW_SCHEMA_VERSION = 17;
 export const JOB_RETIREMENT_AND_RESTORE_SCHEMA_VERSION = 18;
 export const RED_ACTION_RECEIPT_AND_DETERMINISTIC_VERIFICATION_SCHEMA_VERSION = 19;
-export const CURRENT_SCHEMA_VERSION = RED_ACTION_RECEIPT_AND_DETERMINISTIC_VERIFICATION_SCHEMA_VERSION;
+export const CURRENT_SCHEMA_VERSION = 20;
 
 const INITIAL_SCHEMA_SQL = `
   CREATE TABLE installations (
@@ -893,6 +893,13 @@ const RED_ACTION_RECEIPT_AND_DETERMINISTIC_VERIFICATION_SCHEMA_SQL = `
 `;
 
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
+  {
+    version: 20,
+    name: 'operator-runner-control',
+    up(database) {
+      database.exec('CREATE TABLE operator_runner_control (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), revision INTEGER NOT NULL, state_json TEXT NOT NULL)');
+    },
+  },
   {
     version: INITIAL_SCHEMA_VERSION,
     name: 'initial-agent-operations-state',

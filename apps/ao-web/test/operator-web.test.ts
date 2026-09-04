@@ -171,6 +171,26 @@ class StubOperatorApplication implements OperatorApplication {
 }
 
 describe('OperatorWebApplication', () => {
+  it('shows paused execution and changes runner control only on explicit POST', async () => {
+    const service = new StubOperatorApplication();
+    const changes: boolean[] = [];
+    const app = new OperatorWebApplication(Object.assign(service, {
+      getRunnerStatus: async () => ({ state: 'paused' as const, pauseKind: 'administrative' as const, reason: 'Human pause remains active.' }),
+      setRunnerPaused: async (paused: boolean) => { changes.push(paused); },
+    }));
+    for (let i = 0; i < 2; i++) {
+      const page = await app.handle(new Request('http://localhost/'));
+      const body = await page.text();
+      expect(body).toContain('Paused');
+      expect(body).toContain('Resume Execution');
+      expect(body).toContain('Resuming may execute queued Jobs');
+    }
+    expect(changes).toEqual([]);
+    const response = await app.handle(new Request('http://localhost/runner', { method: 'POST', body: new URLSearchParams({ action: 'resume' }) }));
+    expect(response.status).toBe(303);
+    expect(changes).toEqual([false]);
+    expect(service.runCalls).toBe(0);
+  });
   it('renders exact Red approvals and binds execution to the selected action', async () => {
     const service = new StubOperatorApplication();
     const app = new OperatorWebApplication(service);
@@ -634,7 +654,7 @@ function summary(
     },
     currentStage: status === 'completed' ? 'Completed' : needsHuman ? 'Needs Me'
       : state.includes('Reviewer') ? 'Executing Reviewer'
-      : state.includes('Worker') ? 'Executing Worker' : 'Accepted',
+      : state.includes('Worker') ? 'Executing Worker' : 'Queued',
     ...(state.includes('running') || status === 'completed' ? { startedAt: TIME } : {}),
     ...(status === 'completed' ? { finishedAt: TIME, durationMs: 60_000 } : {}),
   };

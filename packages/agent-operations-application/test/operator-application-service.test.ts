@@ -209,6 +209,53 @@ class LateReviewerRevisionOrchestration implements OperatorOrchestrationPort {
 }
 
 describe('OperatorApplicationService', () => {
+  it('holds an unsupported unexecuted operation without a provider and keeps the existing Job', async () => {
+    const store = await configuredStore();
+    const orchestration = new FakeOrchestration(store);
+    const app = new OperatorApplicationService(store, orchestration, { deferRunnerWake: true });
+    const run = await app.runOperatorJob(INPUT);
+    const held = await app.holdUnexecutedJob(run.jobId, 'Required external action capability is unavailable. Authorization remains recorded.');
+    expect(held.status).toBe('needs_human');
+    expect(await app.holdUnexecutedJob(run.jobId, 'Duplicate hold')).toEqual(held);
+    await app.waitForRun(run.jobId);
+    expect(orchestration.runCalls).toBe(0);
+    expect(await store.listAttemptsForJob(run.jobId)).toEqual([]);
+    expect(await store.listEscalations(run.jobId, true)).toHaveLength(1);
+    expect(await store.listJobs()).toHaveLength(1);
+  });
+  it('retires a queued Job without execution, releases the slot, and never resurrects it', async () => {
+    const store = await configuredStore();
+    const orchestration = new FakeOrchestration(store);
+    const app = new OperatorApplicationService(store, orchestration, { deferRunnerWake: true });
+    const run = await app.runOperatorJob(INPUT);
+    const retirement = { jobId: run.jobId, disposition: 'retired' as const, reason: 'Obsolete queued Job', actor: 'human', retiredAt: TIME };
+    await store.retireJob(retirement);
+    const closed = await store.getOperatorRunForJob(run.jobId);
+    expect(closed?.status).toBe('cancelled');
+    await store.retireJob(retirement);
+    expect(await store.getOperatorRunForJob(run.jobId)).toEqual(closed);
+    await app.waitForRun(run.jobId);
+    expect(orchestration.runCalls).toBe(0);
+    expect(await store.listAttemptsForJob(run.jobId)).toEqual([]);
+    expect((await app.getJobDetail(run.jobId)).summary.orchestrationState).toBe('Archived');
+    await expect(app.runOperatorJob(INPUT)).resolves.toMatchObject({ status: 'pending' });
+  });
+
+  it('keeps queued work paused without Dispatch and distinguishes a paused runner from queue acceptance', async () => {
+    const store = await configuredStore();
+    const orchestration = new FakeOrchestration(store);
+    const app = new OperatorApplicationService(store, orchestration, { requireRunnerControl: true, deferRunnerWake: true });
+    await app.attachWebRunner(false, 'administrative');
+    const run = await app.runOperatorJob(INPUT);
+    await app.waitForRun(run.jobId);
+    expect(orchestration.runCalls).toBe(0);
+    expect((await app.getJobDetail(run.jobId)).summary).toMatchObject({ orchestrationState: 'Execution paused', providerSubmissionCount: 0 });
+    await app.setRunnerPaused(false, 'Human resume');
+    expect((await app.getJobDetail(run.jobId)).summary.orchestrationState).toBe('Queued');
+    await app.waitForRun(run.jobId);
+    expect(orchestration.runCalls).toBe(1);
+    await app.closeWebRunner();
+  });
   it('validates task intake and exposes immutable read-only defaults without mutation', async () => {
     const store = await configuredStore();
     const orchestration = new FakeOrchestration(store);
@@ -449,7 +496,7 @@ describe('OperatorApplicationService', () => {
     await lifecycle.startAttempt(workerAttempt.id);
     const application = new OperatorApplicationService(store, orchestration);
 
-    expect((await application.listJobs()).find(item => item.job.id === draft.id)?.orchestrationState).toBe('Accepted');
+    expect((await application.listJobs()).find(item => item.job.id === draft.id)?.orchestrationState).toBe('Queued');
     const running = await application.listJobs('running');
     expect(running.find(item => item.job.id === ready.id)).toMatchObject({
       job: { id: ready.id },

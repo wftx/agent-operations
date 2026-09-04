@@ -1,5 +1,16 @@
 import { createHash, randomUUID } from 'node:crypto';
 
+/** Installation-local runner lease. Administrative pauses never expire automatically. */
+export interface DurableOperatorRunnerState {
+  readonly ownerId: string;
+  readonly state: 'running' | 'paused' | 'stopped';
+  readonly pauseKind?: 'maintenance' | 'administrative';
+  readonly reason?: string;
+  readonly resumeAt?: string;
+  readonly updatedAt: string;
+  readonly revision: number;
+}
+
 export const JOB_RETIREMENT_DISPOSITIONS = ['retired', 'externally-published'] as const;
 export type JobRetirementDisposition = (typeof JOB_RETIREMENT_DISPOSITIONS)[number];
 

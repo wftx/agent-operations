@@ -15,6 +15,7 @@ import type { OrchestrationReadModel } from '../../agent-operations-core/src/ind
 import type { OperatorNotifier } from './notification.js';
 import type { RuntimeFreshnessApplication } from './types.js';
 import { NoopOperatorNotifier } from './notification.js';
+import { readRunnerStatus } from './operator-runner-control.js';
 
 export interface OperatorRunnerOrchestrationPort {
   runJob(jobId: string): Promise<OrchestrationReadModel>;
@@ -26,6 +27,7 @@ export interface OperatorRunnerOptions {
   readonly notificationDeliveryIdFactory?: () => string;
   readonly escalationIdFactory?: () => string;
   readonly runtimeFreshness?: RuntimeFreshnessApplication;
+  readonly requireRunnerControl?: boolean;
 }
 
 /** One-process durable runner for explicitly accepted Operator Runs only. */
@@ -35,6 +37,7 @@ export class OperatorRunner {
   private readonly notificationDeliveryIdFactory: () => string;
   private readonly escalationIdFactory: () => string;
   private readonly runtimeFreshness?: RuntimeFreshnessApplication;
+  private readonly requireRunnerControl: boolean;
   private drainPromise: Promise<void> | null = null;
   private wakeRequested = false;
   private deferredWake: ReturnType<typeof setTimeout> | null = null;
@@ -50,6 +53,7 @@ export class OperatorRunner {
       ?? (() => createOperatorNotificationDeliveryId());
     this.escalationIdFactory = options.escalationIdFactory ?? (() => createEscalationId());
     this.runtimeFreshness = options.runtimeFreshness;
+    this.requireRunnerControl = options.requireRunnerControl ?? false;
   }
 
   start(): void {
@@ -73,6 +77,7 @@ export class OperatorRunner {
 
   private async drain(): Promise<void> {
     for (;;) {
+      if (this.requireRunnerControl && (await readRunnerStatus(this.store, this.now())).state !== 'running') break;
       const runs = await this.store.listOperatorRuns();
       const next = runs.find(run => run.status === 'pending' || run.status === 'running');
       if (!next) break;
@@ -89,6 +94,11 @@ export class OperatorRunner {
   }
 
   private async process(run: DurableOperatorRun): Promise<'processed' | 'deferred'> {
+    const retirement = await this.store.getJobRetirement(run.jobId);
+    if (retirement) {
+      await this.store.retireJob(retirement);
+      return 'processed';
+    }
     let running = run;
     if (this.runtimeFreshness) {
       try {
@@ -109,6 +119,8 @@ export class OperatorRunner {
         );
         if (capacity.state !== 'ready') throw new Error(capacity.message);
       } catch (error) {
+        const retired = await this.store.getJobRetirement(running.jobId);
+        if (retired) { await this.store.retireJob(retired); return 'processed'; }
         if (running.status === 'pending') {
           const timestamp = this.now().toISOString();
           const started = transitionRun(running, 'running', timestamp, { startedAt: timestamp });
@@ -119,6 +131,9 @@ export class OperatorRunner {
         return 'processed';
       }
     }
+    const retirementAfterReadiness = await this.store.getJobRetirement(run.jobId);
+    if (retirementAfterReadiness) { await this.store.retireJob(retirementAfterReadiness); return 'processed'; }
+    if (this.requireRunnerControl && (await readRunnerStatus(this.store, this.now())).state !== 'running') return 'deferred';
     if (running.status === 'pending') {
       const timestamp = this.now().toISOString();
       running = transitionRun(running, 'running', timestamp, {
@@ -129,6 +144,9 @@ export class OperatorRunner {
       await this.store.saveOperatorRunTransition(running, run.revision);
     }
     try {
+      // Retirement can race with asynchronous runtime readiness. Recheck before work.
+      const retired = await this.store.getJobRetirement(running.jobId);
+      if (retired) { await this.store.retireJob(retired); return 'processed'; }
       const result = await this.orchestration.runJob(running.jobId);
       const timestamp = this.now().toISOString();
       const terminalStatus = result.needsHuman || result.finalDecision === 'ESCALATED'
@@ -154,6 +172,8 @@ export class OperatorRunner {
   }
 
   private async failRun(running: DurableOperatorRun, error: unknown): Promise<void> {
+    const retirement = await this.store.getJobRetirement(running.jobId);
+    if (retirement) { await this.store.retireJob(retirement); return; }
     const failure = errorMessage(error);
     let hasEscalation = (await this.store.listEscalations(running.jobId, true)).length > 0;
     if (!hasEscalation) {

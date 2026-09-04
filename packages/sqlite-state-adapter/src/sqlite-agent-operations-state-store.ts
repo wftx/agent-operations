@@ -69,6 +69,7 @@ import type {
   TrustProfilePreset,
   TrustProfileScope,
   DurableJobRetirement,
+  DurableOperatorRunnerState,
   JobRetirementDisposition,
   DurableRepositoryRestoreAction,
   RepositoryRestoreExecutionReceipt,
@@ -1154,6 +1155,35 @@ function validateBrowserRequirement(requirement: BrowserEvidenceRequirement): vo
 }
 
 export class SqliteAgentOperationsStateStore implements AgentOperationsStateStore {
+  async holdUnexecutedOperatorRun(escalation: DurableEscalation, expectedRevision: number): Promise<void> {
+    this.assertOpen();
+    this.database.transaction(() => {
+      const run = this.database.prepare('SELECT revision,status FROM operator_runs WHERE job_id = ?').get(escalation.jobId) as { revision: number; status: string } | undefined;
+      if (run?.status !== 'pending' || run.revision !== expectedRevision
+        || this.database.prepare('SELECT 1 FROM job_attempts WHERE job_id = ?').get(escalation.jobId)
+        || this.database.prepare('SELECT 1 FROM job_retirements WHERE job_id = ?').get(escalation.jobId)) throw new Error('Queued preflight hold preconditions changed');
+      this.database.prepare('INSERT INTO escalations (id,job_id,reason,summary,created_at) VALUES (?,?,?,?,?)')
+        .run(escalation.id, escalation.jobId, escalation.reason, escalation.summary, escalation.createdAt);
+      this.database.prepare(`UPDATE operator_runs SET status = 'needs_human', revision = revision + 1,
+        started_at = ?, finished_at = ?, updated_at = ?, failure_message = ? WHERE job_id = ? AND revision = ?`)
+        .run(escalation.createdAt, escalation.createdAt, escalation.createdAt, escalation.summary, escalation.jobId, expectedRevision);
+    })();
+  }
+  async getOperatorRunnerState(): Promise<DurableOperatorRunnerState | null> {
+    this.assertOpen();
+    if (!this.database.prepare("SELECT 1 FROM sqlite_master WHERE name = 'operator_runner_control'").get()) return null;
+    const row = this.database.prepare('SELECT state_json FROM operator_runner_control WHERE singleton = 1').get() as { state_json: string } | undefined;
+    return row ? JSON.parse(row.state_json) : null;
+  }
+
+  async saveOperatorRunnerState(state: DurableOperatorRunnerState, expectedRevision: number | null): Promise<void> {
+    this.assertOpen();
+    if (state.revision !== (expectedRevision ?? -1) + 1) throw new Error('Invalid runner control revision');
+    const result = expectedRevision === null
+      ? this.database.prepare('INSERT OR IGNORE INTO operator_runner_control VALUES (1, ?, ?)').run(state.revision, JSON.stringify(state))
+      : this.database.prepare('UPDATE operator_runner_control SET revision = ?, state_json = ? WHERE singleton = 1 AND revision = ?').run(state.revision, JSON.stringify(state), expectedRevision);
+    if (result.changes !== 1) throw new Error('Runner control ownership conflict');
+  }
   readonly databasePath: string;
   private readonly database: Database.Database;
   private closed = false;
@@ -2064,18 +2094,35 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
         if (JSON.stringify(toJobRetirement(existing)) !== JSON.stringify(retirement)) {
           throw new Error(`Job ${retirement.jobId} already has another retirement disposition`);
         }
-        return;
       }
+      const unsafe = this.database.prepare(`
+        SELECT a.id FROM job_attempts a
+        LEFT JOIN execution_plans p ON p.attempt_id = a.id
+        LEFT JOIN execution_dispatches d ON d.execution_plan_id = p.id
+        WHERE a.job_id = ? AND (d.status IN ('submitting', 'uncertain')
+          OR (a.status IN ('created', 'running') AND (d.id IS NULL OR d.status IN ('prepared', 'accepted')))) LIMIT 1
+      `).get(retirement.jobId);
+      if (unsafe) throw new Error('Job cannot retire while an execution may still be active');
       const job = this.database.prepare('SELECT id FROM jobs WHERE id = ?')
         .get(retirement.jobId) as { id: string } | undefined;
       if (!job) throw new Error(`Job not found: ${retirement.jobId}`);
       this.database.prepare(`
-        INSERT INTO job_retirements
+        INSERT OR IGNORE INTO job_retirements
           (job_id, disposition, reason, actor, evidence_reference, retired_at)
         VALUES (?, ?, ?, ?, ?, ?)
       `).run(
         retirement.jobId, retirement.disposition, retirement.reason, retirement.actor,
         retirement.evidenceReference ?? null, retirement.retiredAt,
+      );
+      this.database.prepare(`UPDATE jobs SET status = 'cancelled', revision = revision + 1, updated_at = ?
+        WHERE id = ? AND status IN ('draft', 'ready')`).run(retirement.retiredAt, retirement.jobId);
+      // Pending runs never executed. Equal lifecycle timestamps satisfy the legacy
+      // terminal schema without fabricating an Attempt or provider start.
+      this.database.prepare(`UPDATE operator_runs SET status = 'cancelled', revision = revision + 1,
+        updated_at = ?, started_at = COALESCE(started_at, ?), finished_at = ?, failure_message = ?
+        WHERE job_id = ? AND status IN ('pending', 'running', 'needs_human')`).run(
+        retirement.retiredAt, retirement.retiredAt, retirement.retiredAt,
+        'Retired by operator. Orchestration closed; no new provider execution.', retirement.jobId,
       );
       if (this.supportsLateExecutionReconciliation) {
         this.database.prepare(`

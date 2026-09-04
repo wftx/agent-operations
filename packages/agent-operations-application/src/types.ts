@@ -181,10 +181,16 @@ export interface OperatorJobSummary {
   readonly finishedAt?: string;
   readonly durationMs?: number;
   readonly retirement?: DurableJobRetirement | null;
+  readonly runnerStatus?: import('./operator-runner-control.js').OperatorRunnerStatus;
+  readonly providerSubmissionCount?: number;
 }
 
 export type OperatorExecutionStage =
-  | 'Accepted'
+  | 'Queued'
+  | 'Waiting for runner'
+  | 'Execution paused'
+  | 'Dispatching'
+  | 'Provider Accepted'
   | 'Preparing Worker'
   | 'Executing Worker'
   | 'Capturing Worker Result'
@@ -333,6 +339,9 @@ export interface PreviewApplication {
 export type OperatorJobList = 'all' | 'running' | 'needs-human' | 'done' | 'retired';
 
 export interface OperatorApplication {
+  getRunnerStatus?(): Promise<import('./operator-runner-control.js').OperatorRunnerStatus>;
+  setRunnerPaused?(paused: boolean, reason: string): Promise<void>;
+  holdUnexecutedJob?(jobId: string, reason: string): Promise<DurableOperatorRun>;
   startRunner(): void;
   listProjects(): Promise<readonly OperatorProjectOption[]>;
   getRuntimeStatus(): Promise<OperatorRuntimeStatus>;

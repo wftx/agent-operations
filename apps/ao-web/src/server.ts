@@ -21,6 +21,7 @@ export interface OperatorWebServerDependencies {
   readonly trustProfiles?: TrustProfileApplication;
   readonly metrics?: DailyDriverMetricsApplication;
   readonly runtimeFreshness?: RuntimeFreshnessApplication;
+  startWebRunner?(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -40,6 +41,11 @@ export function startOperatorWebServer(dependencies: OperatorWebServerDependenci
   );
   const server = createOperatorHttpServer(app, { host, port });
   server.listen(port, host, () => {
+    void dependencies.startWebRunner?.().catch(error => {
+      console.error('AO Web runner startup failed:', error instanceof Error ? error.message : String(error));
+      server.close();
+      void dependencies.close();
+    });
     console.log(`Agent Operations is available at http://${host}:${port}`);
     console.log('Local only mission control. Viewing and refreshing never Dispatch work.');
   });

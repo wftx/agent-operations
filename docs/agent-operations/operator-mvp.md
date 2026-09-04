@@ -1,5 +1,18 @@
 # Agent Operations Daily Operator Workflow
 
+## Runner status and retirement
+
+The background runner is displayed separately from the provider runtime. Queued
+means AO saved the Job, not that a provider or external action executed. A missing
+runner heartbeat shows Waiting for runner. Maintenance pauses are visible and
+expire after one minute under Daily Driver. Administrative pauses require the
+operator to select Resume Execution and persist across restart. Resuming can run
+already queued Jobs; it never authorizes a broader capability.
+
+Retire Job preserves history and atomically releases pending orchestration ownership.
+It cannot retire work while provider execution might still be active. No unexecuted
+Job is marked successfully completed merely to clear a slot.
+
 The Operator MVP is a separate local mission-control surface for durable Agent
 Operations Jobs. The existing CortextOS dashboard remains the runtime
 diagnostics surface.

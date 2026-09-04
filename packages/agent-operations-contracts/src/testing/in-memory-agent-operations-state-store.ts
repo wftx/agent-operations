@@ -42,6 +42,7 @@ import type {
 import type { DurableTrustProfile } from '../trust.js';
 import { validateTrustProfile } from '../trust.js';
 import type {
+  DurableOperatorRunnerState,
   DurableDeterministicRepositoryVerification,
   DurableJobRetirement,
   DurableRepositoryRestoreAction,
@@ -324,6 +325,23 @@ function rejectDuplicates(values: readonly string[], field: string): void {
 
 /** Deterministic, defensively-copying state store for AO domain tests. */
 export class InMemoryAgentOperationsStateStore implements AgentOperationsStateStore {
+  async holdUnexecutedOperatorRun(escalation: DurableEscalation, expectedRevision: number): Promise<void> {
+    const run = [...this.operatorRuns.values()].find(item => item.jobId === escalation.jobId);
+    if (!run || run.status !== 'pending' || run.revision !== expectedRevision
+      || [...this.attempts.values()].some(item => item.jobId === escalation.jobId)
+      || this.jobRetirements.has(escalation.jobId) || this.escalations.has(escalation.id)) throw new Error('Queued preflight hold preconditions changed');
+    this.escalations.set(escalation.id, { ...escalation });
+    this.operatorRuns.set(run.id, { ...run, status: 'needs_human', revision: run.revision + 1,
+      startedAt: escalation.createdAt, finishedAt: escalation.createdAt, updatedAt: escalation.createdAt, failureMessage: escalation.summary });
+  }
+  private runnerState: DurableOperatorRunnerState | null = null;
+  async getOperatorRunnerState(): Promise<DurableOperatorRunnerState | null> {
+    return this.runnerState ? { ...this.runnerState } : null;
+  }
+  async saveOperatorRunnerState(state: DurableOperatorRunnerState, expectedRevision: number | null): Promise<void> {
+    if ((this.runnerState?.revision ?? null) !== expectedRevision || state.revision !== (expectedRevision ?? -1) + 1) throw new Error('Runner control ownership conflict');
+    this.runnerState = { ...state };
+  }
   private readonly installation: AgentOperationsInstallation;
   private readonly failOperations: ReadonlySet<InMemoryStateStoreOperation>;
   private readonly projects = new Map<string, DurableProject>();
@@ -866,9 +884,25 @@ export class InMemoryAgentOperationsStateStore implements AgentOperationsStateSt
       if (JSON.stringify(existing) !== JSON.stringify(retirement)) {
         throw new Error(`Job ${retirement.jobId} already has another retirement disposition`);
       }
-      return;
+    }
+    for (const attempt of await this.listAttemptsForJob(retirement.jobId)) {
+      const plan = await this.getExecutionPlanForAttempt(attempt.id);
+      const dispatch = plan ? await this.getExecutionDispatchForPlan(plan.id) : null;
+      if (dispatch?.status === 'submitting' || dispatch?.status === 'uncertain'
+        || (isActiveAttemptStatus(attempt.status) && (!dispatch || ['prepared', 'accepted'].includes(dispatch.status)))) {
+        throw new Error('Job cannot retire while an execution may still be active');
+      }
     }
     this.jobRetirements.set(retirement.jobId, copyJobRetirement(retirement));
+    const job = this.jobs.get(retirement.jobId)!;
+    if (job.status === 'draft' || job.status === 'ready') this.jobs.set(job.id, { ...job, status: 'cancelled', revision: job.revision + 1, updatedAt: retirement.retiredAt });
+    for (const [id, run] of this.operatorRuns) {
+      if (run.jobId === job.id && ['pending', 'running', 'needs_human'].includes(run.status)) {
+        this.operatorRuns.set(id, { ...run, status: 'cancelled', revision: run.revision + 1,
+          startedAt: run.startedAt ?? retirement.retiredAt, finishedAt: retirement.retiredAt,
+          updatedAt: retirement.retiredAt, failureMessage: 'Retired by operator. Orchestration closed; no new provider execution.' });
+      }
+    }
     for (const [id, escalation] of this.escalations) {
       if (escalation.jobId === retirement.jobId && !escalation.resolvedAt) {
         this.escalations.set(id, {

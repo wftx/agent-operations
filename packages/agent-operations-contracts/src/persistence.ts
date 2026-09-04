@@ -37,6 +37,7 @@ import type {
 } from './preview.js';
 import type { DurableTrustProfile } from './trust.js';
 import type {
+  DurableOperatorRunnerState,
   DurableDeterministicRepositoryVerification,
   DurableJobRetirement,
   DurableRepositoryRestoreAction,
@@ -115,6 +116,9 @@ export interface DurableRuntimeObservation {
 
 /** AO-owned durable-state boundary. It deliberately exposes no SQL concepts. */
 export interface AgentOperationsStateStore {
+  holdUnexecutedOperatorRun(escalation: DurableEscalation, expectedRevision: number): Promise<void>;
+  getOperatorRunnerState(): Promise<DurableOperatorRunnerState | null>;
+  saveOperatorRunnerState(state: DurableOperatorRunnerState, expectedRevision: number | null): Promise<void>;
   getInstallation(): Promise<AgentOperationsInstallation>;
   applyProjectConfiguration(configuration: DurableProjectConfiguration): Promise<void>;
   getProject(id: string): Promise<DurableProject | null>;
