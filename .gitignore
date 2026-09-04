@@ -116,3 +116,4 @@ docs/phase-reports/
 leakage-fixture.json
 **/leakage-fixture.json
 *.leakage-fixture.json
+connector-secrets/

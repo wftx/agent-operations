@@ -894,6 +894,12 @@ const RED_ACTION_RECEIPT_AND_DETERMINISTIC_VERIFICATION_SCHEMA_SQL = `
 
 export const DEFAULT_STATE_MIGRATIONS: readonly SqliteStateMigration[] = [
   {
+    version: 22,
+    name: 'node-local-connector-metadata',
+    up: database => database.exec(`CREATE TABLE connector_bindings (id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL);
+      CREATE TABLE connector_action_links (binding_id TEXT PRIMARY KEY, connector_id TEXT NOT NULL REFERENCES connector_bindings(id), organization_id TEXT NOT NULL, data_center TEXT NOT NULL);`),
+  },
+  {
     version: 21,
     name: 'bounded-external-actions',
     up: database => database.exec(`

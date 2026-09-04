@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { createConnectorComposition } from './connector-composition.js';
+import type { ConnectorApplication } from '../../agent-operations-application/src/connector-application.js';
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -73,6 +75,7 @@ export interface AgentOperationsCompositionOptions {
 }
 
 export interface AgentOperationsComposition {
+  readonly connectors: ConnectorApplication;
   readonly externalActions: ExternalActionService;
   readonly operator: OperatorApplication;
   readonly conversation: OrchestratorConversationService;
@@ -177,11 +180,13 @@ export function createAgentOperationsComposition(
     new CortextOSOrchestratorConversationAdapter(),
     store,
   );
-  const externalActions = new ExternalActionService(store, options.externalActionExecutors);
-  const tools = new OrchestratorToolApplicationService(operator, inputs, preview, externalActions);
+  const {connectors,executor}=createConnectorComposition(store,stateLocation.stateDirectory);
+  const externalActions = new ExternalActionService(store, options.externalActionExecutors ?? [executor]);
+  const tools = new OrchestratorToolApplicationService(operator, inputs, preview, externalActions, connectors);
   let runnerTimer: ReturnType<typeof setInterval> | null = null;
   let tickPromise: Promise<void> | null = null;
   return {
+    connectors,
     externalActions,
     operator,
     conversation,

@@ -286,7 +286,7 @@ describe('SQLite orchestration persistence', () => {
 
     const database = new Database(path, { readonly: true });
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual(Array.from({length:21}, (_,index)=>({version:index+1})));
+      .toEqual(Array.from({length:22}, (_,index)=>({version:index+1})));
     database.close();
   });
 });

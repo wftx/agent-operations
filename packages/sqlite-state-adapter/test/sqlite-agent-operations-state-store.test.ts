@@ -98,6 +98,7 @@ describe('SQLite Agent Operations state store', () => {
       { version: 19, name: 'red-action-receipts-and-deterministic-verification' },
       { version: 20, name: 'operator-runner-control' },
       { version: 21, name: 'bounded-external-actions' },
+      { version: 22, name: 'node-local-connector-metadata' },
     ]);
     database.close();
 
@@ -438,7 +439,7 @@ describe('SQLite Agent Operations state store', () => {
       installationIdFactory: () => INSTALLATION_ID,
       now: () => new Date(TIME),
       additionalMigrations: [{
-        version: 22,
+        version: 23,
         name: 'deliberate-test-failure',
         up: database => {
           database.exec('CREATE TABLE should_rollback (id TEXT)');
@@ -452,7 +453,7 @@ describe('SQLite Agent Operations state store', () => {
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'should_rollback'",
     ).get()).toBeUndefined();
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual(Array.from({length:21}, (_,index)=>({version:index+1})));
+      .toEqual(Array.from({length:22}, (_,index)=>({version:index+1})));
     database.close();
 
     const corruptPath = temporaryPath('corrupt.db');

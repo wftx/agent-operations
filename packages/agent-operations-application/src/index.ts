@@ -76,3 +76,4 @@ export type {
   InputApplication,
 } from './types.js';
 export * from './external-action-service.js';
+export type { ConnectorApplication, ConnectorBinding, ZohoDataCenter } from './connector-application.js';

@@ -1,4 +1,5 @@
 import type {
+  ConnectorApplication,
   OperatorApplication,
   ExternalActionService,
   OrchestratorConversationService,
@@ -13,6 +14,7 @@ import { OperatorWebApplication } from './app.js';
 import { createOperatorHttpServer } from './http-server.js';
 
 export interface OperatorWebServerDependencies {
+  readonly connectors?: ConnectorApplication;
   readonly externalActions?: ExternalActionService;
   readonly operator: OperatorApplication;
   readonly conversation: OrchestratorConversationService;
@@ -41,6 +43,7 @@ export function startOperatorWebServer(dependencies: OperatorWebServerDependenci
     dependencies.metrics,
     dependencies.runtimeFreshness,
     dependencies.externalActions,
+    dependencies.connectors,
   );
   const server = createOperatorHttpServer(app, { host, port });
   server.listen(port, host, () => {

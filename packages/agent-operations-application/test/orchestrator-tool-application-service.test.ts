@@ -24,6 +24,14 @@ const PROJECT: OperatorProjectOption = {
 };
 
 describe('OrchestratorToolApplicationService', () => {
+  it('projects only safe connector status and scopes through existing action discovery',async()=>{
+    const tools=new OrchestratorToolApplicationService(fakeOperator(),undefined,undefined,
+      {list:async()=>[{id:'action:test',executorId:'zoho-invoice-normalized-sync/v1'}]} as never,
+      {inspect:async()=>({status:'connected',scopes:['ZohoInvoice.invoices.READ'],secretReference:'secret:hidden',clientSecret:'never-expose'})} as never);
+    const result=await tools.execute({name:'ao.actions.list',arguments:{projectId:PROJECT.project.id}});
+    expect(result.data).toEqual([{id:'action:test',executorId:'zoho-invoice-normalized-sync/v1',connection:{service:'Zoho Invoice',status:'connected',scopes:['ZohoInvoice.invoices.READ'],link:'/settings/connections/zoho-invoice'}}]);
+    expect(JSON.stringify(result)).not.toMatch(/secret:hidden|never-expose/);
+  });
   it('lists and resolves Projects through the read-only Operator application boundary', async () => {
     const operator = fakeOperator();
     const tools = new OrchestratorToolApplicationService(operator);

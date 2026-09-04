@@ -1,4 +1,5 @@
 import type {
+  ConnectorApplication,
   OperatorApplication,
   ExternalActionService,
   OperatorJobList,
@@ -25,6 +26,7 @@ import {
   renderApprovals,
   renderRepositoryRestoreDetail,
 } from './render.js';
+import { connections } from './connections.js';
 
 export class OperatorWebApplication {
   private readonly conversation: OrchestratorConversationService;
@@ -41,6 +43,7 @@ export class OperatorWebApplication {
     private readonly metrics?: DailyDriverMetricsApplication,
     private readonly runtimeFreshness?: RuntimeFreshnessApplication,
     private readonly externalActions?: ExternalActionService,
+    private readonly connectors?: ConnectorApplication,
   ) {
     if ('sendTurn' in conversationOrOptions) {
       this.conversation = conversationOrOptions;
@@ -53,6 +56,9 @@ export class OperatorWebApplication {
 
   async handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (url.pathname.startsWith('/settings/connections')) {
+      return this.connectors ? connections(request,this.connectors) : new Response('Connections unavailable',{status:503});
+    }
     try {
       if (request.method === 'GET' && url.pathname === '/') {
         return html(renderDashboard(

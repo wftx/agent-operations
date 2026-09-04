@@ -9,6 +9,9 @@ export class FixedSyncHttpBinding implements NormalizedSyncBinding {
       || (url.port && url.port!=='443') || url.pathname!=='/api/internal/sync') throw new Error('Invalid fixed sync endpoint');
     this.endpoint=url.href;
   }
+  async ready(): Promise<boolean> {
+    try { const token=await this.secret();return !!token.trim() && !/[\r\n]/.test(token); } catch { return false; }
+  }
   async postOnce(payload: Readonly<Record<string,unknown>>, signal?: AbortSignal): Promise<unknown> {
     const body=JSON.stringify(payload);
     if (Buffer.byteLength(body)>20*1024*1024) throw new Error('Sync payload exceeds bound');

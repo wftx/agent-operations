@@ -66,9 +66,12 @@ export class ExternalActionService {
     if (plan.state !== 'approved') throw new Error('External action already claimed. Reconcile evidence; never retry.');
     const executor = this.executors.find(e => e.id === plan.action.executorId);
     let ready = false;
-    try { ready = !!executor && (await executor.preflight(plan)).ready; } catch { /* Do not surface connector errors or secrets. */ }
+    let connectionReason: string | undefined;
+    try { const check = await executor?.preflight(plan); ready = check?.ready ?? false; connectionReason=check?.reason; } catch { /* Do not surface connector errors or secrets. */ }
     if (!ready) {
-      const summary = 'Configured external action binding is unavailable or failed exact scope validation. No external invocation occurred. Existing approval is preserved.';
+      const summary = connectionReason==='connector-reauthentication-required' ? 'Zoho Invoice connection needs reauthentication. Open /settings/connections. No external invocation occurred.'
+        : connectionReason==='connector-disconnected' ? 'Zoho Invoice is not connected. Connect it at /settings/connections. No external invocation occurred.'
+        : 'Configured external action binding is unavailable or failed exact scope validation. No external invocation occurred. Existing approval is preserved.';
       if (!(await this.store.listEscalations(jobId)).some(e => !e.resolvedAt && e.summary === summary)) {
         await this.store.createEscalation({id:`escalation:${randomUUID()}`,jobId,reason:'policy_blocked',summary,createdAt:this.now().toISOString()});
       }

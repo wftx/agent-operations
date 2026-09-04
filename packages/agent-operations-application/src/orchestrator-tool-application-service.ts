@@ -8,6 +8,7 @@ import type {
   OrchestratorToolResult,
 } from './types.js';
 import type { ExternalActionService } from './external-action-service.js';
+import type { ConnectorApplication } from './connector-application.js';
 
 /** The complete mutable authority exposed to the conversational Orchestrator. */
 export class OrchestratorToolApplicationService {
@@ -16,6 +17,7 @@ export class OrchestratorToolApplicationService {
     private readonly inputs?: InputApplication,
     private readonly preview?: PreviewApplication,
     private readonly externalActions?: ExternalActionService,
+    private readonly connectors?: Pick<ConnectorApplication,'inspect'>,
   ) {}
 
   async execute(request: OrchestratorToolRequest): Promise<OrchestratorToolResult> {
@@ -30,8 +32,11 @@ export class OrchestratorToolApplicationService {
           const project = await this.requireProject(text(request.arguments, 'projectId'));
           return success({...projectView(project), actions: await this.externalActions?.list(project.project.id) ?? []});
         }
-        case 'ao.actions.list':
-          return success(await this.externalActions?.list(text(request.arguments, 'projectId')) ?? []);
+        case 'ao.actions.list': {
+          const b=await this.connectors?.inspect();
+          const connection={service:'Zoho Invoice',status:b?.status??'not-configured',scopes:b?.scopes??[],link:'/settings/connections/zoho-invoice'};
+          return success((await this.externalActions?.list(text(request.arguments, 'projectId')) ?? []).map(a=>({...a,...(a.executorId==='zoho-invoice-normalized-sync/v1'?{connection}:{})})));
+        }
         case 'ao.inputs.list': {
           if (!this.inputs) throw new Error('Input tools are not configured');
           return success(await this.inputs.listInputs(optionalText(request.arguments, 'projectId')));

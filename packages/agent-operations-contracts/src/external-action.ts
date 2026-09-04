@@ -74,7 +74,7 @@ export interface ExternalActionReceipt extends ExternalActionResult {
 export interface ExternalActionExecutor {
   readonly id: string;
   /** Resolves only a preconfigured binding and validates exact allowed scope. No side effects. */
-  preflight(plan: ExternalActionPlan): Promise<{ readonly ready: boolean }>;
+  preflight(plan: ExternalActionPlan): Promise<{ readonly ready: boolean; readonly reason?: 'connector-reauthentication-required' | 'connector-disconnected' | 'connector-unavailable' }>;
   /** Invoked only after the durable, exclusive execution claim. Never retried. */
   execute(plan: ExternalActionPlan, signal: AbortSignal): Promise<ExternalActionResult>;
 }

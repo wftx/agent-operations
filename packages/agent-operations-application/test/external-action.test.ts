@@ -44,6 +44,13 @@ for (const kind of ['memory','sqlite'] as const) describe(`external action ${kin
     await expect(f.service.register({...action,systemsWritten:['Other']})).rejects.toThrow('immutable');
     expect(f.execute).not.toHaveBeenCalled();
   });
+  it('retains approval and creates actionable reauthentication Needs Me without an invocation',async()=>{
+    const execute=vi.fn();const f=await fixture({id:'sync/v1',preflight:async()=>({ready:false,reason:'connector-reauthentication-required'}),execute});
+    await f.service.approve(f.plan.jobId,f.approval);await f.service.execute(f.plan.jobId);await f.service.execute(f.plan.jobId);
+    const open=await f.store.listEscalations(f.plan.jobId,true);
+    expect(open).toHaveLength(1);expect(open[0]?.summary).toContain('Zoho Invoice connection needs reauthentication.');
+    expect((await f.store.getExternalActionPlan(f.plan.jobId))?.approval).toEqual(f.approval);expect(execute).not.toHaveBeenCalled();
+  });
   it('rejects arbitrary action and parameter authority',async()=>{
     const f=await fixture();
     await expect(f.service.create({...f.input,requestKey:'other',actionId:'action:shell'})).rejects.toThrow('configured');

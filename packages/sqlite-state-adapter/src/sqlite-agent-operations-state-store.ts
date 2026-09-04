@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { validateConnector, type ConnectorBinding, type ConnectorActionLink } from '../../agent-operations-contracts/src/connector.js';
 import { ExternalActionPersistence } from './external-action-persistence.js';
 import type { ProjectAction, ExternalActionPlan, ExternalActionApproval, ExternalActionReceipt } from '../../agent-operations-contracts/src/index.js';
 import { chmodSync, mkdirSync } from 'node:fs';
@@ -2387,6 +2388,29 @@ export class SqliteAgentOperationsStateStore implements AgentOperationsStateStor
     }
   }
 
+  async getConnector(id: string): Promise<ConnectorBinding | null> {
+    const row = this.database.prepare('SELECT metadata_json FROM connector_bindings WHERE id=?').get(id) as {metadata_json: string} | undefined;
+    if (!row) return null;
+    const binding = JSON.parse(row.metadata_json) as ConnectorBinding;
+    validateConnector(binding);
+    return binding;
+  }
+  async getConnectorActionLink(id: string): Promise<ConnectorActionLink | null> {
+    return this.database.prepare('SELECT binding_id AS actionBindingId, connector_id AS connectorId, organization_id AS organizationId, data_center AS dataCenter FROM connector_action_links WHERE binding_id=?').get(id) as ConnectorActionLink | undefined ?? null;
+  }
+  async pinConnectorActionLink(link: ConnectorActionLink): Promise<void> {
+    if (Object.keys(link).some(k=>!['actionBindingId','connectorId','organizationId','dataCenter'].includes(k)) || !/^binding:[a-zA-Z0-9:._-]{1,150}$/.test(link.actionBindingId)) throw new Error('Invalid connector action link');
+    const binding=await this.getConnector(link.connectorId);
+    if (!binding || binding.status!=='connected' || binding.organizationId!==link.organizationId || binding.dataCenter!==link.dataCenter) throw new Error('Verified exact connector required');
+    this.database.prepare('INSERT OR IGNORE INTO connector_action_links VALUES (?,?,?,?)').run(link.actionBindingId,link.connectorId,link.organizationId,link.dataCenter);
+    const old=await this.getConnectorActionLink(link.actionBindingId);
+    if (!old || old.connectorId!==link.connectorId || old.organizationId!==link.organizationId || old.dataCenter!==link.dataCenter) throw new Error('Action account is already pinned. Explicit account migration is required.');
+  }
+  async saveConnector(binding: ConnectorBinding): Promise<void> {
+    validateConnector(binding);
+    this.database.prepare('INSERT INTO connector_bindings VALUES (?,?) ON CONFLICT(id) DO UPDATE SET metadata_json=excluded.metadata_json')
+      .run(binding.id, JSON.stringify(binding));
+  }
   async registerProjectAction(action: ProjectAction) { new ExternalActionPersistence(this.database).register(action); }
   async listProjectActions(projectId: string) { return new ExternalActionPersistence(this.database).list(projectId); }
   async createExternalActionJob(job: DurableJob, plan: ExternalActionPlan) { new ExternalActionPersistence(this.database).create(job, plan); }

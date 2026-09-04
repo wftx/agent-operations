@@ -23,7 +23,7 @@ export function createOperatorHttpServer(
       response.end(Buffer.from(await webResponse.arrayBuffer()));
     } catch (error) {
       response.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
-      response.end(error instanceof Error ? error.message : String(error));
+      response.end(request.url?.startsWith('/settings/connections') ? 'Connection request failed.' : error instanceof Error ? error.message : String(error));
     }
   });
 }

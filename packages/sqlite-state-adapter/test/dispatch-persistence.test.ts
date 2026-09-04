@@ -208,7 +208,7 @@ describe('SQLite Execution Dispatch persistence', () => {
 
     const database = new Database(path, { readonly: true });
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual(Array.from({length:21}, (_,index)=>({version:index+1})));
+      .toEqual(Array.from({length:22}, (_,index)=>({version:index+1})));
     expect(database.prepare(`
       SELECT requested_policy_version, requested_filesystem, requested_network, requested_environment
       FROM execution_plans WHERE id = 'plan:legacy-policy'
@@ -320,7 +320,7 @@ describe('SQLite Execution Dispatch persistence', () => {
     expect(() => SqliteAgentOperationsStateStore.open({
       databasePath: path,
       additionalMigrations: [{
-        version: 22,
+        version: 23,
         name: 'deliberate-dispatch-rollback',
         up: database => {
           database.exec('CREATE TABLE should_rollback_dispatch (id TEXT)');
@@ -335,7 +335,7 @@ describe('SQLite Execution Dispatch persistence', () => {
     expect(database.prepare('SELECT id FROM execution_dispatches').get())
       .toEqual({ id: 'dispatch:rollback' });
     expect(database.prepare('SELECT version FROM schema_migrations ORDER BY version').all())
-      .toEqual(Array.from({length:21}, (_,index)=>({version:index+1})));
+      .toEqual(Array.from({length:22}, (_,index)=>({version:index+1})));
     database.close();
   });
 });
